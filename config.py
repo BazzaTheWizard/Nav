@@ -21,6 +21,17 @@ class Settings:
     raw_dir: Path
     temp_dir: Path
     output_dir: Path
+    # Seconds the clip's hook title stays on screen at the top (0 turns it off).
+    hook_title_seconds: float = 4.0
+    # Colour the word being spoken inside each caption card.
+    caption_highlight: bool = True
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.getenv(name, str(default))))
+    except ValueError:
+        return default
 
 
 def load_settings() -> Settings:
@@ -37,6 +48,9 @@ def load_settings() -> Settings:
         raw_dir=PROJECT_ROOT / "storage" / "raw",
         temp_dir=PROJECT_ROOT / "storage" / "temp",
         output_dir=PROJECT_ROOT / "storage" / "output",
+        hook_title_seconds=_float_env("HOOK_TITLE_SECONDS", 4.0),
+        caption_highlight=os.getenv("CAPTION_HIGHLIGHT", "1").strip().lower()
+        not in {"0", "false", "no", "off"},
     )
     for directory in (settings.raw_dir, settings.temp_dir, settings.output_dir):
         directory.mkdir(parents=True, exist_ok=True)

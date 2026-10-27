@@ -321,71 +321,68 @@ def _select_spaced_candidates(
     return selected
 
 
-def select_clips(
+REPLAY_PEAK_THRESHOLD = 0.5
+REPLAY_SKIP_OPENING_SECONDS = 20.0
+
+
+def replay_peaks(
+    heatmap: list[dict] | None,
+    top_n: int = 6,
+) -> list[tuple[float, float, float]]:
+    """Turn YouTube's "Most replayed" heatmap into (start, end, intensity) peaks.
+
+    Adjacent high-intensity buckets are merged into one region. The opening
+    seconds are skipped because playback start always looks "replayed".
+    """
+    if not heatmap:
+        return []
+    points: list[tuple[float, float, float]] = []
+    for item in heatmap:
+        try:
+            start = float(item["start_time"])
+            end = float(item["end_time"])
+            value = float(item["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and end > start:
+            points.append((start, end, value))
+    points.sort()
+    regions: list[tuple[float, float, float]] = []
+    for start, end, value in points:
+        if value < REPLAY_PEAK_THRESHOLD or end <= REPLAY_SKIP_OPENING_SECONDS:
+            continue
+        if regions and start - regions[-1][1] <= 1.0:
+            previous_start, _previous_end, previous_value = regions[-1]
+            regions[-1] = (previous_start, end, max(previous_value, value))
+        else:
+            regions.append((start, end, value))
+    regions.sort(key=lambda region: region[2], reverse=True)
+    return regions[:top_n]
+
+
+def format_replay_peaks(peaks: list[tuple[float, float, float]]) -> str:
+    return "\n".join(
+        f"{start:.0f}-{end:.0f}s (replay intensity {value:.2f})"
+        for start, end, value in peaks
+    )
+
+
+def finalize_candidates(
+    proposals: list[ClipResult],
     words: list[Word],
     video_duration: float,
     requested_count: int,
-    settings: Settings,
 ) -> list[ClipResult]:
-    if not settings.openai_api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY is required for hook selection. Copy .env.example to .env "
-            "and add your API key."
-        )
-    if requested_count < 1:
-        raise ValueError("The requested clip count must be at least 1.")
-    if not math.isfinite(video_duration) or video_duration <= 0:
-        raise ValueError("The source video must have a positive, finite duration.")
-    transcript = format_timeline(words)
-    candidate_count = requested_count + 3
-    client = OpenAI(api_key=settings.openai_api_key)
-    completion = client.chat.completions.parse(
-        model=settings.openai_model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Find strong self-contained short-form moments in the timestamped "
-                    "transcript. Return the requested number of candidates, ordered by "
-                    "virality_score descending. Target 30-60 seconds per candidate, "
-                    "stay within the source duration, and prefer complete sentences "
-                    "and natural thought boundaries. Final clips start with a "
-                    "0.15-second pre-roll and end at a finished thought with up to "
-                    "0.4 seconds of post-roll, while staying within 30-60 seconds. "
-                    "Snap endings to natural silence of at least 0.35 seconds where "
-                    "available. Every candidate must be a completely distinct "
-                    "moment covering a different topic or idea from a different "
-                    "part of the video. "
-                    "Do NOT select overlapping timestamps or the same scene with "
-                    "different lengths. "
-                    "Favor an immediate hook, a clear payoff, emotional specificity, "
-                    "novelty, or useful insight. For each candidate, provide a concise "
-                    "viral_title, ready-to-post caption, and short list of hashtags "
-                    "without # symbols."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Source duration: {video_duration:.2f} seconds\n"
-                    f"Requested candidates: {candidate_count}\n"
-                    f"Final clips to select: {requested_count}\n"
-                    "Timestamped transcript (seconds):\n"
-                    f"{transcript}"
-                ),
-            },
-        ],
-        response_format=ClipSelection,
-    )
+    """Snap proposals to sentence boundaries and pick the best non-overlapping set.
 
-    message = completion.choices[0].message
-    if message.parsed is None:
-        return _fallback_clips(requested_count, video_duration, words)
-
+    Used for both the OpenAI picker and the Gemini picker so every clip follows
+    the same 30-60 s, sentence-aligned, well-spaced rules. Proposals are ranked
+    by virality_score; any shortfall is filled with spaced heuristic clips.
+    """
     ordered_words = sorted(words, key=lambda word: (word.start, word.end))
     sentences = _sentence_spans(ordered_words)
     candidates_by_interval: dict[tuple[float, float], ClipResult] = {}
-    for proposed_clip in message.parsed.clips:
+    for proposed_clip in proposals:
         normalized = _normalize_clip(
             proposed_clip,
             video_duration,
@@ -424,3 +421,82 @@ def select_clips(
             video_duration,
         )
     return sorted(selected[:requested_count], key=lambda clip: clip.start_time)
+
+
+def select_clips(
+    words: list[Word],
+    video_duration: float,
+    requested_count: int,
+    settings: Settings,
+    replay_peaks_hint: list[tuple[float, float, float]] | None = None,
+) -> list[ClipResult]:
+    if not settings.openai_api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is required for hook selection. Copy .env.example to .env "
+            "and add your API key."
+        )
+    if requested_count < 1:
+        raise ValueError("The requested clip count must be at least 1.")
+    if not math.isfinite(video_duration) or video_duration <= 0:
+        raise ValueError("The source video must have a positive, finite duration.")
+    transcript = format_timeline(words)
+    candidate_count = requested_count + 3
+    client = OpenAI(api_key=settings.openai_api_key)
+    completion = client.chat.completions.parse(
+        model=settings.openai_model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Find strong self-contained short-form moments in the timestamped "
+                    "transcript. Return the requested number of candidates, ordered by "
+                    "virality_score descending. Target 30-60 seconds per candidate, "
+                    "stay within the source duration, and prefer complete sentences "
+                    "and natural thought boundaries. Final clips start with a "
+                    "0.15-second pre-roll and end at a finished thought with up to "
+                    "0.4 seconds of post-roll, while staying within 30-60 seconds. "
+                    "Snap endings to natural silence of at least 0.35 seconds where "
+                    "available. Every candidate must be a completely distinct "
+                    "moment covering a different topic or idea from a different "
+                    "part of the video. "
+                    "Do NOT select overlapping timestamps or the same scene with "
+                    "different lengths. "
+                    "Favor an immediate hook, a clear payoff, emotional specificity, "
+                    "novelty, or useful insight. When 'Most replayed' moments are "
+                    "listed, viewers rewatched those parts most: prefer candidates "
+                    "that contain them, as long as the clip still stands alone. "
+                    "For each candidate, provide a concise "
+                    "viral_title, ready-to-post caption, and short list of hashtags "
+                    "without # symbols."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Source duration: {video_duration:.2f} seconds\n"
+                    f"Requested candidates: {candidate_count}\n"
+                    f"Final clips to select: {requested_count}\n"
+                    + (
+                        "Most replayed moments (YouTube viewers):\n"
+                        f"{format_replay_peaks(replay_peaks_hint)}\n"
+                        if replay_peaks_hint
+                        else ""
+                    )
+                    + "Timestamped transcript (seconds):\n"
+                    f"{transcript}"
+                ),
+            },
+        ],
+        response_format=ClipSelection,
+    )
+
+    message = completion.choices[0].message
+    if message.parsed is None:
+        return _fallback_clips(requested_count, video_duration, words)
+
+    return finalize_candidates(
+        list(message.parsed.clips),
+        words,
+        video_duration,
+        requested_count,
+    )

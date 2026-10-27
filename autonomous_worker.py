@@ -13,28 +13,20 @@ from pathlib import Path
 from typing import Any, Generator
 
 from config import PROJECT_ROOT, load_settings
-from core.agent_brain import select_clips_and_draft_pitch
-from core.downloader import (
-    download_source_video,
-    extract_audio_only,
-    extract_audio_segment,
-)
+from core.downloader import download_source_video, extract_audio_only
 from core.drive_uploader import upload_clips_to_drive
-from core.face_tracker import analyze_vertical_crop
 from core.hook_selector import ClipResult
 from core.lead_harvester import (
     YouTubeQuotaExceededError,
     discover_channels,
     generate_search_queries,
 )
-from core.subtitle_engine import create_ass_subtitles
-from core.transcriber import (
-    Word,
-    clip_words_from_transcript,
-    transcribe_audio,
-    transcribe_clip_audio,
+from core.pipeline import (
+    pick_clips_with_agent,
+    render_selected_clip,
+    video_info_and_peaks,
 )
-from core.video_renderer import render_clip
+from core.transcriber import Word, transcribe_audio
 from main import _video_duration
 
 
@@ -54,6 +46,10 @@ PENDING_SLOT_POLL_INTERVAL_SEC = 5
 DISCOVERY_BACKOFF_START_SEC = 5 * 60
 DISCOVERY_BACKOFF_MAX_SEC = 60 * 60
 QUOTA_COOLDOWN_SEC = 15 * 60
+# A lead that fails (network blip, API hiccup) goes back in the queue this many
+# times before it's marked failed for good.
+MAX_LEAD_ATTEMPTS = 3
+CLIPS_PER_LEAD = 3
 
 
 def is_youtube_quota_exhausted() -> bool:
@@ -427,22 +423,6 @@ def skip_lead(channel_id: str, reason: str = "user_skipped") -> bool:
         return True
 
 
-def _transcript_segments(words: list[Word]) -> list[dict[str, Any]]:
-    segments: list[dict[str, Any]] = []
-    for word in words:
-        start = word.segment_start if word.segment_start is not None else word.start
-        end = word.segment_end if word.segment_end is not None else word.end
-        if (
-            segments
-            and segments[-1]["start"] == start
-            and segments[-1]["end"] == end
-        ):
-            segments[-1]["text"] = f'{segments[-1]["text"]} {word.text}'.strip()
-        else:
-            segments.append({"start": start, "end": end, "text": word.text})
-    return segments
-
-
 def _lead_queue() -> list[dict[str, Any]]:
     queue = _read_json(LEAD_QUEUE_PATH, [])
     if not isinstance(queue, list):
@@ -535,67 +515,56 @@ def _update_lead_status(
 
 def _render_selected_clips(
     source_path: Path,
-    selection: dict[str, Any],
+    clips: list[ClipResult],
     job_dir: Path,
     settings: Any,
-    words: list[Word] | None = None,
+    words: list[Word],
 ) -> list[Path]:
-    rendered_paths: list[Path] = []
-    for index, selected in enumerate(selection["clips"], start=1):
-        clip = ClipResult(
-            start_time=float(selected["start_time"]),
-            end_time=float(selected["end_time"]),
-            viral_title=str(selected["hook_title"]),
-            caption=str(selected["reason"]),
-            hashtags=[],
-            virality_score=0,
-        )
-        stem = f"clip_{index:02d}"
-        clip_audio = job_dir / f"{stem}.wav"
-        subtitle_file = job_dir / f"{stem}.ass"
-        output_file = job_dir / f"{stem}.mp4"
-        clip_words = (
-            clip_words_from_transcript(words, clip.start_time, clip.end_time)
-            if words
-            else None
-        )
-        if clip_words is None:
-            extract_audio_segment(
-                source_path,
-                clip.start_time,
-                clip.end_time,
-                clip_audio,
-            )
-            clip_words = transcribe_clip_audio(clip_audio, settings)
-        create_ass_subtitles(
-            clip_words,
-            subtitle_file,
-            clip_duration=clip.end_time - clip.start_time,
-        )
-        crop_analysis = analyze_vertical_crop(
+    rendered_paths = [
+        render_selected_clip(
             source_path,
-            clip.start_time,
-            clip.end_time,
+            clip,
+            words,
+            settings,
+            job_dir / f"clip_{index:02d}.mp4",
+            layout_mode="auto",
+            work_dir=job_dir,
+        ).path
+        for index, clip in enumerate(clips, start=1)
+    ]
+    if len(rendered_paths) != CLIPS_PER_LEAD:
+        raise RuntimeError(
+            f"Expected {CLIPS_PER_LEAD} rendered clips; got {len(rendered_paths)}."
         )
-        layout_mode = (
-            "wide_blurred_background"
-            if crop_analysis.use_wide_layout
-            else "blurred_background"
-        )
-        rendered_paths.append(
-            render_clip(
-                source_path,
-                subtitle_file,
-                crop_analysis.crop,
-                clip.start_time,
-                clip.end_time,
-                output_file,
-                layout_mode=layout_mode,
-            )
-        )
-    if len(rendered_paths) != 3:
-        raise RuntimeError(f"Expected three rendered clips; got {len(rendered_paths)}.")
     return rendered_paths
+
+
+def _handle_lead_failure(lead: dict[str, Any], error: Exception) -> bool:
+    """Requeue a failed lead until MAX_LEAD_ATTEMPTS; return True if requeued."""
+    attempts = int(lead.get("attempts", 0)) + 1
+    channel_id = str(lead.get("channel_id", ""))
+    video_id = str(lead.get("latest_video_url", "")).rsplit("=", maxsplit=1)[-1]
+    with _worker_lock():
+        state = _processed_state()
+        if attempts < MAX_LEAD_ATTEMPTS:
+            state["processed_channel_ids"] = [
+                value for value in state["processed_channel_ids"] if value != channel_id
+            ]
+            state["processed_video_ids"] = [
+                value for value in state["processed_video_ids"] if value != video_id
+            ]
+            _update_lead_status(
+                state,
+                channel_id,
+                f"retry {attempts}/{MAX_LEAD_ATTEMPTS - 1} queued",
+                str(error),
+            )
+            queue = _lead_queue()
+            queue.append({**lead, "attempts": attempts})
+            _write_json_atomic(LEAD_QUEUE_PATH, queue)
+            return True
+        _update_lead_status(state, channel_id, "failed", str(error))
+        return False
 
 
 def _process_lead(
@@ -618,15 +587,18 @@ def _process_lead(
         if duration <= 0:
             raise RuntimeError(f"Source video has invalid duration: {source_video}")
 
-        selection = select_clips_and_draft_pitch(
-            transcript_segments=_transcript_segments(words),
-            channel_name=channel_title,
-            video_title=video_title,
-            drive_link="",
+        _info, peaks = video_info_and_peaks(video_url)
+        clips, outreach_email = pick_clips_with_agent(
+            words,
+            duration,
+            CLIPS_PER_LEAD,
+            channel_title,
+            video_title,
+            peaks,
         )
         rendered = _render_selected_clips(
             source_video,
-            selection,
+            clips,
             job_dir,
             settings,
             words,
@@ -636,7 +608,7 @@ def _process_lead(
             video_title,
             [str(path) for path in rendered],
         )
-        email_body = str(selection["outreach_email"]).replace(
+        email_body = outreach_email.replace(
             "Access the 3 edited clips here:\n\n",
             f"Access the 3 edited clips here:\n{drive_link}\n\n",
         )
@@ -731,9 +703,8 @@ def run_worker(batch: int = 3) -> int:
                 lead.get("channel_title", channel_id),
                 channel_id,
             )
-            with _worker_lock():
-                state = _processed_state()
-                _update_lead_status(state, channel_id, "failed", str(exc))
+            if _handle_lead_failure(lead, exc):
+                logger.info("Lead requeued for another attempt.")
             continue
         with _worker_lock():
             state = _processed_state()
@@ -829,9 +800,8 @@ def run_continuous_queue(
                 channel_id,
                 exc,
             )
-            with _worker_lock():
-                state = _processed_state()
-                _update_lead_status(state, channel_id, "failed", str(exc))
+            if _handle_lead_failure(fresh_lead, exc):
+                logger.info("Lead requeued for another attempt.")
             time.sleep(10)
             continue
         with _worker_lock():

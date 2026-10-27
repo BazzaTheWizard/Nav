@@ -520,6 +520,19 @@ def _words_from_segments(
     return words
 
 
+def transcript_segments(words: list[Word]) -> list[dict[str, Any]]:
+    """Group words back into their sentence/segment lines for the AI picker."""
+    segments: list[dict[str, Any]] = []
+    for word in words:
+        start = word.segment_start if word.segment_start is not None else word.start
+        end = word.segment_end if word.segment_end is not None else word.end
+        if segments and segments[-1]["start"] == start and segments[-1]["end"] == end:
+            segments[-1]["text"] = f'{segments[-1]["text"]} {word.text}'.strip()
+        else:
+            segments.append({"start": start, "end": end, "text": word.text})
+    return segments
+
+
 def has_word_level_timing(words: list[Word]) -> bool:
     """True when entries are single words (Whisper/Groq), not caption lines."""
     if not words:

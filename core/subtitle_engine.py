@@ -136,13 +136,40 @@ def _centiseconds(seconds: float) -> int:
     return max(0, round(seconds * 100))
 
 
+# Vertical positions on the 1080x1920 canvas. TikTok, Reels and Shorts draw the
+# username, description and buttons over roughly the bottom 35% and the top 15%,
+# so captions sit just above 1248 px and the hook title just below 288 px.
+CAPTION_MARGIN_V = 680
+CAPTION_MARGIN_H = 110
+HOOK_MARGIN_V = 300
+HOOK_MAX_CHARACTERS = 70
+HIGHLIGHT_COLOUR = "&H00FFFF&"  # yellow (ASS colours are BGR)
+GENERIC_HOOK_TITLES = frozenset({"key highlight", "clip", ""})
+
+
+def _hook_text(title: str) -> str:
+    text = " ".join(title.split())
+    if len(text) > HOOK_MAX_CHARACTERS:
+        text = text[:HOOK_MAX_CHARACTERS].rsplit(" ", 1)[0].rstrip(",.;:-") + "…"
+    return _safe_ass_text(text)
+
+
 def create_ass_subtitles(
     words: list[Word],
     output_path: str | Path,
     clip_start_time: float = 0.0,
     clip_duration: float | None = None,
+    *,
+    highlight_active_word: bool = True,
+    hook_title: str | None = None,
+    hook_seconds: float = 0.0,
 ) -> Path:
-    """Write short, clip-relative ASS subtitle chunks with non-overlapping timing."""
+    """Write short, clip-relative ASS subtitle cards with non-overlapping timing.
+
+    highlight_active_word: colour the word being spoken in each card.
+    hook_title / hook_seconds: show the clip's title at the top for the first
+    ``hook_seconds`` (0 turns it off).
+    """
     if not words:
         raise ValueError("Cannot create subtitles without word timestamps.")
     ordered = _normalize_words(words, clip_start_time, clip_duration)
@@ -151,7 +178,7 @@ def create_ass_subtitles(
     if any(word.end <= word.start for word in ordered):
         raise ValueError("Every subtitle word must have an end time after its start time.")
 
-    header = """[Script Info]
+    header = f"""[Script Info]
 ScriptType: v4.00+
 WrapStyle: 0
 ScaledBorderAndShadow: yes
@@ -160,23 +187,37 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ShortForm,Arial Black,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,90,90,140,1
+Style: ShortForm,Arial Black,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,{CAPTION_MARGIN_H},{CAPTION_MARGIN_H},{CAPTION_MARGIN_V},1
+Style: Hook,Arial Black,58,&H00FFFFFF,&H00FFFFFF,&H50000000,&H00000000,-1,0,0,0,100,100,0,0,3,18,0,8,120,120,{HOOK_MARGIN_V},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+    clip_end_cs = (
+        _centiseconds(clip_duration) if clip_duration is not None else None
+    )
     groups = _make_groups(ordered)
     events: list[str] = []
+
+    def add_event(start_cs: int, end_cs: int, text: str, style: str = "ShortForm", layer: int = 0) -> None:
+        if end_cs > start_cs:
+            events.append(
+                f"Dialogue: {layer},{_ass_time(start_cs / 100)},"
+                f"{_ass_time(end_cs / 100)},{style},,0,0,0,,{text}"
+            )
+
+    if hook_title and hook_seconds > 0 and hook_title.strip().casefold() not in GENERIC_HOOK_TITLES:
+        hook_end_cs = _centiseconds(hook_seconds)
+        if clip_end_cs is not None:
+            hook_end_cs = min(hook_end_cs, clip_end_cs)
+        add_event(0, hook_end_cs, _hook_text(hook_title), style="Hook", layer=1)
+
     previous_end_cs = 0
     for index, group in enumerate(groups):
-        event_start_cs = max(
-            previous_end_cs,
-            _centiseconds(max(0.0, group[0].start)),
-        )
-        event_end_cs = min(
-            _centiseconds(group[-1].end),
-            _centiseconds(clip_duration) if clip_duration is not None else math.inf,
-        )
+        event_start_cs = max(previous_end_cs, _centiseconds(max(0.0, group[0].start)))
+        event_end_cs = _centiseconds(group[-1].end)
+        if clip_end_cs is not None:
+            event_end_cs = min(event_end_cs, clip_end_cs)
         if index + 1 < len(groups):
             event_end_cs = min(
                 event_end_cs,
@@ -185,12 +226,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if event_end_cs <= event_start_cs:
             continue
 
-        text = _safe_ass_text(" ".join(word.text for word in group).upper())
-        events.append(
-            "Dialogue: 0,"
-            f"{_ass_time(event_start_cs / 100)},"
-            f"{_ass_time(event_end_cs / 100)},ShortForm,,0,0,140,,{text}"
-        )
+        tokens = [_safe_ass_text(word.text.upper()) for word in group]
+        if not highlight_active_word or len(group) == 1:
+            add_event(event_start_cs, event_end_cs, " ".join(tokens))
+        else:
+            # One event per word: same card text, the spoken word in yellow.
+            boundaries = [event_start_cs]
+            for word in group[1:]:
+                boundaries.append(
+                    min(event_end_cs, max(boundaries[-1], _centiseconds(word.start)))
+                )
+            boundaries.append(event_end_cs)
+            for word_index in range(len(group)):
+                text = " ".join(
+                    f"{{\\c{HIGHLIGHT_COLOUR}}}{token}{{\\r}}" if i == word_index else token
+                    for i, token in enumerate(tokens)
+                )
+                add_event(boundaries[word_index], boundaries[word_index + 1], text)
         previous_end_cs = event_end_cs
 
     destination = Path(output_path)

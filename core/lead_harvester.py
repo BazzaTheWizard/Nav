@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import tempfile
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
@@ -15,7 +14,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from core.gemini_resilience import generate_content_with_fallback
+from core.gemini_resilience import (
+    gemini_thinking_config,
+    generate_content_with_fallback,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -151,7 +153,10 @@ def generate_search_queries(category: str = "All", count: int = 10) -> list[str]
         client.models.generate_content,
         model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
         contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            thinking_config=gemini_thinking_config(types),
+        ),
     )
     if not response.text:
         raise RuntimeError("Gemini returned an empty search phrase response.")

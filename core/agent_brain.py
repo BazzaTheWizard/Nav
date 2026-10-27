@@ -11,7 +11,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from core.gemini_resilience import generate_content_with_fallback
+from core.gemini_resilience import (
+    gemini_thinking_config,
+    generate_content_with_fallback,
+)
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -37,11 +40,15 @@ Best,
 Barry Navan
 201-466-4807"""
 
+DEFAULT_CANDIDATE_COUNT = 5
+
 _SYSTEM_PROMPT = f"""You are an expert short-form video editor and creator outreach writer.
 Analyze the supplied transcript and return one JSON object with:
-- "clips": exactly three items, each with numeric start_time and end_time (seconds),
-  hook_title (string), and reason (string). Target a cohesive, high-retention
-  30–50 second self-contained story or tactical breakdown.
+- "clips": exactly "candidate_count" items (given in the request), ranked best
+  first, each with numeric start_time and end_time (seconds), hook_title (string,
+  under 60 characters, shown on screen as the clip's hook), and reason (string).
+  Target a cohesive, high-retention 30–50 second self-contained story or
+  tactical breakdown.
 - STRICT HOOK START: start_time MUST begin exactly at the start of a complete
   sentence that immediately poses a question, introduces a bold statement, or
   starts an actionable tip. Do not start mid-sentence or mid-breath. Use an exact
@@ -51,15 +58,18 @@ Analyze the supplied transcript and return one JSON object with:
   thought or natural sentence period. Under no circumstances cut off mid-thought
   or mid-sentence. Use an exact end timestamp from the supplied transcript
   sentence segments.
-  Every clip must be strictly longer than 20 and shorter than 60 seconds. Each
+  Every clip must be between 30 and 60 seconds long. Each
   clip must capture a complete, self-contained thought with a strong hook,
   explanation, and natural conclusion. Use only transcript timestamps and do not invent dialogue.
 - "channel_content_summary": one concise factual description of the channel/video
   content, suitable for the email.
 - "specific_moment_reference": a concise reference to a specific moment in the
   transcript that fits the email sentence.
-- The three clips must not overlap and should come from different parts of the
+- The clips must not overlap and should come from different parts of the
   video.
+- When "most_replayed" moments are supplied, YouTube viewers rewatched those
+  parts the most. Prefer clips that contain them, as long as each clip still
+  stands on its own.
 
 The two text fields are inserted into this email template by the application
 (do NOT return the email itself):
@@ -67,7 +77,6 @@ The two text fields are inserted into this email template by the application
 {_EMAIL_TEMPLATE}
 
 Do not include markdown or extra commentary."""
-MIN_GAP_BETWEEN_CLIPS_SECONDS = 1.0
 
 
 def _format_transcript_segments(
@@ -126,6 +135,7 @@ def _request_gemini(api_key: str, prompt: str) -> str:
         config=types.GenerateContentConfig(
             system_instruction=_SYSTEM_PROMPT,
             response_mime_type="application/json",
+            thinking_config=gemini_thinking_config(types),
         ),
     )
     if not response.text:
@@ -138,6 +148,9 @@ def select_clips_and_draft_pitch(
     channel_name: str,
     video_title: str,
     drive_link: str = "",
+    *,
+    candidate_count: int = DEFAULT_CANDIDATE_COUNT,
+    replay_peaks: list[tuple[float, float, float]] | None = None,
 ) -> dict[str, Any]:
     """Select three transcript clips and draft personalized outreach."""
     if not transcript_segments:
@@ -169,6 +182,11 @@ def select_clips_and_draft_pitch(
             "channel_name": channel_name,
             "video_title": video_title,
             "drive_link": drive_link,
+            "candidate_count": candidate_count,
+            "most_replayed": [
+                {"start": round(start, 1), "end": round(end, 1), "intensity": round(value, 2)}
+                for start, end, value in (replay_peaks or [])
+            ],
         },
         ensure_ascii=False,
     )
@@ -183,63 +201,44 @@ def select_clips_and_draft_pitch(
 
     result = _parse_json_response(response_text)
     clips = result.get("clips")
-    if not isinstance(clips, list) or len(clips) != 3:
-        raise ValueError("The AI response must contain exactly three clips.")
+    if not isinstance(clips, list) or not clips:
+        raise ValueError("The AI response must contain a list of clips.")
 
+    # Keep every well-formed candidate in rank order. Snapping to sentences,
+    # the 30-60 s rule and overlap checks happen in
+    # hook_selector.finalize_candidates, so one bad pick no longer discards all.
     transcript_start = min(segment["start"] for segment in normalized_segments)
     transcript_end = max(segment["end"] for segment in normalized_segments)
-    sentence_starts = [segment["start"] for segment in normalized_segments]
-    sentence_ends = [segment["end"] for segment in normalized_segments]
     validated_clips: list[dict[str, Any]] = []
-    for index, clip in enumerate(clips):
+    for clip in clips:
         if not isinstance(clip, dict):
-            raise ValueError(f"Clip {index + 1} must be a JSON object.")
+            continue
         try:
             start_time = float(clip["start_time"])
             end_time = float(clip["end_time"])
             hook_title = str(clip["hook_title"]).strip()
             reason = str(clip["reason"]).strip()
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"Clip {index + 1} has invalid fields.") from exc
+        except (KeyError, TypeError, ValueError):
+            continue
         if (
             not math.isfinite(start_time)
             or not math.isfinite(end_time)
-            or start_time < transcript_start
-            or end_time > transcript_end
-        ):
-            raise ValueError(f"Clip {index + 1} has invalid timestamps.")
-        start_time = min(sentence_starts, key=lambda value: abs(value - start_time))
-        end_time = min(sentence_ends, key=lambda value: abs(value - end_time))
-        duration = end_time - start_time
-        if (
-            start_time < transcript_start
-            or end_time > transcript_end
-            or not 20 < duration < 60
+            or end_time <= start_time
+            or start_time < transcript_start - 1
+            or start_time >= transcript_end
             or not hook_title
-            or not reason
         ):
-            raise ValueError(
-                f"Clip {index + 1} must have valid transcript timestamps, "
-                "a duration strictly between 20 and 60 seconds, and non-empty "
-                "title and reason."
-            )
+            continue
         validated_clips.append(
             {
                 "start_time": start_time,
-                "end_time": end_time,
+                "end_time": min(end_time, transcript_end),
                 "hook_title": hook_title,
-                "reason": reason,
+                "reason": reason or hook_title,
             }
         )
-
-    ordered_clips = sorted(validated_clips, key=lambda item: item["start_time"])
-    for previous, current in zip(ordered_clips, ordered_clips[1:]):
-        if current["start_time"] < previous["end_time"] + MIN_GAP_BETWEEN_CLIPS_SECONDS:
-            raise ValueError(
-                "The AI returned overlapping clips "
-                f"({previous['start_time']:.1f}-{previous['end_time']:.1f}s and "
-                f"{current['start_time']:.1f}-{current['end_time']:.1f}s)."
-            )
+    if not validated_clips:
+        raise ValueError("The AI response did not contain any usable clips.")
 
     channel_content_summary = str(result.get("channel_content_summary", "")).strip()
     specific_moment_reference = str(

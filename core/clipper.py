@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from config import PROJECT_ROOT
-from core.face_tracker import CropBox
+from core.face_tracker import CropBox, CropPlan
 from core.subtitle_engine import create_ass_subtitles
 from core.transcriber import Word
-from core.video_renderer import render_clip
+from core.video_renderer import CROP_LAYOUTS, render_clip
 
 
 MIN_CLIP_DURATION = 15.0
@@ -76,6 +76,10 @@ def rerender_clip(
     cached_crop: CropBox | None = None,
     layout_mode: str = "smart_crop",
     source_duration: float | None = None,
+    crop_plan: CropPlan | None = None,
+    hook_title: str | None = None,
+    hook_seconds: float = 0.0,
+    highlight_active_word: bool = True,
 ) -> Path:
     duration = new_end - new_start
     if not MIN_CLIP_DURATION <= duration <= MAX_CLIP_DURATION:
@@ -119,6 +123,9 @@ def rerender_clip(
             clip_words,
             subtitle_path,
             clip_duration=duration,
+            highlight_active_word=highlight_active_word,
+            hook_title=hook_title,
+            hook_seconds=hook_seconds,
         )
 
         crop = cached_crop
@@ -132,6 +139,10 @@ def rerender_clip(
                 height=crop.height,
             )
 
+        x_expression = None
+        if crop_plan is not None and layout_mode in CROP_LAYOUTS:
+            crop = crop_plan.crop
+            x_expression = crop_plan.x_expression(new_start, new_end)
         render_clip(
             source,
             subtitle_path,
@@ -140,6 +151,7 @@ def rerender_clip(
             new_end,
             temporary_output,
             layout_mode=layout_mode,
+            crop_x_expression=x_expression,
         )
         temporary_output.replace(destination)
     finally:

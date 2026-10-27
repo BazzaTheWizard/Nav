@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -83,3 +84,19 @@ def generate_content_with_fallback(
                 len(retry_delays),
             )
             time.sleep(delay)
+
+
+def gemini_thinking_config(types: Any) -> Any:
+    """Thinking effort for Gemini calls (GEMINI_THINKING_LEVEL, default "low").
+
+    Picking clips doesn't need deep reasoning, and Gemini 3.8 Flash bills its
+    thinking tokens as output, so "low" is cheaper and faster. Set the variable
+    to "medium" or "high" for more effort, or "" to use the model default.
+    """
+    level = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().upper()
+    if not level:
+        return None
+    try:
+        return types.ThinkingConfig(thinking_level=types.ThinkingLevel(level))
+    except (AttributeError, ValueError):
+        return None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import logging
 import re
 import shutil
@@ -9,7 +10,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import streamlit as st
 from pydantic import BaseModel
@@ -22,17 +22,20 @@ from autonomous_worker import (
     skip_lead,
 )
 from config import load_settings
-from core.agent_brain import select_clips_and_draft_pitch
 from core.downloader import (
     download_audio_only,
     download_source_video,
     extract_audio_only,
-    extract_audio_segment,
 )
 from core.clipper import rerender_clip
-from core.face_tracker import CropBox, analyze_vertical_crop, find_vertical_crop
+from core.face_tracker import CropBox
 from core.drive_uploader import upload_clips_to_drive
 from core.hook_selector import ClipResult, select_clips
+from core.pipeline import (
+    pick_clips_with_agent,
+    render_selected_clip,
+    video_info_and_peaks,
+)
 from core.storage_manager import (
     prune_output_folder,
     prune_stale_files,
@@ -40,15 +43,10 @@ from core.storage_manager import (
     render_output_dir,
     storage_usage_bytes,
 )
-from core.subtitle_engine import create_ass_subtitles
 from core.transcriber import (
-    Word,
-    clip_words_from_transcript,
     transcribe_audio,
-    transcribe_clip_audio,
     youtube_video_id,
 )
-from core.video_renderer import render_clip
 from main import _audio_duration, _video_duration
 
 
@@ -58,11 +56,11 @@ class OutreachPitch(BaseModel):
 
 
 LAYOUT_LABELS = {
-    "Auto": "auto",
+    "Auto (face crop when faces are clear)": "auto",
     "Blurred Background (Best for Sports)": "blurred_background",
     "Automotive / Wide Video (Blurred Background)": "wide_blurred_background",
     "Stacked Split-Screen": "stacked",
-    "Center Crop": "smart_crop",
+    "Face Crop (follows camera cuts)": "smart_crop",
 }
 
 
@@ -70,30 +68,21 @@ def _get_video_metadata(
     input_path: str | Path,
     channel_name_override: str = "",
     video_title_override: str = "",
-) -> tuple[str, str]:
+) -> tuple[str, str, list[tuple[float, float, float]]]:
+    """Title, channel and YouTube "Most replayed" peaks (empty for local files)."""
     source_value = str(input_path)
     if not source_value.startswith(("http://", "https://")):
         title = video_title_override.strip() or Path(input_path).stem
-        return title, channel_name_override.strip() or "your channel"
+        return title, channel_name_override.strip() or "your channel", []
 
-    from yt_dlp import YoutubeDL
-
-    with YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
-        metadata = ydl.extract_info(source_value, download=False)
-    if not isinstance(metadata, dict):
-        raise RuntimeError("Could not read video metadata for the outreach pitch.")
-
+    metadata, peaks = video_info_and_peaks(source_value)
     title = video_title_override.strip() or metadata.get("title")
-    channel = (
-        channel_name_override.strip()
-        or metadata.get("channel")
-        or metadata.get("uploader")
-    )
+    channel = channel_name_override.strip() or metadata.get("channel")
     if not isinstance(title, str) or not title.strip():
         raise RuntimeError("The video title is unavailable for the outreach pitch.")
     if not isinstance(channel, str) or not channel.strip():
         raise RuntimeError("The channel name is unavailable for the outreach pitch.")
-    return title.strip(), channel.strip()
+    return title.strip(), channel.strip(), peaks
 
 
 def _sanitize_outreach_video_title(video_title: str) -> str:
@@ -150,22 +139,6 @@ def _generate_outreach_pitch(
             "201-466-4807"
         ),
     )
-
-
-def _transcript_segments(words: list[Word]) -> list[dict[str, Any]]:
-    segments: list[dict[str, Any]] = []
-    for word in words:
-        start = word.segment_start if word.segment_start is not None else word.start
-        end = word.segment_end if word.segment_end is not None else word.end
-        if (
-            segments
-            and segments[-1]["start"] == start
-            and segments[-1]["end"] == end
-        ):
-            segments[-1]["text"] = f'{segments[-1]["text"]} {word.text}'.strip()
-        else:
-            segments.append({"start": start, "end": end, "text": word.text})
-    return segments
 
 
 def _render_copy_email_button(email_body: str) -> None:
@@ -380,8 +353,9 @@ def _generate_clips(
         update_progress(0.45, "")
 
         st.write("**Step 3 of 4: AI selecting three clip hooks**")
+        peaks: list[tuple[float, float, float]] = []
         try:
-            video_title, resolved_channel_name = _get_video_metadata(
+            video_title, resolved_channel_name, peaks = _get_video_metadata(
                 input_path,
                 st.session_state.get("outreach_channel_override", ""),
                 st.session_state.get("outreach_title_override", ""),
@@ -408,24 +382,15 @@ def _generate_clips(
 
         try:
             with st.spinner("Analyzing the transcript and drafting outreach..."):
-                agent_result = select_clips_and_draft_pitch(
-                    transcript_segments=_transcript_segments(words),
-                    channel_name=resolved_channel_name,
-                    video_title=video_title,
-                    drive_link="",
+                clips, outreach_email = pick_clips_with_agent(
+                    words,
+                    duration,
+                    clip_count,
+                    resolved_channel_name,
+                    video_title,
+                    peaks,
                 )
-            clips = [
-                ClipResult(
-                    start_time=float(selected["start_time"]),
-                    end_time=float(selected["end_time"]),
-                    viral_title=str(selected["hook_title"]),
-                    caption=str(selected["reason"]),
-                    hashtags=[],
-                    virality_score=0,
-                )
-                for selected in agent_result["clips"]
-            ]
-            st.session_state["ai_outreach_email"] = agent_result["outreach_email"]
+            st.session_state["ai_outreach_email"] = outreach_email
             st.session_state.pop("ai_clip_selection_error", None)
         except Exception as exc:
             logging.exception("AI clip selection failed; using the existing selector")
@@ -435,7 +400,9 @@ def _generate_clips(
                 "AI clip selection/outreach generation failed; using the existing "
                 f"clip selector instead. Details: {exc}"
             )
-            clips = select_clips(words, duration, clip_count, settings)[:clip_count]
+            clips = select_clips(
+                words, duration, clip_count, settings, replay_peaks_hint=peaks
+            )[:clip_count]
 
         st.session_state["agent_video_title"] = video_title
         st.session_state["agent_channel_name"] = resolved_channel_name
@@ -474,71 +441,31 @@ def _generate_clips(
 
         def render_one(index: int, clip: ClipResult) -> tuple[Path, ClipResult]:
             output_path = output_dir / f"clip_{run_id}_{index:02d}.mp4"
-            subtitle_path = settings.temp_dir / f"{output_path.stem}.ass"
-            clip_audio_path = settings.temp_dir / f"{output_path.stem}.wav"
-            video_path = source_video
-            video_start = clip.start_time
-            video_end = clip.end_time
-            rendered_successfully = False
+            if source_video is None:
+                raise RuntimeError("No source video is available for rendering.")
             try:
-                if video_path is None:
-                    raise RuntimeError("No source video is available for rendering.")
-                # The full transcript already has word timings; reuse them instead
-                # of re-transcribing every clip (saves 3 API calls per video).
-                clip_words = clip_words_from_transcript(words, video_start, video_end)
-                if clip_words is None:
-                    extract_audio_segment(
-                        video_path,
-                        video_start,
-                        video_end,
-                        clip_audio_path,
-                    )
-                    clip_words = transcribe_clip_audio(clip_audio_path, settings)
-                create_ass_subtitles(
-                    clip_words,
-                    subtitle_path,
-                    clip_duration=video_end - video_start,
-                )
-                render_layout = layout_mode
-                if layout_mode == "auto":
-                    crop_analysis = analyze_vertical_crop(
-                        video_path,
-                        video_start,
-                        video_end,
-                    )
-                    render_layout = (
-                        "wide_blurred_background"
-                        if crop_analysis.use_wide_layout
-                        else "blurred_background"
-                    )
-                    crop = crop_analysis.crop
-                else:
-                    crop = find_vertical_crop(video_path, video_start, video_end)
-                rendered_path = render_clip(
-                    video_path,
-                    subtitle_path,
-                    crop,
-                    video_start,
-                    video_end,
+                result = render_selected_clip(
+                    source_video,
+                    clip,
+                    words,
+                    settings,
                     output_path,
-                    layout_mode=render_layout,
+                    layout_mode=layout_mode,
                 )
-                rendered_successfully = True
-                render_contexts[str(rendered_path)] = {
-                    "source_path": str(video_path),
-                    "words": words,
-                    "layout_mode": render_layout,
-                    "crop": crop,
-                    "start_time": clip.start_time,
-                    "end_time": clip.end_time,
-                    "source_duration": duration,
-                }
-            finally:
-                clip_audio_path.unlink(missing_ok=True)
-                subtitle_path.unlink(missing_ok=True)
-                if not rendered_successfully:
-                    output_path.unlink(missing_ok=True)
-            return rendered_path, clip
+            except Exception:
+                output_path.unlink(missing_ok=True)
+                raise
+            render_contexts[str(result.path)] = {
+                "source_path": str(source_video),
+                "words": words,
+                "layout_mode": result.layout_mode,
+                "crop": result.crop,
+                "crop_plan": result.crop_plan,
+                "start_time": clip.start_time,
+                "end_time": clip.end_time,
+                "source_duration": duration,
+            }
+            return result.path, clip
 
         if len(clips) == 3:
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -686,8 +613,8 @@ def main() -> None:
             )
             clip_count = 3
             st.caption("The AI agent selects and renders exactly three clips.")
-            if "crop_mode" not in st.session_state:
-                st.session_state["crop_mode"] = "Auto"
+            if st.session_state.get("crop_mode") not in LAYOUT_LABELS:
+                st.session_state["crop_mode"] = next(iter(LAYOUT_LABELS))
             layout_label = st.selectbox(
                 "Layout mode",
                 list(LAYOUT_LABELS),
@@ -875,6 +802,10 @@ def main() -> None:
                                         cached_crop=cached_crop,
                                         layout_mode=str(context["layout_mode"]),
                                         source_duration=float(context["source_duration"]),
+                                        crop_plan=context.get("crop_plan"),
+                                        hook_title=clip.viral_title,
+                                        hook_seconds=settings.hook_title_seconds,
+                                        highlight_active_word=settings.caption_highlight,
                                     )
                                 except Exception as exc:
                                     logging.exception(
@@ -921,14 +852,16 @@ def main() -> None:
                     if clip.hashtags:
                         st.markdown(" ".join(f"#{tag.lstrip('#')}" for tag in clip.hashtags))
                     if clip_path.is_file() and clip_path.stat().st_size > 0:
-                        with clip_path.open("rb") as video_file:
-                            st.download_button(
-                                "Download clip",
-                                data=video_file.read(),
-                                file_name=clip_path.name,
-                                mime="video/mp4",
-                                key=f"download_{clip_path.name}",
-                            )
+                        # Read the file only when the button is clicked, not on
+                        # every rerun of the page.
+                        st.download_button(
+                            "Download clip",
+                            data=functools.partial(clip_path.read_bytes),
+                            file_name=clip_path.name,
+                            mime="video/mp4",
+                            key=f"download_{clip_path.name}",
+                            on_click="ignore",
+                        )
 
             if st.session_state.get("drive_folder_link"):
                 st.info(

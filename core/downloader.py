@@ -25,6 +25,7 @@ VIDEO_FORMAT = (
 )
 
 __all__ = [
+    "fetch_video_info",
     "download_audio_only",
     "download_source_video",
     "download_video_segment",
@@ -130,6 +131,29 @@ def download_source_video(
             f"The downloaded source video is missing from the expected path: {destination}"
         )
     return str(destination)
+
+
+def fetch_video_info(url: str) -> dict[str, object]:
+    """Title, channel and YouTube "Most replayed" heatmap, without downloading.
+
+    The heatmap is a list of {"start_time", "end_time", "value"} dicts, or None
+    when YouTube has none (new or low-view videos).
+    """
+    from yt_dlp import YoutubeDL
+
+    with YoutubeDL(
+        {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+    ) as downloader:
+        info = downloader.extract_info(url, download=False)
+    if not isinstance(info, dict):
+        raise RuntimeError(f"Could not read video metadata for {url}")
+    heatmap = info.get("heatmap")
+    return {
+        "title": info.get("title"),
+        "channel": info.get("channel") or info.get("uploader"),
+        "duration": info.get("duration"),
+        "heatmap": heatmap if isinstance(heatmap, list) else None,
+    }
 
 
 def _require_ffmpeg() -> str:

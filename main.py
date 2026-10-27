@@ -17,25 +17,21 @@ from core.downloader import (
     download_audio_only,
     download_source_video,
     extract_audio_only,
-    extract_audio_segment,
 )
-from core.face_tracker import analyze_vertical_crop
 from core.hook_selector import select_clips
+from core.pipeline import render_selected_clip, video_info_and_peaks
 from core.storage_manager import (
     prune_output_folder,
     prune_stale_files,
     render_output_dir,
 )
-from core.subtitle_engine import create_ass_subtitles
 from core.transcriber import (
     Word,
-    clip_words_from_transcript,
     transcribe_audio,
-    transcribe_clip_audio,
     transcribe_youtube_captions,
     youtube_video_id,
 )
-from core.video_renderer import LAYOUT_MODES, render_clip
+from core.video_renderer import SELECTABLE_LAYOUTS
 
 
 def _video_duration(video_path: Path) -> float:
@@ -107,7 +103,7 @@ def _words_for_clip(words: list[Word], start: float, end: float) -> list[Word]:
 def run_pipeline(
     input_path: str,
     clips_count: int,
-    layout_mode: str = "blurred_background",
+    layout_mode: str = "auto",
 ) -> list[Path]:
     settings = load_settings()
     output_dir = render_output_dir()
@@ -139,8 +135,11 @@ def run_pipeline(
 
             logging.info("Transcribing audio for %s", input_path)
             words = transcribe_audio(audio_path, settings)
+        peaks: list[tuple[float, float, float]] = []
+        if is_url:
+            _info, peaks = video_info_and_peaks(input_path)
         logging.info("Selecting up to %d clips", clips_count)
-        clips = select_clips(words, duration, clips_count, settings)
+        clips = select_clips(words, duration, clips_count, settings, replay_peaks_hint=peaks)
         audio_path.unlink(missing_ok=True)
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -153,61 +152,30 @@ def run_pipeline(
             downloaded_source = Path(download_source_video(input_path))
             source_video = downloaded_source
 
+        if source_video is None:
+            raise RuntimeError("No source video is available for rendering.")
         rendered: list[Path] = []
         for index, clip in enumerate(tqdm(clips, desc="Rendering clips"), start=1):
             output_path = output_dir / f"clip_{run_id}_{index:02d}.mp4"
-            subtitle_path = settings.temp_dir / f"{output_path.stem}.ass"
-            clip_audio_path = settings.temp_dir / f"{output_path.stem}.wav"
-            video_path = source_video
-            video_start = clip.start_time
-            video_end = clip.end_time
-            rendered_successfully = False
             try:
-                if video_path is None:
-                    raise RuntimeError("No source video is available for rendering.")
-                # Reuse word timings from the full transcript when it has them;
-                # only re-transcribe when it came from caption lines.
-                clip_words = clip_words_from_transcript(words, video_start, video_end)
-                if clip_words is None:
-                    extract_audio_segment(
-                        video_path,
-                        video_start,
-                        video_end,
-                        clip_audio_path,
-                    )
-                    clip_words = transcribe_clip_audio(clip_audio_path, settings)
-                create_ass_subtitles(
-                    clip_words,
-                    subtitle_path,
-                    clip_duration=video_end - video_start,
-                )
-                crop_analysis = analyze_vertical_crop(video_path, video_start, video_end)
-                render_layout = (
-                    "wide_blurred_background"
-                    if crop_analysis.use_wide_layout
-                    else layout_mode
-                )
-                rendered_path = render_clip(
-                    video_path,
-                    subtitle_path,
-                    crop_analysis.crop,
-                    video_start,
-                    video_end,
+                result = render_selected_clip(
+                    source_video,
+                    clip,
+                    words,
+                    settings,
                     output_path,
-                    layout_mode=render_layout,
+                    layout_mode=layout_mode,
                 )
-                rendered.append(rendered_path)
-                rendered_successfully = True
-            finally:
-                clip_audio_path.unlink(missing_ok=True)
-                subtitle_path.unlink(missing_ok=True)
-                if not rendered_successfully:
-                    output_path.unlink(missing_ok=True)
+            except Exception:
+                output_path.unlink(missing_ok=True)
+                raise
+            rendered.append(result.path)
             logging.info(
-                "Rendered %s — %s (score %d)",
+                "Rendered %s — %s (score %d, %s)",
                 output_path,
                 clip.viral_title,
                 clip.virality_score,
+                result.layout_mode,
             )
         return rendered
     finally:
@@ -233,9 +201,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--layout",
-        choices=LAYOUT_MODES,
-        default="blurred_background",
-        help="Vertical framing layout (default: blurred_background).",
+        choices=SELECTABLE_LAYOUTS,
+        default="auto",
+        help=(
+            "Vertical framing layout (default: auto = full-screen face crop that "
+            "follows camera cuts when faces are clear, otherwise blurred background)."
+        ),
     )
     args = parser.parse_args()
     if args.clips < 1:
