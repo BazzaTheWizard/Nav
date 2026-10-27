@@ -450,16 +450,29 @@ def _enqueue_leads(leads: list[dict[str, Any]]) -> int:
     return added
 
 
+def _lead_priority(lead: dict[str, Any]) -> int:
+    """Queue rank. A lead that failed drops back so it doesn't block the queue."""
+    try:
+        priority = int(lead.get("priority", 0) or 0)
+        attempts = int(lead.get("attempts", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return priority - 3 * attempts
+
+
 def _pop_fresh_lead() -> dict[str, Any] | None:
-    """Take the next unprocessed lead off the queue and reserve it atomically."""
+    """Take the best unprocessed lead off the queue and reserve it atomically.
+
+    Best = highest "priority" (Shorts gap, email found, video length); ties keep
+    the order they were found in. Leads queued before priorities existed count as 0.
+    """
     with _worker_lock():
         queue = _lead_queue()
         state = _processed_state()
         processed_channels = set(state["processed_channel_ids"])
         processed_videos = set(state["processed_video_ids"])
-        chosen: dict[str, Any] | None = None
-        while queue:
-            lead = queue.pop(0)
+        valid: list[dict[str, Any]] = []
+        for lead in queue:
             channel_id = str(lead.get("channel_id", ""))
             video_url = str(lead.get("latest_video_url", ""))
             video_id = video_url.rsplit("=", maxsplit=1)[-1]
@@ -469,12 +482,50 @@ def _pop_fresh_lead() -> dict[str, Any] | None:
                 and channel_id not in processed_channels
                 and video_id not in processed_videos
             ):
-                chosen = lead
-                break
-        _write_json_atomic(LEAD_QUEUE_PATH, queue)
+                valid.append(lead)
+        chosen: dict[str, Any] | None = None
+        if valid:
+            chosen = max(valid, key=_lead_priority)  # max() keeps the first of equals
+            valid.remove(chosen)
+        _write_json_atomic(LEAD_QUEUE_PATH, valid)
         if chosen is not None:
             _reserve_lead(state, chosen)
         return chosen
+
+
+def get_lead_queue() -> list[dict[str, Any]]:
+    """Queued creators in the order the worker will take them (for the app)."""
+    with _worker_lock():
+        queue = _lead_queue()
+    return sorted(queue, key=_lead_priority, reverse=True)  # sorted() is stable
+
+
+def skip_queued_lead(channel_id: str, reason: str = "user_skipped_before_processing") -> bool:
+    """Remove a creator from the queue before any work is done on them."""
+    if not channel_id.strip():
+        raise ValueError("channel_id must not be empty.")
+    with _worker_lock():
+        queue = _lead_queue()
+        remaining = [lead for lead in queue if str(lead.get("channel_id")) != channel_id]
+        if len(remaining) == len(queue):
+            return False
+        skipped = next(lead for lead in queue if str(lead.get("channel_id")) == channel_id)
+        _write_json_atomic(LEAD_QUEUE_PATH, remaining)
+        skipped_leads = _skipped_records()
+        skipped_leads.append(
+            {
+                **skipped,
+                "status": "skipped",
+                "skip_reason": reason,
+                "skipped_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        _write_json_atomic(SKIPPED_LEADS_PATH, skipped_leads)
+        seen = set(_seen_channels())
+        seen.add(channel_id)
+        _write_json_atomic(SEEN_CHANNELS_PATH, sorted(seen))
+    logger.info("Skipped queued lead %s (%s).", skipped.get("channel_title", channel_id), channel_id)
+    return True
 
 
 def _reserve_lead(
@@ -492,6 +543,11 @@ def _reserve_lead(
             "channel_title": str(lead["channel_title"]),
             "status": "processing",
             "created_at": datetime.now(timezone.utc).isoformat(),
+            # Kept so the Shorts cut-offs can be tuned later against what you skip.
+            "priority": lead.get("priority"),
+            "shorts": lead.get("shorts"),
+            "has_email": bool(lead.get("contact_email")),
+            "duration_seconds": lead.get("duration_seconds"),
         }
     )
     _write_json_atomic(PROCESSED_CREATORS_PATH, state)

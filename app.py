@@ -17,10 +17,12 @@ from pydantic import BaseModel
 
 from autonomous_worker import (
     get_cached_leads,
+    get_lead_queue,
     get_pending_outreach,
     is_youtube_quota_exhausted,
     mark_outreach_sent,
     skip_lead,
+    skip_queued_lead,
 )
 from config import load_settings
 from core.downloader import (
@@ -60,6 +62,54 @@ class OutreachPitch(BaseModel):
 # saved in storage/processed_creators.json so the worker never contacts them again.
 # Add "skipped" here to hide creators you passed on as well.
 FINISHED_LEAD_STATUSES = frozenset({"sent", "completed", "skipped"})
+
+
+QUEUE_PREVIEW_SIZE = 15
+
+
+def _render_lead_queue() -> None:
+    """Up-next list: the worker takes these top-down; one click skips a creator."""
+    try:
+        queue = get_lead_queue()
+    except Exception as exc:
+        st.error(f"Could not read the lead queue: {exc}")
+        return
+    st.subheader(f"Up next ({len(queue)} in queue)")
+    if not queue:
+        st.caption("The queue is empty. The worker will look for new creators when it needs one.")
+        return
+    st.caption(
+        "The worker processes these from the top, automatically. "
+        "Skip anyone you don't want before it gets to them."
+    )
+    for index, lead in enumerate(queue[:QUEUE_PREVIEW_SIZE]):
+        channel_id = str(lead.get("channel_id", ""))
+        title = lead.get("channel_title") or channel_id or "Creator"
+        channel_url = lead.get("channel_url") or f"https://www.youtube.com/channel/{channel_id}"
+        subscribers = lead.get("subscriber_count")
+        subscriber_text = f"{int(subscribers):,} subs" if isinstance(subscribers, int) else "subs hidden"
+        email = lead.get("contact_email")
+        email_text = f"✉️ {email}" if email else "no email found"
+        seconds = lead.get("duration_seconds")
+        length_text = f"{int(seconds) // 60} min" if isinstance(seconds, int) else "length unknown"
+        video_url = lead.get("latest_video_url") or ""
+        video_title = lead.get("latest_video_title") or "Target video"
+        shorts_text = lead.get("shorts_summary") or "Shorts: not checked (queued before this update)"
+        with st.container(border=True):
+            info, action = st.columns([6, 1])
+            with info:
+                st.markdown(f"**{index + 1}. [{title}]({channel_url})** · {subscriber_text} · {email_text}")
+                st.caption(f"{shorts_text} · [{video_title}]({video_url}) ({length_text})")
+            with action:
+                if st.button("Skip", key=f"skip_queued_{channel_id}_{index}", use_container_width=True):
+                    try:
+                        skip_queued_lead(channel_id)
+                    except Exception as exc:
+                        st.error(f"Could not skip: {exc}")
+                    else:
+                        st.rerun()
+    if len(queue) > QUEUE_PREVIEW_SIZE:
+        st.caption(f"…and {len(queue) - QUEUE_PREVIEW_SIZE} more.")
 
 
 def _latest_lead_records() -> list[dict[str, Any]]:
@@ -1126,6 +1176,8 @@ def main() -> None:
                 "Autonomous worker is ready. Background process queries YouTube for high-potential creator leads.",
                 icon="🧭",
             )
+
+        _render_lead_queue()
 
         with st.container(border=True):
             st.subheader("Autonomous Worker Architecture")

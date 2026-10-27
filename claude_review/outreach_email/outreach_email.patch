@@ -1,0 +1,369 @@
+diff --git a/app.py b/app.py
+index 20b2600..ef0d467 100644
+--- a/app.py
++++ b/app.py
+@@ -33,6 +33,7 @@ from core.downloader import (
+ from core.clipper import rerender_clip
+ from core.face_tracker import CropBox
+ from core.drive_uploader import upload_clips_to_drive
++from core.outreach import SUBJECT, build_outreach_email, fill_drive_link
+ from core.hook_selector import ClipResult, select_clips
+ from core.pipeline import (
+     pick_clips_with_agent,
+@@ -185,7 +186,9 @@ def _generate_outreach_pitch(
+     video_title: str,
+     drive_link: str,
+     clip_count: int,
++    channel_name: str = "",
+ ) -> OutreachPitch:
++    """Email for when the AI step didn't produce one (same template as the worker)."""
+     clean_title = _sanitize_outreach_video_title(video_title)
+     if not clean_title:
+         raise ValueError("The video title is empty after cleaning.")
+@@ -195,24 +198,12 @@ def _generate_outreach_pitch(
+         raise ValueError("At least one uploaded clip is required for the outreach email.")
+ 
+     return OutreachPitch(
+-        subject=f"{clip_count} ready-to-post shorts for your {clean_title}",
+-        body=(
+-            "Hi team,\n\n"
+-            f'Loved the energy in your "{clean_title}" upload—there were a couple '
+-            "of standout moments that work especially well for vertical platforms "
+-            "like TikTok, Reels, and Shorts.\n\n"
+-            f"To show you what I mean, I went ahead and edited {clip_count} vertical "
+-            "(9:16) shorts directly from that upload, complete with kinetic captions "
+-            "and active framing:\n\n"
+-            f"👉 Access the {clip_count} finished clips here: {drive_link}\n\n"
+-            "No strings attached—feel free to download and post them across YouTube "
+-            "Shorts, IG Reels, or TikTok if you like how they look.\n\n"
+-            "If you'd be interested in a hands-off setup that automatically turns "
+-            "every future upload into 3–5 optimized vertical clips, let me know and "
+-            "we can set something up.\n\n"
+-            "Best,\n"
+-            "Barry Navan\n"
+-            "201-466-4807"
++        subject=SUBJECT,
++        body=build_outreach_email(
++            channel_name,
++            video_title=clean_title,
++            drive_link=drive_link,
++            clip_count=clip_count,
+         ),
+     )
+ 
+@@ -486,6 +477,7 @@ def _generate_clips(
+             st.session_state["outreach_email_body"] = st.session_state[
+                 "ai_outreach_email"
+             ]
++            st.session_state["outreach_email_subject"] = SUBJECT
+         else:
+             st.session_state.pop("outreach_email_body", None)
+         st.session_state["outreach_video_title"] = video_title
+@@ -988,10 +980,7 @@ def main() -> None:
+                     st.session_state["drive_folder_link"] = drive_link
+                     ai_email = st.session_state.get("ai_outreach_email", "")
+                     if ai_email:
+-                        completed_email = ai_email.replace(
+-                            "Access the 3 edited clips here:\n\n",
+-                            f"Access the 3 edited clips here:\n{drive_link}\n\n",
+-                        )
++                        completed_email = fill_drive_link(ai_email, drive_link)
+                         st.session_state["ai_outreach_email"] = completed_email
+                         st.session_state["outreach_email_body"] = completed_email
+                     else:
+@@ -1000,6 +989,7 @@ def main() -> None:
+                                 video_title,
+                                 drive_link,
+                                 len(generated_clips),
++                                resolved_channel_name,
+                             )
+                         except Exception as exc:
+                             logging.exception("Fallback outreach email generation failed")
+@@ -1029,7 +1019,7 @@ def main() -> None:
+                     "📬 AI Creator Outreach Email Draft",
+                     expanded=True,
+                 ):
+-                    if not ai_email and pitch_data:
++                    if st.session_state.get("outreach_email_subject"):
+                         st.text_input(
+                             "Subject",
+                             key="outreach_email_subject",
+@@ -1236,6 +1226,11 @@ def main() -> None:
+                 if drive_link:
+                     st.link_button("Open Google Drive clips", drive_link)
+                 email_body = str(record.get("full_email_body") or "")
++                st.text_input(
++                    "Subject",
++                    value=str(record.get("subject") or SUBJECT),
++                    key=f"pending_subject_{record_id}",
++                )
+                 st.text_area(
+                     "Barry Navan outreach pitch",
+                     value=email_body,
+diff --git a/autonomous_worker.py b/autonomous_worker.py
+index 7900336..bfcf981 100644
+--- a/autonomous_worker.py
++++ b/autonomous_worker.py
+@@ -16,6 +16,7 @@ from config import PROJECT_ROOT, load_settings
+ from core.downloader import download_source_video, extract_audio_only
+ from core.drive_uploader import upload_clips_to_drive
+ from core.hook_selector import ClipResult
++from core.outreach import SUBJECT, fill_drive_link, is_old_template, rewrite_old_draft
+ from core.lead_harvester import (
+     YouTubeQuotaExceededError,
+     discover_channels,
+@@ -315,6 +316,17 @@ def get_pending_outreach() -> list[dict[str, Any]]:
+                     f"{record.get('target_video_id', uuid.uuid4().hex)}"
+                 )
+                 changed = True
++            # Unsent drafts written with the old template get the new email once.
++            body = str(record.get("full_email_body") or "")
++            if record.get("status", "pending") == "pending" and is_old_template(body):
++                record["full_email_body"] = rewrite_old_draft(
++                    body,
++                    str(record.get("channel_title") or ""),
++                    str(record.get("drive_link") or ""),
++                    str(record.get("video_title") or ""),
++                )
++                record.setdefault("subject", SUBJECT)
++                changed = True
+         if changed:
+             _write_json_atomic(PENDING_OUTREACH_PATH, pending)
+         return [
+@@ -664,10 +676,7 @@ def _process_lead(
+             video_title,
+             [str(path) for path in rendered],
+         )
+-        email_body = outreach_email.replace(
+-            "Access the 3 edited clips here:\n\n",
+-            f"Access the 3 edited clips here:\n{drive_link}\n\n",
+-        )
++        email_body = fill_drive_link(outreach_email, drive_link)
+         channel_url = str(
+             lead.get("channel_url")
+             or f"https://www.youtube.com/channel/{lead['channel_id']}"
+@@ -678,7 +687,9 @@ def _process_lead(
+             "channel_title": channel_title,
+             "contact_email": contact,
+             "drive_link": drive_link,
++            "subject": SUBJECT,
+             "full_email_body": email_body,
++            "video_title": video_title,
+             "created_at": datetime.now(timezone.utc).isoformat(),
+             "channel_id": str(lead["channel_id"]),
+             "target_video_id": video_id,
+diff --git a/core/agent_brain.py b/core/agent_brain.py
+index 9e4f110..33dd6e9 100644
+--- a/core/agent_brain.py
++++ b/core/agent_brain.py
+@@ -15,34 +15,14 @@ from core.gemini_resilience import (
+     gemini_thinking_config,
+     generate_content_with_fallback,
+ )
++from core.outreach import build_outreach_email, clean_topic
+ 
+ 
+ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ _JSON_CODE_BLOCK = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
+-_EMAIL_TEMPLATE = """Hello {recipient_name},
+-
+-I hope all is well.
+-
+-My name is Barry Navan and I am an aspiring entrepreneur building a short-form content agency that turns {channel_content_summary} into high-retention vertical clips formatted specifically for short-form algorithms. Since short-form video is redefining modern marketing, actively circulating these clips across your channels is crucial for reaching younger fans and maximizing visibility.
+-
+-I loved the "{video_title}" and thought there were a couple of standout sequence moments that work especially well for TikTok and Reels, particularly when {specific_moment_reference}.
+-
+-To show you what I mean, I edited 3 vertical (9:16) shorts directly from that video, complete with kinetic captions and active framing:
+-
+-Access the 3 edited clips here:
+-{drive_link}
+-
+-No strings attached—feel free to download and post them across YouTube Shorts, Instagram Reels, or TikTok if you like how they look.
+-
+-If you're interested in a hands-off setup that automatically turns every future video into 3–5 optimized vertical clips, let me know and we can set something up.
+-
+-Best,
+-Barry Navan
+-201-466-4807"""
+-
+ DEFAULT_CANDIDATE_COUNT = 5
+ 
+-_SYSTEM_PROMPT = f"""You are an expert short-form video editor and creator outreach writer.
++_SYSTEM_PROMPT = """You are an expert short-form video editor.
+ Analyze the supplied transcript and return one JSON object with:
+ - "clips": exactly "candidate_count" items (given in the request), ranked best
+   first, each with numeric start_time and end_time (seconds), hook_title (string,
+@@ -61,21 +41,17 @@ Analyze the supplied transcript and return one JSON object with:
+   Every clip must be between 30 and 60 seconds long. Each
+   clip must capture a complete, self-contained thought with a strong hook,
+   explanation, and natural conclusion. Use only transcript timestamps and do not invent dialogue.
+-- "channel_content_summary": one concise factual description of the channel/video
+-  content, suitable for the email.
+-- "specific_moment_reference": a concise reference to a specific moment in the
+-  transcript that fits the email sentence.
++- "video_topic": the specific topic of this video as a short phrase (3–10 words,
++  lowercase except names), written to complete the sentence "I cut 3 sample
++  Shorts from your recent video on ___". Be specific to what the video actually
++  covers, e.g. "squatting pain-free with knee arthritis", not "fitness".
+ - The clips must not overlap and should come from different parts of the
+   video.
+ - When "most_replayed" moments are supplied, YouTube viewers rewatched those
+   parts the most. Prefer clips that contain them, as long as each clip still
+   stands on its own.
+ 
+-The two text fields are inserted into this email template by the application
+-(do NOT return the email itself):
+-
+-{_EMAIL_TEMPLATE}
+-
++The application writes the outreach email itself; do NOT return an email.
+ Do not include markdown or extra commentary."""
+ 
+ 
+@@ -152,7 +128,7 @@ def select_clips_and_draft_pitch(
+     candidate_count: int = DEFAULT_CANDIDATE_COUNT,
+     replay_peaks: list[tuple[float, float, float]] | None = None,
+ ) -> dict[str, Any]:
+-    """Select three transcript clips and draft personalized outreach."""
++    """Select transcript clips and build the outreach email (see core/outreach.py)."""
+     if not transcript_segments:
+         raise ValueError("transcript_segments must not be empty.")
+     normalized_segments: list[dict[str, float | str]] = []
+@@ -240,24 +216,16 @@ def select_clips_and_draft_pitch(
+     if not validated_clips:
+         raise ValueError("The AI response did not contain any usable clips.")
+ 
+-    channel_content_summary = str(result.get("channel_content_summary", "")).strip()
+-    specific_moment_reference = str(
+-        result.get("specific_moment_reference", "")
+-    ).strip()
+-    if not channel_content_summary or not specific_moment_reference:
+-        raise ValueError(
+-            "The AI response must include channel_content_summary and "
+-            "specific_moment_reference."
+-        )
+-
+-    outreach_email = _EMAIL_TEMPLATE.format(
+-        recipient_name=channel_name.strip() or "there",
+-        channel_content_summary=channel_content_summary,
+-        video_title=video_title.strip(),
+-        specific_moment_reference=specific_moment_reference,
+-        drive_link=drive_link.strip(),
++    # A missing topic is not worth failing the lead over: the email falls back to
++    # the video title.
++    video_topic = clean_topic(result.get("video_topic"))
++    outreach_email = build_outreach_email(
++        channel_name,
++        video_title=video_title,
++        video_topic=video_topic,
++        drive_link=drive_link,
+     )
+-    return {"clips": validated_clips, "outreach_email": outreach_email}
++    return {"clips": validated_clips, "outreach_email": outreach_email, "video_topic": video_topic}
+ 
+ 
+ def qualify_channel_candidate(
+diff --git a/core/outreach.py b/core/outreach.py
+new file mode 100644
+index 0000000..d99ba8d
+--- /dev/null
++++ b/core/outreach.py
+@@ -0,0 +1,98 @@
++"""Creator outreach email: the one template used by the worker, the app and the AI step.
++
++Edit the wording here and every path (worker drafts, app drafts, fallback) changes
++together. The AI only supplies ``video_topic``; it never writes the email itself.
++"""
++from __future__ import annotations
++
++import re
++
++PORTFOLIO_URL = "https://navstudios.base44.app/#samples"
++DRIVE_LINK_PLACEHOLDER = "[Google Drive link is added after the clips upload]"
++SIGNATURE = "Best,\nBarry Navan\nNav Studios"
++SUBJECT = "3 ready-to-post Shorts from your latest video"
++
++_BODY = (
++    "Hi {recipient},\n\n"
++    "I run Nav, a short-form post-production and marketing agency that turns long-form "
++    "podcasts and video backlogs into high-retention vertical clips. "
++    "I already cut {clip_text} from your recent video {topic_text}, and they're in a "
++    "private Google Drive folder for you: {drive_link}\n\n"
++    "You can check out examples of our hook retention cuts, dynamic captions, and "
++    "production standards here: {portfolio_url}\n\n"
++    "No channel passwords or API access needed: we deliver raw MP4 files only, so just "
++    "reply if you'd like this for every new upload.\n\n"
++    "{signature}"
++)
++
++# Text from the old template, used to spot drafts written before this update.
++OLD_TEMPLATE_MARKERS = ("aspiring entrepreneur", "Access the 3 edited clips here:")
++_OLD_TITLE_PATTERN = re.compile(r'I loved the "(.+?)"')
++_FILE_EXTENSION = re.compile(r"\.(?:mp4|mov|mkv|webm|avi|m4v|mp3|wav|m4a)$", re.IGNORECASE)
++
++
++def clean_topic(topic: object) -> str:
++    """A topic phrase that reads well after 'your recent video on ...'."""
++    if not isinstance(topic, str):
++        return ""
++    text = " ".join(topic.split()).strip(" \"'“”‘’.,;:!-")
++    text = re.sub(r"^(?:on|about)\s+", "", text, flags=re.IGNORECASE)
++    if len(text) > 90:
++        text = text[:90].rsplit(" ", 1)[0]
++    return text
++
++
++def _clean_title(title: str) -> str:
++    text = _FILE_EXTENSION.sub("", " ".join(str(title or "").split()))
++    return text.replace("_", " ").strip(" \"'“”")
++
++
++def build_outreach_email(
++    channel_name: str,
++    video_title: str = "",
++    video_topic: str = "",
++    drive_link: str = "",
++    clip_count: int = 3,
++) -> str:
++    """The full email. Without a Drive link yet, a placeholder marks where it goes."""
++    topic = clean_topic(video_topic)
++    title = _clean_title(video_title)
++    if topic:
++        topic_text = f"on {topic}"
++    elif title:
++        topic_text = f'"{title}"'
++    else:
++        topic_text = ""
++    clip_text = f"{clip_count} sample Short" + ("" if clip_count == 1 else "s")
++    body = _BODY.format(
++        recipient=channel_name.strip() or "there",
++        clip_text=clip_text,
++        topic_text=topic_text,
++        drive_link=drive_link.strip() or DRIVE_LINK_PLACEHOLDER,
++        portfolio_url=PORTFOLIO_URL,
++        signature=SIGNATURE,
++    )
++    return body.replace("your recent video , and", "your recent video, and")
++
++
++def fill_drive_link(email: str, drive_link: str) -> str:
++    """Put the Drive folder link into a draft made before the upload."""
++    if DRIVE_LINK_PLACEHOLDER in email:
++        return email.replace(DRIVE_LINK_PLACEHOLDER, drive_link.strip())
++    # Drafts from the old template.
++    return email.replace(
++        "Access the 3 edited clips here:\n\n",
++        f"Access the 3 edited clips here:\n{drive_link.strip()}\n\n",
++    )
++
++
++def is_old_template(email: str) -> bool:
++    return any(marker in email for marker in OLD_TEMPLATE_MARKERS)
++
++
++def rewrite_old_draft(email: str, channel_name: str, drive_link: str, video_title: str = "") -> str:
++    """Rebuild a not-yet-sent draft from the old template with the new one."""
++    if not video_title:
++        match = _OLD_TITLE_PATTERN.search(email)
++        video_title = match.group(1) if match else ""
++    return build_outreach_email(channel_name, video_title=video_title, drive_link=drive_link)
