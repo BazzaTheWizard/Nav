@@ -1,0 +1,23 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+storage/raw/*
+!storage/raw/.gitkeep
+storage/temp/*
+!storage/temp/.gitkeep
+storage/output/*
+!storage/output/.gitkeep
+client_secret.json
+token.json
+service_account.json
+
+# macOS and patch leftovers
+.DS_Store
+*.orig
+*.rej
+# Old code dump: AI tools may read it instead of the real files
+project_code_bundle.txt
+# Worker state (contains creator contact details)
+storage/*.json
+storage/.autonomous_worker.lock

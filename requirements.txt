@@ -1,0 +1,18 @@
+faster-whisper
+av<19
+youtube-transcript-api
+openai
+google-api-python-client
+google-auth-oauthlib
+google-genai
+pydantic
+# Install exactly ONE OpenCV package. OpenCV 5 drops cv2.CascadeClassifier from
+# the main package, which silently disables face tracking (center crop only).
+opencv-python-headless>=4.10,<5
+python-dotenv
+groq
+tqdm
+yt-dlp
+streamlit
+requests
+certifi
