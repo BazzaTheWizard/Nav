@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import logging
+import subprocess
+import uuid
+from pathlib import Path
+from typing import Any
+
+from config import PROJECT_ROOT
+from core.face_tracker import CropBox, CropPlan
+from core.subtitle_engine import create_ass_subtitles
+from core.title_card import TitleOverlay, prepare_title_overlay
+from core.transcriber import Word
+from core.video_renderer import CROP_LAYOUTS, render_clip
+
+logger = logging.getLogger(__name__)
+
+
+MIN_CLIP_DURATION = 15.0
+MAX_CLIP_DURATION = 90.0
+
+
+def _word_value(word: Word | dict[str, Any], key: str) -> Any:
+    if isinstance(word, dict):
+        return word[key]
+    return getattr(word, key)
+
+
+def _center_crop(source_path: Path, cached_crop_x: int | None) -> CropBox:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=s=x:p=0",
+                str(source_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        width_text, height_text = result.stdout.strip().split("x", maxsplit=1)
+        input_width, input_height = int(width_text), int(height_text)
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        raise RuntimeError(
+            f"Could not read source video dimensions for re-rendering: {source_path}"
+        ) from exc
+
+    if input_width <= 0 or input_height <= 0:
+        raise ValueError(f"Source video has invalid dimensions: {source_path}")
+    if input_width / input_height >= 9 / 16:
+        crop_width = min(input_width, round(input_height * 9 / 16))
+        crop_height = input_height
+    else:
+        crop_width = input_width
+        crop_height = min(input_height, round(input_width * 16 / 9))
+    crop_x = (
+        (input_width - crop_width) // 2
+        if cached_crop_x is None
+        else min(max(cached_crop_x, 0), input_width - crop_width)
+    )
+    crop_y = (input_height - crop_height) // 2
+    return CropBox(crop_x, crop_y, crop_width, crop_height)
+
+
+def rerender_clip(
+    source_path: str | Path,
+    new_start: float,
+    new_end: float,
+    transcript_words: list[Word] | list[dict[str, Any]],
+    output_path: str | Path,
+    cached_crop_x: int | None = None,
+    *,
+    cached_crop: CropBox | None = None,
+    layout_mode: str = "smart_crop",
+    source_duration: float | None = None,
+    crop_plan: CropPlan | None = None,
+    hook_title: str | None = None,
+    hook_seconds: float = 0.0,
+    highlight_active_word: bool = True,
+    hook_style: str | None = None,
+) -> Path:
+    duration = new_end - new_start
+    if not MIN_CLIP_DURATION <= duration <= MAX_CLIP_DURATION:
+        raise ValueError("Adjusted clip duration must remain between 15 and 90 seconds.")
+    if new_start < 0:
+        raise ValueError("Adjusted clip start must be non-negative.")
+    if source_duration is not None and new_end > source_duration:
+        raise ValueError("Adjusted clip boundaries must stay within the source video.")
+
+    source = Path(source_path).expanduser().resolve(strict=True)
+    destination = Path(output_path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_output = destination.with_name(
+        f"{destination.stem}_rerender_{uuid.uuid4().hex}.mp4"
+    )
+    temp_dir = PROJECT_ROOT / "storage" / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    subtitle_path = temp_dir / (
+        f"sub_{int(new_start * 100)}_{int(new_end * 100)}_{uuid.uuid4().hex}.ass"
+    )
+    title: TitleOverlay | None = None
+    try:
+        clip_words: list[Word] = []
+        for word in transcript_words:
+            word_start = float(_word_value(word, "start"))
+            word_end = float(_word_value(word, "end"))
+            if word_end <= new_start or word_start >= new_end:
+                continue
+            relative_start = max(0.0, word_start - new_start)
+            relative_end = max(
+                relative_start + 0.05,
+                min(duration, word_end - new_start),
+            )
+            clip_words.append(
+                Word(
+                    text=str(_word_value(word, "text")),
+                    start=relative_start,
+                    end=relative_end,
+                )
+            )
+        crop = cached_crop
+        if crop is None:
+            crop = _center_crop(source, cached_crop_x)
+        elif cached_crop_x is not None:
+            crop = CropBox(
+                x=cached_crop_x,
+                y=crop.y,
+                width=crop.width,
+                height=crop.height,
+            )
+
+        x_expression = None
+        if crop_plan is not None and layout_mode in CROP_LAYOUTS:
+            crop = crop_plan.crop
+            x_expression = crop_plan.x_expression(new_start, new_end)
+
+        try:
+            title = prepare_title_overlay(
+                hook_title,
+                hook_seconds,
+                layout=layout_mode,
+                plan=crop_plan,
+                crop=crop,
+                source_video=source,
+                clip_start=new_start,
+                clip_duration=duration,
+                work_dir=temp_dir,
+                name=subtitle_path.stem,
+                style=hook_style,
+            )
+        except Exception:
+            logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
+        create_ass_subtitles(
+            clip_words,
+            subtitle_path,
+            clip_duration=duration,
+            highlight_active_word=highlight_active_word,
+            # The card replaces the old subtitle-style title; that one is only a fallback.
+            hook_title=None if title else hook_title,
+            hook_seconds=hook_seconds,
+        )
+        render_clip(
+            source,
+            subtitle_path,
+            crop,
+            new_start,
+            new_end,
+            temporary_output,
+            layout_mode=layout_mode,
+            crop_x_expression=x_expression,
+            title=title,
+        )
+        temporary_output.replace(destination)
+    finally:
+        subtitle_path.unlink(missing_ok=True)
+        temporary_output.unlink(missing_ok=True)
+        if title is not None:
+            title.image_path.unlink(missing_ok=True)
+    return destination

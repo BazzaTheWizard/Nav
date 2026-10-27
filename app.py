@@ -59,7 +59,7 @@ class OutreachPitch(BaseModel):
 # Leads with these statuses are done, so the Lead Finder tab hides them. They stay
 # saved in storage/processed_creators.json so the worker never contacts them again.
 # Add "skipped" here to hide creators you passed on as well.
-FINISHED_LEAD_STATUSES = frozenset({"sent", "completed"})
+FINISHED_LEAD_STATUSES = frozenset({"sent", "completed", "skipped"})
 
 
 def _latest_lead_records() -> list[dict[str, Any]]:
