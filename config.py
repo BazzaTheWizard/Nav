@@ -21,8 +21,10 @@ class Settings:
     raw_dir: Path
     temp_dir: Path
     output_dir: Path
-    # Seconds the clip's hook title stays on screen at the top (0 turns it off).
+    # Seconds the clip's hook title stays on screen (0 turns it off).
     hook_title_seconds: float = 4.0
+    # Hook title card look: "light" (white card, dark text) or "dark".
+    hook_title_style: str = "light"
     # Colour the word being spoken inside each caption card.
     caption_highlight: bool = True
 
@@ -49,6 +51,7 @@ def load_settings() -> Settings:
         temp_dir=PROJECT_ROOT / "storage" / "temp",
         output_dir=PROJECT_ROOT / "storage" / "output",
         hook_title_seconds=_float_env("HOOK_TITLE_SECONDS", 4.0),
+        hook_title_style=os.getenv("HOOK_TITLE_STYLE", "light").strip().lower() or "light",
         caption_highlight=os.getenv("CAPTION_HIGHLIGHT", "1").strip().lower()
         not in {"0", "false", "no", "off"},
     )

@@ -14,5 +14,6 @@ groq
 tqdm
 yt-dlp
 streamlit
+pillow
 requests
 certifi

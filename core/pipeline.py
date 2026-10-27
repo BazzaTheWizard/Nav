@@ -17,6 +17,7 @@ from core.downloader import extract_audio_segment, fetch_video_info
 from core.face_tracker import CropBox, CropPlan, analyze_crop_plan
 from core.hook_selector import ClipResult, finalize_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
+from core.title_card import TitleOverlay, prepare_title_overlay
 from core.transcriber import (
     Word,
     clip_words_from_transcript,
@@ -78,6 +79,7 @@ def render_selected_clip(
     subtitle_path = work_dir / f"{output_path.stem}.ass"
     clip_audio_path = work_dir / f"{output_path.stem}.wav"
     start, end = clip.start_time, clip.end_time
+    title: TitleOverlay | None = None
     try:
         clip_words = clip_words_from_transcript(words, start, end)
         if clip_words is None:
@@ -98,12 +100,29 @@ def render_selected_clip(
         else:
             crop, x_expression = _PLACEHOLDER_CROP, None
 
+        try:
+            title = prepare_title_overlay(
+                clip.viral_title,
+                settings.hook_title_seconds,
+                layout=layout,
+                plan=plan,
+                crop=crop,
+                source_video=source_video,
+                clip_start=start,
+                clip_duration=end - start,
+                work_dir=work_dir,
+                name=output_path.stem,
+                style=settings.hook_title_style,
+            )
+        except Exception:
+            logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
         create_ass_subtitles(
             clip_words,
             subtitle_path,
             clip_duration=end - start,
             highlight_active_word=settings.caption_highlight,
-            hook_title=clip.viral_title,
+            # The card replaces the old subtitle-style title; that one is only a fallback.
+            hook_title=None if title else clip.viral_title,
             hook_seconds=settings.hook_title_seconds,
         )
         rendered = render_clip(
@@ -115,6 +134,7 @@ def render_selected_clip(
             output_path,
             layout_mode=layout,
             crop_x_expression=x_expression,
+            title=title,
         )
         logger.info(
             "Rendered %s (%s, %d shot(s))",
@@ -132,6 +152,8 @@ def render_selected_clip(
     finally:
         subtitle_path.unlink(missing_ok=True)
         clip_audio_path.unlink(missing_ok=True)
+        if title is not None:
+            title.image_path.unlink(missing_ok=True)
 
 
 def pick_clips_with_agent(

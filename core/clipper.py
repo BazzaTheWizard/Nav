@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 import uuid
 from pathlib import Path
@@ -8,8 +9,11 @@ from typing import Any
 from config import PROJECT_ROOT
 from core.face_tracker import CropBox, CropPlan
 from core.subtitle_engine import create_ass_subtitles
+from core.title_card import TitleOverlay, prepare_title_overlay
 from core.transcriber import Word
 from core.video_renderer import CROP_LAYOUTS, render_clip
+
+logger = logging.getLogger(__name__)
 
 
 MIN_CLIP_DURATION = 15.0
@@ -80,6 +84,7 @@ def rerender_clip(
     hook_title: str | None = None,
     hook_seconds: float = 0.0,
     highlight_active_word: bool = True,
+    hook_style: str | None = None,
 ) -> Path:
     duration = new_end - new_start
     if not MIN_CLIP_DURATION <= duration <= MAX_CLIP_DURATION:
@@ -100,6 +105,7 @@ def rerender_clip(
     subtitle_path = temp_dir / (
         f"sub_{int(new_start * 100)}_{int(new_end * 100)}_{uuid.uuid4().hex}.ass"
     )
+    title: TitleOverlay | None = None
     try:
         clip_words: list[Word] = []
         for word in transcript_words:
@@ -119,15 +125,6 @@ def rerender_clip(
                     end=relative_end,
                 )
             )
-        create_ass_subtitles(
-            clip_words,
-            subtitle_path,
-            clip_duration=duration,
-            highlight_active_word=highlight_active_word,
-            hook_title=hook_title,
-            hook_seconds=hook_seconds,
-        )
-
         crop = cached_crop
         if crop is None:
             crop = _center_crop(source, cached_crop_x)
@@ -143,6 +140,32 @@ def rerender_clip(
         if crop_plan is not None and layout_mode in CROP_LAYOUTS:
             crop = crop_plan.crop
             x_expression = crop_plan.x_expression(new_start, new_end)
+
+        try:
+            title = prepare_title_overlay(
+                hook_title,
+                hook_seconds,
+                layout=layout_mode,
+                plan=crop_plan,
+                crop=crop,
+                source_video=source,
+                clip_start=new_start,
+                clip_duration=duration,
+                work_dir=temp_dir,
+                name=subtitle_path.stem,
+                style=hook_style,
+            )
+        except Exception:
+            logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
+        create_ass_subtitles(
+            clip_words,
+            subtitle_path,
+            clip_duration=duration,
+            highlight_active_word=highlight_active_word,
+            # The card replaces the old subtitle-style title; that one is only a fallback.
+            hook_title=None if title else hook_title,
+            hook_seconds=hook_seconds,
+        )
         render_clip(
             source,
             subtitle_path,
@@ -152,9 +175,12 @@ def rerender_clip(
             temporary_output,
             layout_mode=layout_mode,
             crop_x_expression=x_expression,
+            title=title,
         )
         temporary_output.replace(destination)
     finally:
         subtitle_path.unlink(missing_ok=True)
         temporary_output.unlink(missing_ok=True)
+        if title is not None:
+            title.image_path.unlink(missing_ok=True)
     return destination

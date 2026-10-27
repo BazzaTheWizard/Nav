@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 from core.face_tracker import CropBox
+from core.title_card import TitleOverlay, overlay_filter
 
 
 logger = logging.getLogger(__name__)
@@ -56,11 +57,13 @@ def render_clip(
     output_path: str | Path,
     layout_mode: str = "blurred_background",
     crop_x_expression: str | None = None,
+    title: TitleOverlay | None = None,
 ) -> Path:
     """Render one vertical clip.
 
     ``crop_x_expression`` (from CropPlan.x_expression) lets the crop follow
     camera cuts; when omitted, ``crop.x`` is used for the whole clip.
+    ``title`` (from core.title_card) is laid over the video, under the captions.
     """
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -108,21 +111,31 @@ def render_clip(
         filter_complex = (
             _BLURRED_BACKGROUND
             + foreground_filter
-            + f"[bg][fg]overlay=(W-w)/2:(1920-h)/2,{ass_filter}[v]"
+            + "[bg][fg]overlay=(W-w)/2:(1920-h)/2[base]"
         )
     elif layout_mode == "stacked":
         filter_complex = (
             "[0:v]scale=1080:960:force_original_aspect_ratio=decrease,"
             "pad=1080:960:(ow-iw)/2:(oh-ih)/2[top];"
             f"[0:v]{stacked_crop_filter},"
-            f"scale=1080:960[bottom];[top][bottom]vstack=inputs=2,{ass_filter}[v]"
+            "scale=1080:960[bottom];[top][bottom]vstack=inputs=2[base]"
         )
     else:
         filter_complex = (
             f"[0:v]{crop_filter},"
             f"scale=1080:1920:flags=lanczos,"
-            f"unsharp=5:5:0.7:5:5:0.0,{ass_filter}[v]"
+            "unsharp=5:5:0.7:5:5:0.0[base]"
         )
+    title_input: list[str] = []
+    if title is not None:
+        title_input = [
+            "-loop", "1", "-framerate", "30", "-t", f"{title.seconds:.3f}",
+            "-i", str(Path(title.image_path).resolve()),
+        ]
+        filter_complex += ";" + overlay_filter("base", 1, title, "titled")
+        filter_complex += f";[titled]{ass_filter}[v]"
+    else:
+        filter_complex += f";[base]{ass_filter}[v]"
     command = [
         ffmpeg,
         "-y",
@@ -132,6 +145,7 @@ def render_clip(
         str(end_time - start_time),
         "-i",
         str(source),
+        *title_input,
         "-map",
         "[v]",
         "-map",
