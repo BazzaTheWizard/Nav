@@ -1,0 +1,68 @@
+diff --git a/app.py b/app.py
+index 99f6f75..fb192c4 100644
+--- a/app.py
++++ b/app.py
+@@ -10,6 +10,7 @@ from collections.abc import Callable
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ from datetime import datetime
+ from pathlib import Path
++from typing import Any
+ 
+ import streamlit as st
+ from pydantic import BaseModel
+@@ -55,6 +56,31 @@ class OutreachPitch(BaseModel):
+     body: str
+ 
+ 
++# Leads with these statuses are done, so the Lead Finder tab hides them. They stay
++# saved in storage/processed_creators.json so the worker never contacts them again.
++# Add "skipped" here to hide creators you passed on as well.
++FINISHED_LEAD_STATUSES = frozenset({"sent", "completed"})
++
++
++def _latest_lead_records() -> list[dict[str, Any]]:
++    """One record per creator: the newest one (a retried lead has several)."""
++    latest: dict[str, dict[str, Any]] = {}
++    for index, record in enumerate(get_cached_leads()):
++        key = str(record.get("channel_id") or f"record-{index}")
++        latest.pop(key, None)  # keep the newest record, in its newest position
++        latest[key] = record
++    return list(latest.values())
++
++
++def _is_finished(record: dict[str, Any]) -> bool:
++    return str(record.get("status", "")).strip().lower() in FINISHED_LEAD_STATUSES
++
++
++def _active_cached_leads() -> list[dict[str, Any]]:
++    """Leads still worth seeing in the app (not sent or completed)."""
++    return [record for record in _latest_lead_records() if not _is_finished(record)]
++
++
+ LAYOUT_LABELS = {
+     "Auto (face crop when faces are clear)": "auto",
+     "Blurred Background (Best for Sports)": "blurred_background",
+@@ -982,7 +1008,7 @@ def main() -> None:
+             st.error(f"Could not load background worker leads: {exc}")
+             background_pending = []
+ 
+-        cached_leads = get_cached_leads()
++        cached_leads = _active_cached_leads()
+         all_leads = background_pending or cached_leads
+ 
+         if not background_pending and quota_exhausted:
+@@ -1112,9 +1138,12 @@ def main() -> None:
+                 "The worker queries YouTube, screens channels with repurposing deficits, renders clips, "
+                 "uploads to Google Drive, and queues pitches directly into **📬 Outbox / Approval**."
+             )
+-            cached_leads = get_cached_leads()
++            lead_records = _latest_lead_records()
++            finished_count = sum(_is_finished(record) for record in lead_records)
+             st.caption(
+-                f"Discovered records in cache: {len(cached_leads)} | Pending in outbox: {len(pending_outreach)}"
++                f"Active leads: {len(lead_records) - finished_count} | "
++                f"Finished (hidden): {finished_count} | "
++                f"Pending in outbox: {len(pending_outreach)}"
+             )
+ 
+     with outbox_tab:
