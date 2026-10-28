@@ -17,7 +17,7 @@ from core.downloader import extract_audio_segment, fetch_video_info
 from core.face_tracker import CropBox, CropPlan, analyze_crop_plan
 from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
-from core.outreach import build_outreach_email
+from core.outreach import build_outreach_email, build_subject
 from core.title_card import TitleOverlay, prepare_title_overlay
 from core.transcriber import (
     Word,
@@ -170,12 +170,14 @@ def pick_clips_with_agent(
     video_title: str,
     peaks: list[tuple[float, float, float]] | None = None,
     shorts_status: str = "",
-) -> tuple[list[ClipResult], str]:
-    """Gemini/OpenAI picks (ranked) + outreach email, snapped like every other clip.
+) -> tuple[list[ClipResult], str, str]:
+    """Gemini/OpenAI picks (ranked) + outreach email and subject, snapped like
+    every other clip. Returns (clips, email, subject).
 
     The model returns count + EXTRA_CANDIDATES ranked candidates. They're snapped
     to sentences, weak moments are fixed or dropped, a second AI pass scores
     each clip's exact words, and the best non-overlapping ``count`` are kept.
+    The email opens on the best clip: its start time and what its point is.
     """
     result = select_clips_and_draft_pitch(
         transcript_segments=transcript_segments(words),
@@ -198,10 +200,14 @@ def pick_clips_with_agent(
     ]
     candidates = rescore_with_judge(prepare_candidates(proposals, words, video_duration), words, count)
     clips = choose_clips(candidates, words, video_duration, count)
+    short_topic = str(result.get("short_topic") or "")
+    content_format = str(result.get("format") or "")
     if not clips:
-        return clips, str(result["outreach_email"])
-    # Quote the opening words of the best clip back to them (proof the clips are real).
+        return clips, str(result["outreach_email"]), build_subject(short_topic, content_format)
+    # "Your point at 12:34 about ...": the best clip's real start time and its point
+    # (if the AI gave none, its opening words are quoted instead).
     best = max(clips, key=lambda clip: clip.virality_score)
+    picked = _ai_pick_for(best, result["clips"])
     email = build_outreach_email(
         channel_name,
         video_title=video_title,
@@ -209,11 +215,23 @@ def pick_clips_with_agent(
         clip_count=len(clips),
         opening_line=opening_words(words, best.start_time),
         opening_at=best.start_time,
-        key_point=str(result.get("key_point") or ""),
+        key_point=str(picked.get("point") or ""),
         shorts_status=shorts_status,
         greeting_name=str(result.get("host_first_name") or ""),
+        usual_take=str(picked.get("usual_take") or ""),
+        content_format=content_format,
     )
-    return clips, email
+    return clips, email, build_subject(short_topic, content_format, len(clips))
+
+
+def _ai_pick_for(clip: ClipResult, picks: list[dict[str, Any]]) -> dict[str, Any]:
+    """The AI's entry for a final clip: same hook title, else the nearest start
+    (snapping to sentences can move a start by a few seconds)."""
+    for pick in picks:
+        if str(pick.get("hook_title")) == clip.viral_title:
+            return pick
+    nearby = [pick for pick in picks if abs(float(pick.get("start_time", -1e9)) - clip.start_time) <= 20]
+    return min(nearby, key=lambda pick: abs(float(pick["start_time"]) - clip.start_time), default={})
 
 
 EXTRA_CANDIDATES = 5  # spare picks, so dropping weak moments rarely leaves a gap

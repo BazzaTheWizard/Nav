@@ -112,7 +112,7 @@ W._write_json_atomic(W.PENDING_OUTREACH_PATH, [
 ])
 check("Follow-up greets the same first name", W.get_awaiting_reply()[0]["follow_up_body"].startswith("Hi Sam,\n"))
 keep = O.rewrite_old_draft(O.set_greeting(O.build_outreach_email("C", "T", "t", DRIVE, key_point="the three habits that matter"), "Dana"), "C", DRIVE)
-check("Upgrading a draft keeps its key point and greeting", keep.startswith("Hi Dana,\n") and "the point about the three habits that matter" in keep, keep[:160])
+check("Upgrading a draft keeps its key point and greeting", keep.startswith("Hi Dana,\n") and "point about the three habits that matter" in keep, keep[:160])
 check("Quote fallback doesn't claim the host said it", "you said" not in O.build_outreach_email("X", "T", "t", DRIVE, opening_line="Marcela, I try to take deep breaths now"))
 
 import core.agent_brain as A

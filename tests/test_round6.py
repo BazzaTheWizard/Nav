@@ -249,17 +249,17 @@ def fake_ai(key, prompt, system_prompt=A._SYSTEM_PROMPT):
                                       for i in range(1, n + 1)]})
     return json.dumps({"clips": cands, "video_topic": "clear ideas"})
 A._request_openai = fake_ai
-clips, email = P.pick_clips_with_agent(words, duration, 3, "Chan", "Title")
+clips, email, _subject = P.pick_clips_with_agent(words, duration, 3, "Chan", "Title")
 titles = [c.viral_title for c in clips]
 check("Final 3 never include the ad", "Ad" not in titles, str(titles))
 check("Final clips have no moment problems",
       all(H.moment_problem(H.clip_text(words, c.start_time, c.end_time)) is None for c in clips))
-check("Picker still returns 3 clips and an email", len(clips) == 3 and "I loved your recent video" in email)
+check("Picker still returns 3 clips and an email", len(clips) == 3 and "No watermark, no strings." in email)
 
 # Judge failing must not change anything versus no judge
 A._request_openai = lambda key, prompt, system_prompt=A._SYSTEM_PROMPT: (
     json.dumps({"clips": cands}) if system_prompt != A._JUDGE_PROMPT else "garbage")
-clips2, _ = P.pick_clips_with_agent(words, duration, 3, "Chan", "Title")
+clips2, _, _ = P.pick_clips_with_agent(words, duration, 3, "Chan", "Title")
 check("Broken judge -> still 3 clean clips", len(clips2) == 3 and all(
     H.moment_problem(H.clip_text(words, c.start_time, c.end_time)) is None for c in clips2))
 

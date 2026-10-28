@@ -1,7 +1,8 @@
 """Creator outreach email: the one template used by the worker, the app and the AI step.
 
 Edit the wording here and every path (worker drafts, app drafts, fallback) changes
-together. The AI only supplies ``video_topic``; it never writes the email itself.
+together. The AI only supplies short phrases (the topic, what the best clip's point
+is); it never writes the email itself.
 """
 from __future__ import annotations
 
@@ -12,7 +13,8 @@ AGENCY = "Nav Studios"  # one name everywhere: email, signature, Drive folder, s
 # line (no trailing slash). Unsent drafts in the Outbox switch to it automatically.
 SITE_URL = "https://navstudiolab.com"
 DRIVE_LINK_PLACEHOLDER = "[Google Drive link is added after the clips upload]"
-SUBJECT = "3 Shorts from your latest video"
+SUBJECT = "3 Shorts from your latest video"  # used when there's no topic to name
+MAX_SUBJECT_CHARS = 50
 
 
 def site_host(url: str | None = None) -> str:
@@ -22,19 +24,17 @@ def site_host(url: str | None = None) -> str:
 
 SIGNATURE = f"Best,\nBarry Navan\n{AGENCY} | {site_host()}"
 
-# Lead finder Shorts statuses where "you aren't posting much vertical content" is
-# true. Anyone else (posting Shorts regularly, or unknown) gets the line without it.
-LOW_SHORTS_STATUSES = frozenset({"none", "tried", "lapsed", "fading", "occasional"})
-
 _BODY = (
     "Hi {recipient},\n\n"
-    "I loved your recent video {topic_text}{highlight}.\n\n"
-    "{noticed}I edited {clip_text} from that episode, complete with active framing and dynamic captions:\n"
+    "{hook}\n\n"
+    "I cut {cut_text} from the {content_format} into {clip_noun} with captions:\n\n"
     "{drive_link}\n\n"
-    "Feel free to download and post them across Shorts, TikTok, or Reels—no strings attached.\n\n"
-    "Open to having me turn your future uploads into 3–5 finished vertical clips like this?\n\n"
+    "{yours} to post on Shorts, Reels, or TikTok. No watermark, no strings.\n\n"
+    "If {useful}, would you want me to do 3–5 of these for every new upload?\n\n"
     "{signature}"
 )
+_OTHERS = {1: "one other", 2: "two others", 3: "three others", 4: "four others"}
+_COUNT_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
 
 # No reply after a few days: the link again and the same question, shorter.
 _FOLLOW_UP = (
@@ -57,7 +57,8 @@ OLD_TEMPLATE_MARKERS = (
 _OLD_TITLE_PATTERNS = (re.compile(r'I loved the "(.+?)"'), re.compile(r'your recent video "(.+?)"'))
 _OLD_QUOTE_PATTERN = re.compile(r'opens on your line "(.+?)" \((\d+(?::\d{2}){1,2})\)')
 _QUOTE_PATTERNS = (re.compile(r'especially the part that starts "(.+?)"'), re.compile(r'especially when you said "(.+?)"'))
-_KEY_POINT_PATTERN = re.compile(r"—especially the point about (.+?)\.\n")
+# "—especially the point about X." (round 7) or "Your point (at 12:34) about X stuck with me" (round 10)
+_KEY_POINT_PATTERN = re.compile(r"(?:—especially the point about (.+?)\.\n|Your point (?:at [\d:]+ )?about (.+?) stuck with me)")
 _GREETING_PATTERN = re.compile(r"^(?:Hi|Hello|Hey) (.+?),\n")
 _FILE_EXTENSION = re.compile(r"\.(?:mp4|mov|mkv|webm|avi|m4v|mp3|wav|m4a)$", re.IGNORECASE)
 
@@ -107,10 +108,6 @@ def _topic_text(video_title: str, video_topic: str) -> str:
     return f'"{title}"' if title else ""
 
 
-def _clip_text(clip_count: int) -> str:
-    return f"{clip_count} ready-to-post (9:16) sample Short" + ("" if clip_count == 1 else "s")
-
-
 def _tidy(body: str) -> str:
     """Fix spacing when there's no topic or title to name."""
     return (
@@ -121,11 +118,11 @@ def _tidy(body: str) -> str:
 
 
 def clean_key_point(point: object) -> str:
-    """The AI's one-line insight, ready for '...especially the point about ___.'"""
+    """The AI's one-line insight, ready for 'Your point at 12:34 about ___ stuck with me.'"""
     if not isinstance(point, str):
         return ""
-    text = " ".join(point.split()).strip(" \"'“”‘’.,;:!-—")
-    text = re.sub(r"^(?:the point about|about)\s+", "", text, flags=re.IGNORECASE)
+    text = " ".join(point.split()).strip(" \"'“”‘’.,;:!?-—")
+    text = re.sub(r"^(?:your point about|the point about|point about|about)\s+", "", text, flags=re.IGNORECASE)
     return text if 3 <= len(text.split()) <= 18 else ""
 
 
@@ -141,14 +138,70 @@ def clean_first_name(name: object) -> str:
     return text[0].upper() + text[1:]
 
 
-def _highlight(key_point: str, quote: str) -> str:
-    point = clean_key_point(key_point)
+def clean_format(content_format: object) -> str:
+    """'episode' for podcasts and conversations, 'video' for everything else."""
+    text = str(content_format or "").strip().lower()
+    return "episode" if text.startswith(("episode", "podcast", "interview")) else "video"
+
+
+def clean_short_topic(topic: object) -> str:
+    """1–3 words for the subject line ('knee arthritis'); anything longer -> ''."""
+    if not isinstance(topic, str):
+        return ""
+    text = " ".join(topic.split()).strip(" \"'“”‘’.,;:!?-—")
+    text = re.sub(r"^(?:your|the|this|my|latest|recent)\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+(?:episode|video|podcast)$", "", text, flags=re.IGNORECASE)
+    return text if 1 <= len(text.split()) <= 3 else ""
+
+
+def build_subject(short_topic: str = "", content_format: str = "", clip_count: int = 3) -> str:
+    """'3 Shorts from your knee arthritis episode' (at most MAX_SUBJECT_CHARS).
+
+    Without a short enough topic: '3 Shorts from your latest episode'.
+    """
+    noun = "Short" if clip_count == 1 else "Shorts"
+    kind = clean_format(content_format)
+    topic = clean_short_topic(short_topic)
+    subject = f"{clip_count} {noun} from your {topic} {kind}"
+    if topic and len(subject) <= MAX_SUBJECT_CHARS:
+        return subject
+    return f"{clip_count} {noun} from your latest {kind}"
+
+
+def clean_usual_take(take: object) -> str:
+    """The common view a moment pushes against, in 1–4 words ('homework'); else ''."""
+    if not isinstance(take, str):
+        return ""
+    text = " ".join(take.split()).strip(" \"'“”‘’.,;:!?-—")
+    text = re.sub(r"^(?:the usual take on|the usual|usual take on|on)\s+", "", text, flags=re.IGNORECASE)
+    return text if 1 <= len(text.split()) <= 4 and len(text) <= 40 else ""
+
+
+def _hook(
+    timestamp: str,
+    point: str,
+    quote: str,
+    usual_take: str,
+    content_format: str,
+    video_title: str,
+    video_topic: str,
+) -> tuple[str, bool]:
+    """The opening line, and whether it names one specific moment (its timestamp)."""
+    flip = f", especially how it flips the usual take on {usual_take}" if usual_take else ""
+    if timestamp and point:
+        return f"Your point at {timestamp} about {point} stuck with me{flip}.", True
+    if timestamp and quote:
+        # Not "your point": the first words of a clip may be a guest's.
+        return f'The moment at {timestamp} that starts "{quote.rstrip(".")}" stuck with me.', True
     if point:
-        return f"—especially the point about {point}"
-    if quote:
-        # Not "when you said": the first words of a clip may be a guest's.
-        return f'—especially the part that starts "{quote.rstrip(".")}"'
-    return ""
+        return f"Your point about {point} stuck with me{flip}.", False
+    topic = clean_topic(video_topic)
+    if topic:
+        return f"Your recent {content_format} on {topic} stuck with me.", False
+    title = _clean_title(video_title)
+    if title:
+        return f'Your recent {content_format}, "{title}", stuck with me.', False
+    return f"Your recent {content_format} stuck with me.", False
 
 
 def build_outreach_email(
@@ -162,32 +215,47 @@ def build_outreach_email(
     key_point: str = "",
     shorts_status: str = "",
     greeting_name: str = "",
+    usual_take: str = "",
+    content_format: str = "",
 ) -> str:
     """The first email. Without a Drive link yet, a placeholder marks where it goes.
 
-    ``key_point``: one specific insight from their video (from the AI step); if
-    missing, ``opening_line`` (their words at the start of a clip) is quoted instead.
-    ``shorts_status``: the lead finder's Shorts status; the "you aren't posting
-    much vertical content" line is only used when that's actually true.
-    ``greeting_name``: the host's first name when known ("Hi Marcela,"); otherwise
-    the channel name is used.
+    ``opening_at``: start of the best clip in the source video (seconds), shown as
+    "Your point at 12:34 about ...". ``key_point``: what that clip's point is (from
+    the AI step); if missing, the clip's opening words (``opening_line``) are quoted.
+    ``usual_take``: the common view the moment pushes against; the "flips the usual
+    take" part is left out when there isn't one. ``content_format``: "episode" for
+    podcasts, otherwise "video". ``greeting_name``: the host's first name when known;
+    otherwise the channel name is used. ``shorts_status`` is no longer used.
     """
-    del opening_at  # kept for older callers; the timestamp isn't in this template
-    noticed = (
-        "I noticed you aren't posting much vertical content, so "
-        if shorts_status in LOW_SHORTS_STATUSES
-        else ""
+    del shorts_status  # kept for older callers; this template doesn't mention Shorts habits
+    kind = clean_format(content_format)
+    point = clean_key_point(key_point)
+    hook, names_moment = _hook(
+        format_timestamp(opening_at) if opening_at is not None else "",
+        point,
+        clean_quote(opening_line),
+        clean_usual_take(usual_take) if point else "",
+        kind,
+        video_title,
+        video_topic,
     )
-    body = _BODY.format(
+    count = max(1, int(clip_count))
+    if names_moment:
+        cut_text = "that moment" if count == 1 else f"that moment and {_OTHERS.get(count - 1, f'{count - 1} others')}"
+    else:
+        cut_text = f"{_COUNT_WORDS.get(count, str(count))} moment" + ("" if count == 1 else "s")
+    return _BODY.format(
         recipient=clean_first_name(greeting_name) or channel_name.strip() or "there",
-        topic_text=_topic_text(video_title, video_topic),
-        highlight=_highlight(key_point, clean_quote(opening_line)),
-        noticed=noticed,
-        clip_text=_clip_text(clip_count),
+        hook=hook,
+        cut_text=cut_text,
+        content_format=kind,
+        clip_noun="a vertical clip" if count == 1 else "vertical clips",
         drive_link=drive_link.strip() or DRIVE_LINK_PLACEHOLDER,
+        yours="It's yours" if count == 1 else "They're yours",
+        useful="it's useful" if count == 1 else "they're useful",
         signature=SIGNATURE,
     )
-    return _tidy(body)
 
 
 def build_follow_up(
@@ -208,14 +276,14 @@ def build_follow_up(
     return _tidy(body)
 
 
-# "your recent video on <topic>" followed by a dash (current) or . , (older emails)
-_TOPIC_IN_EMAIL = re.compile(r"your recent video on (.+?)(?:—|[.,]\s)")
+# "Your recent video on <topic> stuck with me" (round 10) or "your recent video on
+# <topic>" followed by a dash or . , (older emails)
+_TOPIC_IN_EMAIL = re.compile(r"[Yy]our recent (?:video|episode) on (.+?)(?: stuck with me|—|[.,]\s)")
 
 
 def subject_for(email: str) -> str:
-    """One subject for every first email (kept as a function for older callers)."""
-    del email
-    return SUBJECT
+    """A subject when only the email text is known (older drafts): no topic to name."""
+    return build_subject("", "episode" if " from the episode " in email else "video")
 
 
 def topic_from_email(email: str) -> str:
@@ -264,7 +332,7 @@ def rewrite_old_draft(
         video_topic=topic,
         drive_link=drive_link,
         opening_line=quote,
-        key_point=key_point.group(1) if key_point else "",
+        key_point=(key_point.group(1) or key_point.group(2)) if key_point else "",
         shorts_status=shorts_status,
         greeting_name=greeting_name,
     )

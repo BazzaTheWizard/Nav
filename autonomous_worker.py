@@ -968,7 +968,7 @@ def _process_lead(
             raise RuntimeError(f"Source video has invalid duration: {source_video}")
 
         _info, peaks = video_info_and_peaks(video_url)
-        clips, outreach_email = pick_clips_with_agent(
+        clips, outreach_email, subject = pick_clips_with_agent(
             words,
             duration,
             CLIPS_PER_LEAD,
@@ -1000,7 +1000,7 @@ def _process_lead(
             "channel_title": channel_title,
             "contact_email": contact,
             "drive_link": drive_link,
-            "subject": subject_for(email_body),
+            "subject": subject,
             "full_email_body": email_body,
             "video_title": video_title,
             "greeting_name": greeting_name_of(email_body),

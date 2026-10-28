@@ -40,7 +40,15 @@ from core.downloader import (
 from core.clipper import rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
 from core.drive_uploader import upload_clips_to_drive
-from core.outreach import SUBJECT, build_outreach_email, fill_drive_link, greeting_name_of, set_greeting, subject_for
+from core.outreach import (
+    SUBJECT,
+    build_outreach_email,
+    build_subject,
+    fill_drive_link,
+    greeting_name_of,
+    set_greeting,
+    subject_for,
+)
 from core.hook_selector import ClipResult, select_clips
 from core.pipeline import (
     pick_clips_with_agent,
@@ -256,7 +264,7 @@ def _generate_outreach_pitch(
         raise ValueError("At least one uploaded clip is required for the outreach email.")
 
     return OutreachPitch(
-        subject=SUBJECT,
+        subject=build_subject("", "video", clip_count),
         body=build_outreach_email(
             channel_name,
             video_title=clean_title,
@@ -394,6 +402,7 @@ def _discard_generated_clips() -> None:
         "clip_transcript",
         "ai_clip_selection_error",
         "ai_outreach_email",
+        "ai_outreach_subject",
         "agent_video_title",
         "agent_channel_name",
     ):
@@ -507,7 +516,7 @@ def _generate_clips(
 
         try:
             with st.spinner("Analyzing the transcript and drafting outreach..."):
-                clips, outreach_email = pick_clips_with_agent(
+                clips, outreach_email, outreach_subject = pick_clips_with_agent(
                     words,
                     duration,
                     clip_count,
@@ -516,10 +525,12 @@ def _generate_clips(
                     peaks,
                 )
             st.session_state["ai_outreach_email"] = outreach_email
+            st.session_state["ai_outreach_subject"] = outreach_subject
             st.session_state.pop("ai_clip_selection_error", None)
         except Exception as exc:
             logging.exception("AI clip selection failed; using the existing selector")
             st.session_state["ai_outreach_email"] = ""
+            st.session_state.pop("ai_outreach_subject", None)
             st.session_state["ai_clip_selection_error"] = str(exc)
             st.warning(
                 "AI clip selection/outreach generation failed; using the existing "
@@ -535,9 +546,9 @@ def _generate_clips(
             st.session_state["outreach_email_body"] = st.session_state[
                 "ai_outreach_email"
             ]
-            st.session_state["outreach_email_subject"] = subject_for(
-                st.session_state["ai_outreach_email"]
-            )
+            st.session_state["outreach_email_subject"] = st.session_state.get(
+                "ai_outreach_subject"
+            ) or subject_for(st.session_state["ai_outreach_email"])
         else:
             st.session_state.pop("outreach_email_body", None)
         st.session_state["outreach_video_title"] = video_title
@@ -688,6 +699,7 @@ def main() -> None:
                 st.session_state.pop("active_clip_run_id", None)
                 st.session_state.pop("ai_clip_selection_error", None)
                 st.session_state.pop("ai_outreach_email", None)
+                st.session_state.pop("ai_outreach_subject", None)
                 st.session_state.pop("outreach_email_body", None)
                 storage_status.caption("Storage cleared")
                 st.success(
@@ -777,6 +789,7 @@ def main() -> None:
                 "outreach_title_override",
                 "ai_clip_selection_error",
                 "ai_outreach_email",
+                "ai_outreach_subject",
                 "agent_video_title",
                 "agent_channel_name",
             ):

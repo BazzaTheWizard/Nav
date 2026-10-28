@@ -41,7 +41,7 @@ cands = [
     {"start_time": 700, "end_time": 745, "hook_title": "Third", "reason": "r"},
 ]
 A._request_openai = lambda key, prompt: json.dumps({"clips": cands, "channel_content_summary": "s", "specific_moment_reference": "m"})
-clips, email = P.pick_clips_with_agent(words, duration, 3, "Chan", "Title", [(410.0, 420.0, 0.9)])
+clips, email, _subject = P.pick_clips_with_agent(words, duration, 3, "Chan", "Title", [(410.0, 420.0, 0.9)])
 titles = [c.viral_title for c in clips]
 check("Best non-overlapping picks kept in rank order", titles == ["Best", "Second", "Third"], str(titles))
 check("Every pick is 30–60 s", all(30 <= c.end_time - c.start_time <= 60 for c in clips),

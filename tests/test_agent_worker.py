@@ -21,7 +21,7 @@ good = [{"start_time": 100, "end_time": 140, "hook_title": "a", "reason": "r"},
 A._request_openai = fake(good)
 r = A.select_clips_and_draft_pitch(segs, "Coach Sam", "Squat Tips")
 check("Valid response works without the model writing the email", len(r["clips"]) == 3 and "Coach Sam" in r["outreach_email"])
-check("Email still filled from the template", "your recent video on breaking down the squat" in r["outreach_email"])
+check("Email still filled from the template", "Your recent video on breaking down the squat stuck with me." in r["outreach_email"])
 bad_one = good + [{"start_time": "oops", "end_time": 5, "hook_title": "x", "reason": "r"}]
 A._request_openai = fake(bad_one)
 r = A.select_clips_and_draft_pitch(segs, "Coach Sam", "Squat Tips")

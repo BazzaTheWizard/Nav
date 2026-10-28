@@ -15,7 +15,16 @@ from core.gemini_resilience import (
     gemini_thinking_config,
     generate_content_with_fallback,
 )
-from core.outreach import build_outreach_email, clean_first_name, clean_key_point, clean_topic
+from core.outreach import (
+    build_outreach_email,
+    build_subject,
+    clean_first_name,
+    clean_format,
+    clean_key_point,
+    clean_short_topic,
+    clean_topic,
+    clean_usual_take,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +36,18 @@ _SYSTEM_PROMPT = """You are an expert short-form video editor.
 Analyze the supplied transcript and return one JSON object with:
 - "clips": exactly "candidate_count" items (given in the request), ranked best
   first, each with numeric start_time and end_time (seconds), hook_title (string,
-  under 60 characters, shown on screen as the clip's hook), and reason (string).
+  under 60 characters, shown on screen as the clip's hook), reason (string),
+  point and usual_take (both described below).
+- Each clip's "point": what the speaker argues, reveals or shows in that clip and
+  why it lands, as one phrase (4–14 words, lowercase except names, no quotes)
+  that completes "Your point at 12:34 about ___ stuck with me". Use what they
+  actually say in that clip, e.g. "parents doing more teaching than any
+  classroom", not "parenting".
+- Each clip's "usual_take": only if that clip goes against a common belief, the
+  subject of that belief in 1–4 words (lowercase except names) that completes
+  "especially how it flips the usual take on ___", e.g. "homework" or
+  "stretching before lifting". Use "" when the clip doesn't contradict a common
+  view; never invent a contrast.
   Target a cohesive, high-retention 30–50 second self-contained story or
   tactical breakdown.
 - STRICT HOOK START: start_time MUST begin exactly at the start of a complete
@@ -43,14 +63,20 @@ Analyze the supplied transcript and return one JSON object with:
   clip must capture a complete, self-contained thought with a strong hook,
   explanation, and natural conclusion. Use only transcript timestamps and do not invent dialogue.
 - "video_topic": the specific topic of this video as a short phrase (3–10 words,
-  lowercase except names), written to complete the sentence "I cut 3 sample
-  Shorts from your recent video on ___". Be specific to what the video actually
+  lowercase except names), written to complete the sentence "Your recent video
+  on ___ stuck with me". Be specific to what the video actually
   covers, e.g. "squatting pain-free with knee arthritis", not "fitness".
 - "key_point": one specific insight, claim or story from this video as a short
   phrase (5–15 words, lowercase except names, no quotes), written to complete
-  "I loved your recent video — especially the point about ___". Use what the
+  "Your point about ___ stuck with me". Use what the
   speaker actually says, e.g. "squatting below parallel being fine for healthy
   knees", not a generic summary.
+- "short_topic": what this video is about in 1–3 words (lowercase except
+  names) that completes the email subject "3 Shorts from your ___ episode".
+  Aim for 9–23 characters, e.g. "knee arthritis", "Michigan offense",
+  "early parenting". Never the channel name or the word "video"/"episode".
+- "format": "episode" for a podcast, interview or conversation between two or
+  more people; "video" for a solo or educational upload.
 - "host_first_name": the first name of the channel's host, only if the
   transcript makes it clear (e.g. "I'm Marcela and this is..."). Use "" when
   unsure or when only guests are named.
@@ -168,6 +194,9 @@ def _validated_clips(result: dict[str, Any], transcript_start: float, transcript
                 "end_time": min(end_time, transcript_end),
                 "hook_title": hook_title,
                 "reason": reason or hook_title,
+                # For the email's "Your point at 12:34 about ___" line.
+                "point": clean_key_point(clip.get("point")),
+                "usual_take": clean_usual_take(clip.get("usual_take")),
             }
         )
     if not validated:
@@ -253,6 +282,10 @@ def select_clips_and_draft_pitch(
     video_topic = clean_topic(result.get("video_topic"))
     key_point = clean_key_point(result.get("key_point"))
     host_first_name = clean_first_name(result.get("host_first_name"))
+    short_topic = clean_short_topic(result.get("short_topic"))
+    content_format = clean_format(result.get("format"))
+    # A first draft before the clips are final; core/pipeline.py rebuilds it around
+    # the best clip's start time and point.
     outreach_email = build_outreach_email(
         channel_name,
         video_title=video_title,
@@ -260,13 +293,17 @@ def select_clips_and_draft_pitch(
         drive_link=drive_link,
         key_point=key_point,
         greeting_name=host_first_name,
+        content_format=content_format,
     )
     return {
         "clips": validated_clips,
         "outreach_email": outreach_email,
+        "subject": build_subject(short_topic, content_format),
         "video_topic": video_topic,
         "key_point": key_point,
         "host_first_name": host_first_name,
+        "short_topic": short_topic,
+        "format": content_format,
     }
 
 
