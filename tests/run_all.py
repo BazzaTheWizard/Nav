@@ -1,0 +1,26 @@
+"""Run every test file in this folder, each in its own process.
+
+From the project root:  .venv/bin/python tests/run_all.py
+Tell Antigravity/Copilot: "run tests/run_all.py after every change".
+"""
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parent.parent
+failed = []
+for test in sorted(Path(__file__).parent.glob("test_*.py")):
+    result = subprocess.run([sys.executable, str(test), str(root)], cwd=root, capture_output=True, text=True)
+    lines = (result.stdout + result.stderr).splitlines()
+    passes = sum(line.startswith("[PASS]") for line in lines)
+    fails = [line for line in lines if line.startswith("[FAIL]")]
+    ok = result.returncode == 0
+    print(f"{'OK  ' if ok else 'FAIL'} {test.name}: {passes} passed, {len(fails)} failed")
+    for line in fails:
+        print("     ", line[:160])
+    if not ok and not fails:
+        print("      " + "\n      ".join(lines[-5:]))
+    if not ok:
+        failed.append(test.name)
+print("\nAll test files passed." if not failed else f"\n{len(failed)} test file(s) failed: {', '.join(failed)}")
+sys.exit(1 if failed else 0)

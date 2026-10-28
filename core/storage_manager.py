@@ -10,8 +10,15 @@ def render_output_dir() -> Path:
     return Path.home() / "Desktop" / "ShortFormClips"
 
 
-def purge_storage(*directories: str | Path) -> None:
-    """Remove generated files and nested directories without removing storage roots."""
+def purge_storage(*directories: str | Path, keep_recent_minutes: float = 0) -> int:
+    """Remove generated files and nested directories without removing storage roots.
+
+    The background worker's job folders (worker_*) are always kept, and so is any
+    file changed in the last ``keep_recent_minutes`` (a download or render that is
+    still running). Returns how many items were kept.
+    """
+    cutoff = time.time() - keep_recent_minutes * 60
+    kept = 0
     for directory_value in directories:
         directory = Path(directory_value).expanduser()
         if directory.is_symlink():
@@ -19,10 +26,21 @@ def purge_storage(*directories: str | Path) -> None:
         directory = directory.resolve()
         directory.mkdir(parents=True, exist_ok=True)
         for child in directory.iterdir():
+            if child.name.startswith("worker_") and child.is_dir() and not child.is_symlink():
+                kept += 1
+                continue
+            if keep_recent_minutes and not child.is_symlink():
+                try:
+                    if child.stat().st_mtime >= cutoff:
+                        kept += 1
+                        continue
+                except FileNotFoundError:
+                    continue
             if child.is_symlink() or child.is_file():
-                child.unlink()
+                child.unlink(missing_ok=True)
             elif child.is_dir():
-                shutil.rmtree(child)
+                shutil.rmtree(child, ignore_errors=True)
+    return kept
 
 
 def prune_output_folder(

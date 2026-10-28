@@ -17,6 +17,8 @@ from pydantic import BaseModel
 
 from autonomous_worker import (
     get_cached_leads,
+    get_follow_ups_due,
+    mark_follow_up,
     get_lead_queue,
     get_pending_outreach,
     is_youtube_quota_exhausted,
@@ -33,7 +35,7 @@ from core.downloader import (
 from core.clipper import rerender_clip
 from core.face_tracker import CropBox
 from core.drive_uploader import upload_clips_to_drive
-from core.outreach import SUBJECT, build_outreach_email, fill_drive_link
+from core.outreach import SUBJECT, build_outreach_email, fill_drive_link, subject_for
 from core.hook_selector import ClipResult, select_clips
 from core.pipeline import (
     pick_clips_with_agent,
@@ -477,7 +479,9 @@ def _generate_clips(
             st.session_state["outreach_email_body"] = st.session_state[
                 "ai_outreach_email"
             ]
-            st.session_state["outreach_email_subject"] = SUBJECT
+            st.session_state["outreach_email_subject"] = subject_for(
+                st.session_state["ai_outreach_email"]
+            )
         else:
             st.session_state.pop("outreach_email_body", None)
         st.session_state["outreach_video_title"] = video_title
@@ -611,12 +615,9 @@ def main() -> None:
         storage_status.caption(f"Storage Used: {storage_bytes / (1024 * 1024):.1f} MB")
         if st.button("Clear Temp & Render Cache", use_container_width=True):
             try:
-                purge_storage(
-                    settings.raw_dir,
-                    settings.temp_dir,
-                    settings.output_dir,
-                    output_dir,
-                )
+                # Files the background worker is using right now are kept.
+                kept = purge_storage(settings.raw_dir, settings.temp_dir, keep_recent_minutes=20)
+                purge_storage(settings.output_dir, output_dir)
             except OSError as exc:
                 logging.exception("Could not clear temporary and rendered storage")
                 st.error(f"Could not clear all temporary files or rendered clips: {exc}")
@@ -632,8 +633,11 @@ def main() -> None:
                 st.session_state.pop("ai_clip_selection_error", None)
                 st.session_state.pop("ai_outreach_email", None)
                 st.session_state.pop("outreach_email_body", None)
-                storage_status.caption("Storage Used: 0.0 MB")
-                st.success("Temporary files and rendered clips were cleared.")
+                storage_status.caption("Storage cleared")
+                st.success(
+                    "Temporary files and rendered clips were cleared."
+                    + (f" {kept} item(s) the background worker is using were kept." if kept else "")
+                )
 
     target_url = st.session_state.get("target_url")
     if target_url:
@@ -1276,6 +1280,37 @@ def main() -> None:
                                 st.rerun()
                             else:
                                 st.warning("This lead is no longer pending.")
+
+        _render_follow_ups()
+
+
+def _render_follow_ups() -> None:
+    """Sent pitches with no reply after a few days, each with a ready follow-up."""
+    try:
+        due = get_follow_ups_due()
+    except Exception as exc:
+        st.error(f"Could not load follow-ups: {exc}")
+        return
+    st.subheader(f"Follow-ups due ({len(due)})")
+    if not due:
+        st.caption("Creators you emailed 4+ days ago without a reply show up here with a short follow-up.")
+        return
+    for record in due:
+        record_id = str(record["record_id"])
+        with st.container(border=True):
+            st.markdown(f"**{record.get('channel_title') or 'Creator'}** · sent {str(record.get('sent_at', ''))[:10]}")
+            st.text_input("Subject", value=record["follow_up_subject"], key=f"follow_subject_{record_id}")
+            st.text_area("Follow-up", value=record["follow_up_body"], height=200, key=f"follow_body_{record_id}")
+            _render_copy_email_button(record["follow_up_body"])
+            sent_col, replied_col = st.columns(2)
+            with sent_col:
+                if st.button("Follow-up sent", key=f"followed_{record_id}", use_container_width=True):
+                    mark_follow_up(record_id, "followed_up")
+                    st.rerun()
+            with replied_col:
+                if st.button("They replied", key=f"replied_{record_id}", use_container_width=True):
+                    mark_follow_up(record_id, "replied")
+                    st.rerun()
 
 
 if __name__ == "__main__":

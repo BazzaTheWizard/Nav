@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
-from collections.abc import Sequence
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ from core.gemini_resilience import (
 from core.outreach import build_outreach_email, clean_topic
 
 
+logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _JSON_CODE_BLOCK = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
 DEFAULT_CANDIDATE_COUNT = 5
@@ -119,6 +120,48 @@ def _request_gemini(api_key: str, prompt: str) -> str:
     return response.text
 
 
+AI_ATTEMPTS = 2
+
+
+def _validated_clips(result: dict[str, Any], transcript_start: float, transcript_end: float) -> list[dict[str, Any]]:
+    """Every well-formed candidate, in rank order. Snapping to sentences, the 30-60 s
+    rule and overlap checks happen in hook_selector.finalize_candidates."""
+    clips = result.get("clips")
+    if not isinstance(clips, list) or not clips:
+        raise ValueError("The AI response must contain a list of clips.")
+    validated: list[dict[str, Any]] = []
+    for clip in clips:
+        if not isinstance(clip, dict):
+            continue
+        try:
+            start_time = float(clip["start_time"])
+            end_time = float(clip["end_time"])
+            hook_title = str(clip["hook_title"]).strip()
+            reason = str(clip.get("reason") or "").strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(start_time)
+            or not math.isfinite(end_time)
+            or end_time <= start_time
+            or start_time < transcript_start - 1
+            or start_time >= transcript_end
+            or not hook_title
+        ):
+            continue
+        validated.append(
+            {
+                "start_time": start_time,
+                "end_time": min(end_time, transcript_end),
+                "hook_title": hook_title,
+                "reason": reason or hook_title,
+            }
+        )
+    if not validated:
+        raise ValueError("The AI response did not contain any usable clips.")
+    return validated
+
+
 def select_clips_and_draft_pitch(
     transcript_segments: list[dict[str, Any]],
     channel_name: str,
@@ -166,55 +209,31 @@ def select_clips_and_draft_pitch(
         },
         ensure_ascii=False,
     )
-    if gemini_key:
-        response_text = _request_gemini(gemini_key, request_payload)
-    elif openai_key:
-        response_text = _request_openai(openai_key, request_payload)
-    else:
+    if not gemini_key and not openai_key:
         raise RuntimeError(
             "Configure GEMINI_API_KEY or OPENAI_API_KEY in the project .env file."
         )
-
-    result = _parse_json_response(response_text)
-    clips = result.get("clips")
-    if not isinstance(clips, list) or not clips:
-        raise ValueError("The AI response must contain a list of clips.")
-
-    # Keep every well-formed candidate in rank order. Snapping to sentences,
-    # the 30-60 s rule and overlap checks happen in
-    # hook_selector.finalize_candidates, so one bad pick no longer discards all.
     transcript_start = min(segment["start"] for segment in normalized_segments)
     transcript_end = max(segment["end"] for segment in normalized_segments)
-    validated_clips: list[dict[str, Any]] = []
-    for clip in clips:
-        if not isinstance(clip, dict):
-            continue
+
+    # One retry on a malformed answer: much cheaper than failing the lead, which
+    # makes the worker download and transcribe the whole video again.
+    last_error: Exception | None = None
+    for attempt in range(AI_ATTEMPTS):
+        if gemini_key:
+            response_text = _request_gemini(gemini_key, request_payload)
+        else:
+            response_text = _request_openai(str(openai_key), request_payload)
         try:
-            start_time = float(clip["start_time"])
-            end_time = float(clip["end_time"])
-            hook_title = str(clip["hook_title"]).strip()
-            reason = str(clip["reason"]).strip()
-        except (KeyError, TypeError, ValueError):
-            continue
-        if (
-            not math.isfinite(start_time)
-            or not math.isfinite(end_time)
-            or end_time <= start_time
-            or start_time < transcript_start - 1
-            or start_time >= transcript_end
-            or not hook_title
-        ):
-            continue
-        validated_clips.append(
-            {
-                "start_time": start_time,
-                "end_time": min(end_time, transcript_end),
-                "hook_title": hook_title,
-                "reason": reason or hook_title,
-            }
-        )
-    if not validated_clips:
-        raise ValueError("The AI response did not contain any usable clips.")
+            result = _parse_json_response(response_text)
+            validated_clips = _validated_clips(result, transcript_start, transcript_end)
+            break
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+            logger.warning("AI answer unusable (attempt %d/%d): %s", attempt + 1, AI_ATTEMPTS, exc)
+    else:
+        assert last_error is not None
+        raise last_error
 
     # A missing topic is not worth failing the lead over: the email falls back to
     # the video title.
@@ -226,24 +245,3 @@ def select_clips_and_draft_pitch(
         drive_link=drive_link,
     )
     return {"clips": validated_clips, "outreach_email": outreach_email, "video_topic": video_topic}
-
-
-def qualify_channel_candidate(
-    subscriber_count: int | None,
-    recent_durations: Sequence[float],
-    recent_is_short_flags: Sequence[bool],
-) -> bool:
-    """Return whether a channel meets the size, duration, and recent Shorts criteria."""
-    if subscriber_count is not None and subscriber_count >= 125_000:
-        return False
-    if subscriber_count is not None and subscriber_count < 0:
-        return False
-    if not recent_durations or not recent_is_short_flags:
-        return False
-    durations = [float(duration) for duration in recent_durations]
-    if any(not math.isfinite(duration) or duration < 0 for duration in durations):
-        return False
-    average_duration = sum(durations) / len(durations)
-    if not 240 <= average_duration <= 3000:
-        return False
-    return not any(recent_is_short_flags[-3:])

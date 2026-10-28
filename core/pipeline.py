@@ -17,6 +17,7 @@ from core.downloader import extract_audio_segment, fetch_video_info
 from core.face_tracker import CropBox, CropPlan, analyze_crop_plan
 from core.hook_selector import ClipResult, finalize_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
+from core.outreach import build_outreach_email
 from core.title_card import TitleOverlay, prepare_title_overlay
 from core.transcriber import (
     Word,
@@ -189,7 +190,28 @@ def pick_clips_with_agent(
         for rank, item in enumerate(result["clips"])
     ]
     clips = finalize_candidates(proposals, words, video_duration, count)
-    return clips, str(result["outreach_email"])
+    if not clips:
+        return clips, str(result["outreach_email"])
+    # Quote the opening words of the best clip back to them (proof the clips are real).
+    best = max(clips, key=lambda clip: clip.virality_score)
+    email = build_outreach_email(
+        channel_name,
+        video_title=video_title,
+        video_topic=str(result.get("video_topic") or ""),
+        clip_count=len(clips),
+        opening_line=opening_words(words, best.start_time),
+        opening_at=best.start_time,
+    )
+    return clips, email
+
+
+def opening_words(words: list[Word], start: float, seconds: float = 15.0) -> str:
+    """The words spoken in the first seconds after ``start`` (whole words only)."""
+    return " ".join(
+        word.text.strip()
+        for word in sorted(words, key=lambda w: w.start)
+        if start - 0.3 <= word.start < start + seconds
+    )
 
 
 def video_info_and_peaks(url: str) -> tuple[dict[str, Any], list[tuple[float, float, float]]]:

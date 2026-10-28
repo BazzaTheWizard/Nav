@@ -10,6 +10,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+from core.outreach import AGENCY
+
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -17,7 +19,11 @@ CLIENT_SECRET_FILE = PROJECT_ROOT / "client_secret.json"
 TOKEN_FILE = PROJECT_ROOT / "token.json"
 
 
-def _get_user_credentials() -> Credentials:
+class DriveAuthError(RuntimeError):
+    """Google Drive sign-in is missing or expired; a person has to sign in again."""
+
+
+def _get_user_credentials(interactive: bool = True) -> Credentials:
     credentials: Credentials | None = None
     if TOKEN_FILE.is_file():
         credentials = Credentials.from_authorized_user_file(
@@ -32,14 +38,19 @@ def _get_user_credentials() -> Credentials:
         try:
             credentials.refresh(Request())
         except RefreshError as exc:
-            raise RuntimeError(
-                "Saved Google Drive authorization could not be refreshed. "
-                "Remove token.json and approve access again."
+            raise DriveAuthError(
+                "Google Drive sign-in expired. Delete token.json, then run the app once "
+                "and approve Drive access again. (If this happens every 7 days, switch "
+                "your Google Cloud OAuth consent screen from Testing to In production.)"
             ) from exc
         TOKEN_FILE.write_text(credentials.to_json(), encoding="utf-8")
         TOKEN_FILE.chmod(0o600)
         return credentials
 
+    if not interactive:
+        raise DriveAuthError(
+            "Google Drive isn't signed in yet. Run the app once and approve Drive access."
+        )
     if not CLIENT_SECRET_FILE.is_file():
         raise FileNotFoundError(
             f"Google OAuth client secrets were not found at {CLIENT_SECRET_FILE}."
@@ -53,6 +64,14 @@ def _get_user_credentials() -> Credentials:
     TOKEN_FILE.write_text(credentials.to_json(), encoding="utf-8")
     TOKEN_FILE.chmod(0o600)
     return credentials
+
+
+def check_drive_access() -> None:
+    """Fail fast (DriveAuthError) before any work if Drive can't be used unattended."""
+    _get_user_credentials(interactive=False)
+
+
+UPLOAD_RETRIES = 3  # Google's client retries 5xx/429/network errors with backoff
 
 
 def upload_clips_to_drive(
@@ -81,13 +100,14 @@ def upload_clips_to_drive(
         drive.files()
         .create(
             body={
-                "name": f"{channel_name.strip()} - {video_title[:40]}",
+                # Shown at the top of the folder when they open it: who it's from and what it is.
+                "name": f"{AGENCY} – {len(clips)} sample Shorts for {channel_name.strip()}",
                 "mimeType": "application/vnd.google-apps.folder",
                 "parents": [parent_folder_id],
             },
             fields="id,webViewLink",
         )
-        .execute()
+        .execute(num_retries=UPLOAD_RETRIES)
     )
     folder_id = folder.get("id")
     folder_link = folder.get("webViewLink")
@@ -101,7 +121,7 @@ def upload_clips_to_drive(
             body={"type": "anyone", "role": "reader"},
             fields="id",
         )
-        .execute()
+        .execute(num_retries=UPLOAD_RETRIES)
     )
 
     for clip_path in clips:
@@ -121,7 +141,7 @@ def upload_clips_to_drive(
                 media_body=media,
                 fields="id",
             )
-            .execute()
+            .execute(num_retries=UPLOAD_RETRIES)
         )
 
     if not isinstance(folder_link, str) or not folder_link:

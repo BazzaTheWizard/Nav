@@ -3,20 +3,30 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
+import re
 import os
 import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator
 
 from config import PROJECT_ROOT, load_settings
 from core.downloader import download_source_video, extract_audio_only
-from core.drive_uploader import upload_clips_to_drive
+from core.drive_uploader import DriveAuthError, check_drive_access, upload_clips_to_drive
+from core.storage_manager import prune_stale_files
 from core.hook_selector import ClipResult
-from core.outreach import SUBJECT, fill_drive_link, is_old_template, rewrite_old_draft
+from core.outreach import (
+    build_follow_up,
+    fill_drive_link,
+    is_old_template,
+    rewrite_old_draft,
+    subject_for,
+    topic_from_email,
+)
 from core.lead_harvester import (
     YouTubeQuotaExceededError,
     discover_channels,
@@ -51,6 +61,21 @@ QUOTA_COOLDOWN_SEC = 15 * 60
 # times before it's marked failed for good.
 MAX_LEAD_ATTEMPTS = 3
 CLIPS_PER_LEAD = 3
+DRIVE_SIGN_IN_WAIT_SEC = 10 * 60
+LOG_PATH = STORAGE_DIR / "logs" / "worker.log"
+
+# yt-dlp/YouTube errors that will fail the same way every time: fail the lead now
+# instead of re-downloading it three times.
+_PERMANENT_ERROR = re.compile(
+    r"private video|video is private|members[- ]only|join this channel|"
+    r"confirm your age|age[- ]restricted|live event will begin|premieres in|"
+    r"video unavailable|has been removed|copyright|not available in your country",
+    re.IGNORECASE,
+)
+
+
+def is_permanent_error(error: Exception) -> bool:
+    return bool(_PERMANENT_ERROR.search(str(error)))
 
 
 def is_youtube_quota_exhausted() -> bool:
@@ -325,7 +350,7 @@ def get_pending_outreach() -> list[dict[str, Any]]:
                     str(record.get("drive_link") or ""),
                     str(record.get("video_title") or ""),
                 )
-                record.setdefault("subject", SUBJECT)
+                record["subject"] = subject_for(record["full_email_body"])
                 changed = True
         if changed:
             _write_json_atomic(PENDING_OUTREACH_PATH, pending)
@@ -334,6 +359,57 @@ def get_pending_outreach() -> list[dict[str, Any]]:
             for record in pending
             if record.get("status", "pending") == "pending"
         ]
+
+
+FOLLOW_UP_AFTER_DAYS = 4
+
+
+def get_follow_ups_due(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Sent pitches with no follow-up yet, sent at least FOLLOW_UP_AFTER_DAYS ago.
+
+    Each comes with a ready "follow_up_body". Mark a creator as replied in the app
+    (or by sending the follow-up) and they drop off this list.
+    """
+    now = now or datetime.now(timezone.utc)
+    with _worker_lock():
+        records = _pending_records()
+    due: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("status") != "sent" or record.get("followed_up_at") or record.get("replied_at"):
+            continue
+        try:
+            sent_at = datetime.fromisoformat(str(record.get("sent_at")))
+        except ValueError:
+            continue
+        if now - sent_at < timedelta(days=FOLLOW_UP_AFTER_DAYS):
+            continue
+        body = str(record.get("full_email_body") or "")
+        due.append(
+            {
+                **record,
+                "follow_up_subject": f"Re: {record.get('subject') or subject_for(body)}",
+                "follow_up_body": build_follow_up(
+                    str(record.get("channel_title") or ""),
+                    video_title=str(record.get("video_title") or ""),
+                    video_topic=topic_from_email(body),
+                    drive_link=str(record.get("drive_link") or ""),
+                ),
+            }
+        )
+    return due
+
+
+def mark_follow_up(record_id: str, outcome: str) -> bool:
+    """outcome: "followed_up" (second email sent) or "replied" (no follow-up needed)."""
+    field = {"followed_up": "followed_up_at", "replied": "replied_at"}[outcome]
+    with _worker_lock():
+        records = _pending_records()
+        for record in records:
+            if record.get("record_id") == record_id and record.get("status") == "sent":
+                record[field] = datetime.now(timezone.utc).isoformat()
+                _write_json_atomic(PENDING_OUTREACH_PATH, records)
+                return True
+    return False
 
 
 def mark_outreach_sent(record_id: str) -> bool:
@@ -607,9 +683,25 @@ def _render_selected_clips(
     return rendered_paths
 
 
-def _handle_lead_failure(lead: dict[str, Any], error: Exception) -> bool:
-    """Requeue a failed lead until MAX_LEAD_ATTEMPTS; return True if requeued."""
-    attempts = int(lead.get("attempts", 0)) + 1
+def _handle_lead_failure(
+    lead: dict[str, Any],
+    error: Exception,
+    *,
+    count_attempt: bool = True,
+) -> bool:
+    """Requeue a failed lead until MAX_LEAD_ATTEMPTS; return True if requeued.
+
+    Permanent errors (private/members-only/removed video, ...) fail right away.
+    ``count_attempt=False`` puts the lead back untouched, e.g. while Drive needs
+    a sign-in, so waiting never burns a creator.
+    """
+    if is_permanent_error(error):
+        with _worker_lock():
+            state = _processed_state()
+            _update_lead_status(state, str(lead.get("channel_id", "")), "failed", str(error))
+        logger.info("Not retrying %s: the video can't be used (%s).", lead.get("channel_title"), error)
+        return False
+    attempts = int(lead.get("attempts", 0)) + (1 if count_attempt else 0)
     channel_id = str(lead.get("channel_id", ""))
     video_id = str(lead.get("latest_video_url", "")).rsplit("=", maxsplit=1)[-1]
     with _worker_lock():
@@ -624,7 +716,7 @@ def _handle_lead_failure(lead: dict[str, Any], error: Exception) -> bool:
             _update_lead_status(
                 state,
                 channel_id,
-                f"retry {attempts}/{MAX_LEAD_ATTEMPTS - 1} queued",
+                f"retry {attempts}/{MAX_LEAD_ATTEMPTS - 1} queued" if count_attempt else "waiting",
                 str(error),
             )
             queue = _lead_queue()
@@ -640,6 +732,7 @@ def _process_lead(
     settings: Any,
 ) -> dict[str, Any]:
     _wait_for_pending_slot()
+    check_drive_access()  # before any download: a dead Drive login must not burn the lead
     channel_title = str(lead["channel_title"])
     video_title = str(lead["latest_video_title"])
     video_url = str(lead["latest_video_url"])
@@ -687,7 +780,7 @@ def _process_lead(
             "channel_title": channel_title,
             "contact_email": contact,
             "drive_link": drive_link,
-            "subject": SUBJECT,
+            "subject": subject_for(email_body),
             "full_email_body": email_body,
             "video_title": video_title,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -725,6 +818,34 @@ def _process_lead(
         job_dir.rmdir()
 
 
+def _prune_leftovers(settings: Any) -> None:
+    """Delete downloads/temp files older than a day (the app does this on each run too).
+    Best effort: a cleanup problem never stops the worker."""
+    try:
+        removed = prune_stale_files(settings.raw_dir) + prune_stale_files(settings.temp_dir)
+    except (AttributeError, OSError):
+        logger.debug("Skipped leftover cleanup.", exc_info=True)
+        return
+    if removed:
+        logger.info("Removed %d leftover download/temp file(s) older than a day.", removed)
+
+
+def _setup_logging() -> None:
+    """Terminal output plus storage/logs/worker.log (2 MB x 3 files), so overnight
+    problems leave a record."""
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers[:] = [console, file_handler]
+
+
 def _discover_leads(max_results: int) -> list[dict[str, Any]]:
     queries = generate_search_queries(category="All", count=5)
     leads = discover_channels(queries, max_results=max_results)
@@ -738,6 +859,7 @@ def run_worker(batch: int = 3) -> int:
     settings = load_settings()
     processed_count = 0
     init_storage_files()
+    _prune_leftovers(settings)
     failures = 0
     discovered = False
 
@@ -763,6 +885,10 @@ def run_worker(batch: int = 3) -> int:
         channel_id = str(lead.get("channel_id", ""))
         try:
             pending_record = _process_lead(lead, settings)
+        except DriveAuthError as exc:
+            _handle_lead_failure(lead, exc, count_attempt=False)
+            logger.error("%s Stopping; the lead is back in the queue.", exc)
+            return 1
         except Exception as exc:
             failures += 1
             logger.exception(
@@ -804,7 +930,9 @@ def run_continuous_queue(
 
     settings = load_settings()
     init_storage_files()
+    _prune_leftovers(settings)
     discovery_backoff = DISCOVERY_BACKOFF_START_SEC
+    logged_full_at: int | None = None
     while True:
         with _worker_lock():
             pending_count = sum(
@@ -813,14 +941,17 @@ def run_continuous_queue(
             )
 
         if pending_count >= buffer_size:
-            logger.info(
-                "Outreach buffer is full (%d/%d); checking again in %.1f seconds.",
-                pending_count,
-                buffer_size,
-                poll_interval_sec,
-            )
+            if logged_full_at != pending_count:  # say it once, not every 5 seconds
+                logger.info(
+                    "Outbox is full (%d/%d pitches waiting). Send or skip one in the "
+                    "app and the worker continues.",
+                    pending_count,
+                    buffer_size,
+                )
+                logged_full_at = pending_count
             time.sleep(poll_interval_sec)
             continue
+        logged_full_at = None
 
         fresh_lead = _pop_fresh_lead()
         if fresh_lead is None:
@@ -859,6 +990,11 @@ def run_continuous_queue(
         print("Buffer below threshold. Processing next creator...", flush=True)
         try:
             pending_record = _process_lead(fresh_lead, settings)
+        except DriveAuthError as exc:
+            _handle_lead_failure(fresh_lead, exc, count_attempt=False)
+            logger.error("%s Checking again in %d minutes.", exc, DRIVE_SIGN_IN_WAIT_SEC // 60)
+            time.sleep(DRIVE_SIGN_IN_WAIT_SEC)
+            continue
         except Exception as exc:
             logger.warning(
                 "Continuous queue processing failed for %s (%s); retrying the next "
@@ -916,10 +1052,7 @@ def main() -> int:
     arguments = parser.parse_args()
     if arguments.batch < 1:
         parser.error("--batch must be at least 1.")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _setup_logging()
     init_storage_files()
     if arguments.continuous_queue:
         try:

@@ -10,6 +10,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 FALLBACK_MODEL = "gemini-3.5-flash-lite"
 RETRY_DELAYS_SECONDS = (3, 6)
+RATE_LIMIT_DELAYS_SECONDS = (20, 60)
 
 
 def _is_unavailable_error(exc: Exception, server_error_type: type[Exception]) -> bool:
@@ -30,7 +31,7 @@ def generate_content_with_fallback(
 ) -> Any:
     """Call Gemini with overload fallback and bounded exponential retry."""
     try:
-        from google.genai.errors import ServerError
+        from google.genai.errors import ClientError, ServerError
     except ImportError as exc:
         raise RuntimeError(
             "Gemini generation requires the google-genai package."
@@ -39,9 +40,27 @@ def generate_content_with_fallback(
     active_model = model
     fallback_selected = False
     retry_index = 0
+    rate_limit_index = 0
     while True:
         try:
             return generate(model=active_model, **request_kwargs)
+        except ClientError as exc:
+            # 429 RESOURCE_EXHAUSTED: wait it out, then try the lighter model once.
+            if getattr(exc, "code", None) != 429:
+                raise
+            if rate_limit_index < len(RATE_LIMIT_DELAYS_SECONDS):
+                delay = RATE_LIMIT_DELAYS_SECONDS[rate_limit_index]
+                rate_limit_index += 1
+                logger.warning("Gemini rate limit on %s; waiting %d seconds.", active_model, delay)
+                time.sleep(delay)
+                continue
+            if not fallback_selected and active_model != fallback_model:
+                logger.warning("Gemini still rate-limited; switching to %s.", fallback_model)
+                active_model = fallback_model
+                fallback_selected = True
+                rate_limit_index = 0
+                continue
+            raise
         except ServerError as exc:
             if (
                 _is_unavailable_error(exc, ServerError)
