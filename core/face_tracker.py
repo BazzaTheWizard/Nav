@@ -258,6 +258,52 @@ def _face_detector() -> _FaceDetector:
 
 
 # ---------------------------------------------------------------------------
+# Is anyone on camera? (cheap check before a video is clipped)
+# ---------------------------------------------------------------------------
+ON_CAMERA_SAMPLES = 16  # evenly spaced frames between 5% and 95% of the video
+MIN_FACE_WIDTH_RATIO = 0.025  # faces narrower than this share of the frame don't count
+
+
+def on_camera_share(video_path: Path, samples: int = ON_CAMERA_SAMPLES) -> float | None:
+    """Share of sampled frames that show a face, from 0.0 to 1.0.
+
+    Returns None when it can't tell (no detector, unreadable video), so a
+    caller never skips a creator because of a broken check.
+    """
+    detector = _face_detector()
+    if not detector.available or samples < 1:
+        return None
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return None
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        if fps <= 0 or frame_count <= 0:
+            return None
+        duration = frame_count / fps
+        checked = with_face = 0
+        for index in range(samples):
+            seconds = duration * (0.05 + 0.9 * (index + 0.5) / samples)
+            capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                continue
+            height, width = frame.shape[:2]
+            if width > FACE_FRAME_WIDTH:
+                frame = cv2.resize(frame, (FACE_FRAME_WIDTH, max(1, round(height * FACE_FRAME_WIDTH / width))))
+            checked += 1
+            min_width = MIN_FACE_WIDTH_RATIO * frame.shape[1]
+            if any(face_width >= min_width for _x, _y, face_width, _h, _score in detector.detect(frame)):
+                with_face += 1
+        if checked < max(1, samples // 2):
+            return None
+        return with_face / checked
+    finally:
+        capture.release()
+
+
+# ---------------------------------------------------------------------------
 # Per-shot crop plan
 # ---------------------------------------------------------------------------
 

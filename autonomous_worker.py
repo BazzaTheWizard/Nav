@@ -17,6 +17,7 @@ from typing import Any, Generator
 from config import PROJECT_ROOT, load_settings
 from core.downloader import download_source_video, extract_audio_only
 from core.drive_uploader import DriveAuthError, check_drive_access, upload_clips_to_drive
+from core.face_tracker import on_camera_share
 from core.storage_manager import prune_stale_files
 from core.hook_selector import ClipResult
 from core.outreach import (
@@ -62,6 +63,10 @@ QUOTA_COOLDOWN_SEC = 15 * 60
 MAX_LEAD_ATTEMPTS = 3
 CLIPS_PER_LEAD = 3
 DRIVE_SIGN_IN_WAIT_SEC = 10 * 60
+# Below this share of sampled frames with a face, nobody is really on camera
+# (narration, slides, animation): those creators aren't a fit, so they're
+# skipped right after download, before any transcribing, AI, rendering or upload.
+MIN_ON_CAMERA_SHARE = 0.25
 LOG_PATH = STORAGE_DIR / "logs" / "worker.log"
 
 # yt-dlp/YouTube errors that will fail the same way every time: fail the lead now
@@ -76,6 +81,10 @@ _PERMANENT_ERROR = re.compile(
 
 def is_permanent_error(error: Exception) -> bool:
     return bool(_PERMANENT_ERROR.search(str(error)))
+
+
+class NotAFit(Exception):
+    """The creator isn't a fit (for example, nobody on camera). Skipped, never retried."""
 
 
 def is_youtube_quota_exhausted() -> bool:
@@ -727,6 +736,19 @@ def _handle_lead_failure(
         return False
 
 
+def _skip_not_a_fit(lead: dict[str, Any], reason: NotAFit) -> None:
+    """Record why, and never queue this creator again."""
+    channel_id = str(lead.get("channel_id", ""))
+    with _worker_lock():
+        state = _processed_state()
+        _update_lead_status(state, channel_id, "not a fit", str(reason))
+        seen = set(_seen_channels())
+        if channel_id and channel_id not in seen:
+            seen.add(channel_id)
+            _write_json_atomic(SEEN_CHANNELS_PATH, sorted(seen))
+    logger.info("Skipped %s: %s.", lead.get("channel_title", channel_id), reason)
+
+
 def _process_lead(
     lead: dict[str, Any],
     settings: Any,
@@ -742,6 +764,9 @@ def _process_lead(
     source_video: Path | None = None
     try:
         source_video = Path(download_source_video(video_url))
+        share = on_camera_share(source_video)
+        if share is not None and share < MIN_ON_CAMERA_SHARE:
+            raise NotAFit(f"no one on camera (a face in {share:.0%} of sampled frames)")
         audio_path = extract_audio_only(source_video, job_dir / "source.wav")
         words = transcribe_audio(audio_path, settings)
         duration = _video_duration(source_video)
@@ -889,6 +914,9 @@ def run_worker(batch: int = 3) -> int:
             _handle_lead_failure(lead, exc, count_attempt=False)
             logger.error("%s Stopping; the lead is back in the queue.", exc)
             return 1
+        except NotAFit as exc:
+            _skip_not_a_fit(lead, exc)
+            continue
         except Exception as exc:
             failures += 1
             logger.exception(
@@ -994,6 +1022,9 @@ def run_continuous_queue(
             _handle_lead_failure(fresh_lead, exc, count_attempt=False)
             logger.error("%s Checking again in %d minutes.", exc, DRIVE_SIGN_IN_WAIT_SEC // 60)
             time.sleep(DRIVE_SIGN_IN_WAIT_SEC)
+            continue
+        except NotAFit as exc:
+            _skip_not_a_fit(fresh_lead, exc)
             continue
         except Exception as exc:
             logger.warning(

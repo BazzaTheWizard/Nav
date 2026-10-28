@@ -51,6 +51,11 @@ Analyze the supplied transcript and return one JSON object with:
 - When "most_replayed" moments are supplied, YouTube viewers rewatched those
   parts the most. Prefer clips that contain them, as long as each clip still
   stands on its own.
+- Prefer moments with something concrete: a story, a number, a strong opinion,
+  a surprising claim, or a clear how-to.
+- Never pick sponsor reads, intros, outros, or "like and subscribe" asks.
+- Never start a clip on a word that continues or answers something said before
+  ("And", "But", "Because", "Yeah", "Exactly", "That's why", "Like I said").
 
 The application writes the outreach email itself; do NOT return an email.
 Do not include markdown or extra commentary."""
@@ -76,14 +81,14 @@ def _parse_json_response(response_text: str) -> dict[str, Any]:
     return payload
 
 
-def _request_openai(api_key: str, prompt: str) -> str:
+def _request_openai(api_key: str, prompt: str, system_prompt: str = _SYSTEM_PROMPT) -> str:
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
     response = client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         response_format={"type": "json_object"},
@@ -94,7 +99,7 @@ def _request_openai(api_key: str, prompt: str) -> str:
     return content
 
 
-def _request_gemini(api_key: str, prompt: str) -> str:
+def _request_gemini(api_key: str, prompt: str, system_prompt: str = _SYSTEM_PROMPT) -> str:
     try:
         genai = import_module("google.genai")
         types = import_module("google.genai.types")
@@ -110,7 +115,7 @@ def _request_gemini(api_key: str, prompt: str) -> str:
         model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
         contents=prompt,
         config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM_PROMPT,
+            system_instruction=system_prompt,
             response_mime_type="application/json",
             thinking_config=gemini_thinking_config(types),
         ),
@@ -245,3 +250,64 @@ def select_clips_and_draft_pitch(
         drive_link=drive_link,
     )
     return {"clips": validated_clips, "outreach_email": outreach_email, "video_topic": video_topic}
+
+
+# --- Second opinion on the actual clips --------------------------------------------
+# The first pass picks moments from the whole transcript. After the clips are
+# snapped to sentences, this pass reads each clip's exact words and scores it the
+# way a viewer would meet it: cold, with no context.
+_JUDGE_PROMPT = """You review candidate Shorts cut from one long video.
+For each numbered clip (its exact words), give three scores from 1 to 10:
+- hook: do the first one or two sentences give someone scrolling a reason to keep watching?
+- standalone: does it make sense to someone who has not seen the rest of the video?
+  Score low if it relies on something said earlier.
+- payoff: does it end on a point, answer, story ending or punchline instead of trailing off?
+Return JSON only: {"scores": [{"clip": 1, "hook": 7, "standalone": 8, "payoff": 6}, ...]}
+with exactly one entry per clip."""
+JUDGE_MAX_WORDS = 160  # per clip; about a minute of speech
+
+
+def _judge_scores(result: dict[str, Any], count: int) -> list[int]:
+    """0-100 per clip from the judge's JSON; hook and standalone count double."""
+    entries = result.get("scores")
+    if not isinstance(entries, list):
+        raise ValueError("The judge answer has no scores list.")
+    by_clip: dict[int, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            number = int(entry["clip"])
+            parts = [min(10.0, max(1.0, float(entry[key]))) for key in ("hook", "standalone", "payoff")]
+        except (KeyError, TypeError, ValueError):
+            continue
+        hook, standalone, payoff = parts
+        by_clip[number] = round((2 * hook + 2 * standalone + payoff) / 50 * 100)
+    if sorted(by_clip) != list(range(1, count + 1)):
+        raise ValueError("The judge did not score every clip exactly once.")
+    return [by_clip[number] for number in range(1, count + 1)]
+
+
+def judge_clips(clip_texts: list[str]) -> list[int] | None:
+    """Score each clip's words 0-100. Best effort: None when there's no AI key or the
+    answer is unusable, and the caller keeps the first pass's ranking."""
+    if not clip_texts:
+        return None
+    load_dotenv(_PROJECT_ROOT / ".env")
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not gemini_key and not openai_key:
+        return None
+    prompt = "\n\n".join(
+        f"Clip {number}: " + " ".join(text.split()[:JUDGE_MAX_WORDS])
+        for number, text in enumerate(clip_texts, start=1)
+    )
+    try:
+        if gemini_key:
+            answer = _request_gemini(gemini_key, prompt, _JUDGE_PROMPT)
+        else:
+            answer = _request_openai(str(openai_key), prompt, _JUDGE_PROMPT)
+        return _judge_scores(_parse_json_response(answer), len(clip_texts))
+    except Exception as exc:  # noqa: BLE001 - a second opinion must never fail the lead
+        logger.warning("Clip judge skipped: %s", exc)
+        return None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
 
@@ -8,6 +9,8 @@ from openai import OpenAI
 
 from config import Settings
 from core.transcriber import Word, format_timeline
+
+logger = logging.getLogger(__name__)
 
 
 MIN_CLIP_DURATION = 30.0
@@ -219,11 +222,83 @@ def _normalize_clip(
     )
 
 
+# --- Moment quality ---------------------------------------------------------------
+# Openings that only make sense after something said earlier, or that answer the
+# other speaker. A clip that starts this way feels cut out of the middle.
+_DANGLING_OPENING = re.compile(
+    r"^(?:and|but|or|because|cause|which|also|plus|anyway|anyways|whereas|"
+    r"yeah|yep|yes|right|exactly|absolutely|totally|correct|um+|uh+|"
+    r"like i said|as i (?:said|mentioned)|as you (?:said|mentioned)|"
+    r"that's why|that is why|which is why|that's because|so yeah|so anyway)\b",
+    re.IGNORECASE,
+)
+# Ads, intros, outros and channel housekeeping: never a good Short.
+_FILLER = re.compile(
+    r"brought to you by|sponsored by|(?:today's|our|this week's) sponsor|promo code|"
+    r"use (?:my |our |the )?code\b|links? (?:is |are )?in the description|"
+    r"(?:hit|smash) (?:that |the )?(?:like|subscribe|bell)|and subscribe\b|"
+    r"subscribe to (?:the|my|our) channel|patreon|"
+    r"welcome (?:back )?to (?:the|my|our|another) (?:show|podcast|channel|episode|video)|"
+    r"thanks? (?:you )?(?:so much )?for (?:watching|listening)|see you (?:next time|in the next)",
+    re.IGNORECASE,
+)
+# How many sentences a dangling start may be moved forward before the clip is dropped.
+MAX_START_SHIFT_SENTENCES = 2
+
+
+def clip_text(words: list[Word], start: float, end: float) -> str:
+    """The words spoken between ``start`` and ``end``."""
+    return " ".join(
+        word.text.strip()
+        for word in sorted(words, key=lambda w: w.start)
+        if start - 0.05 <= word.start < end
+    ).strip()
+
+
+def moment_problem(text: str) -> str | None:
+    """Why a clip with this text makes a weak Short, or None if it looks fine."""
+    if _FILLER.search(text):
+        return "sponsor read, intro or outro"
+    opening = text.lstrip(" \"'“”‘’-–—.,…")
+    if _DANGLING_OPENING.match(opening):
+        return "opens mid-thought"
+    return None
+
+
+def _fix_or_drop(
+    clip: ClipResult,
+    words: list[Word],
+    ordered_words: list[Word],
+    sentences: list[tuple[float, float, int]],
+    video_duration: float,
+) -> ClipResult | None:
+    """Keep a clean clip; move a mid-thought start forward a sentence or two; else drop."""
+    problem = moment_problem(clip_text(words, clip.start_time, clip.end_time))
+    if problem is None:
+        return clip
+    if problem != "opens mid-thought":
+        return None
+    if not sentences:
+        return None
+    first = min(range(len(sentences)), key=lambda index: abs(sentences[index][0] - (clip.start_time + PRE_ROLL_SECONDS)))
+    for index in range(first + 1, min(first + 1 + MAX_START_SHIFT_SENTENCES, len(sentences))):
+        options = _bounds_from_start(sentences, index, ordered_words, video_duration)
+        if not options:
+            continue
+        start, end = min(options, key=lambda bounds: abs(bounds[1] - clip.end_time))
+        if moment_problem(clip_text(words, start, end)) is None:
+            return clip.model_copy(update={"start_time": start, "end_time": end})
+    return None
+
+
 def _fallback_clips(
     requested_count: int,
     total_video_duration: float,
     words: list[Word],
+    already: list[ClipResult] | None = None,
 ) -> list[ClipResult]:
+    """Evenly spaced clean moments that also keep their distance from ``already``
+    (the clips picked so far), which are included in the result."""
     if requested_count <= 0:
         return []
 
@@ -240,6 +315,8 @@ def _fallback_clips(
         if not options:
             continue
         start_time, end_time = options[0]
+        if moment_problem(clip_text(ordered_words, start_time, end_time)) is not None:
+            continue
         candidates.append(
             ClipResult(
                 start_time=start_time,
@@ -251,7 +328,7 @@ def _fallback_clips(
             )
         )
 
-    return _select_spaced_candidates(candidates, [], requested_count, total_video_duration)
+    return _select_spaced_candidates(candidates, list(already or []), requested_count, total_video_duration)
 
 
 def _has_minimum_gap(candidate: ClipResult, chosen: list[ClipResult]) -> bool:
@@ -367,6 +444,65 @@ def format_replay_peaks(peaks: list[tuple[float, float, float]]) -> str:
     )
 
 
+def prepare_candidates(
+    proposals: list[ClipResult],
+    words: list[Word],
+    video_duration: float,
+) -> list[ClipResult]:
+    """Snap proposals to sentence boundaries, fix or drop weak moments, best first."""
+    ordered_words = sorted(words, key=lambda word: (word.start, word.end))
+    sentences = _sentence_spans(ordered_words)
+    candidates_by_interval: dict[tuple[float, float], ClipResult] = {}
+    dropped = 0
+    for proposed_clip in proposals:
+        normalized = _normalize_clip(
+            proposed_clip,
+            video_duration,
+            words,
+            ordered_words=ordered_words,
+            sentences=sentences,
+        )
+        if normalized is None:
+            continue
+        normalized = _fix_or_drop(normalized, ordered_words, ordered_words, sentences, video_duration)
+        if normalized is None:
+            dropped += 1
+            continue
+        interval = (normalized.start_time, normalized.end_time)
+        existing = candidates_by_interval.get(interval)
+        if existing is None or normalized.virality_score > existing.virality_score:
+            candidates_by_interval[interval] = normalized
+    if dropped:
+        logger.info("Dropped %d weak moment(s) (mid-thought start, ad, intro or outro).", dropped)
+    return sorted(
+        candidates_by_interval.values(),
+        key=lambda clip: clip.virality_score,
+        reverse=True,
+    )
+
+
+def choose_clips(
+    candidates: list[ClipResult],
+    words: list[Word],
+    video_duration: float,
+    requested_count: int,
+) -> list[ClipResult]:
+    """Best-scored candidates that don't overlap; spaced fallback picks fill any gap."""
+    selected: list[ClipResult] = []
+    for candidate in sorted(candidates, key=lambda clip: clip.virality_score, reverse=True):
+        if _has_minimum_gap(candidate, selected):
+            selected.append(candidate)
+        if len(selected) == requested_count:
+            break
+    if len(selected) < requested_count:
+        missing = requested_count - len(selected)
+        # The spaced picks must fit around the clips already chosen; picking them
+        # separately often left a lead with 2 clips, which fails the whole lead.
+        selected = _fallback_clips(requested_count, video_duration, words, already=selected)
+        logger.info("Only %d strong moment(s); filling up to %d with spaced picks.", requested_count - missing, missing)
+    return sorted(selected[:requested_count], key=lambda clip: clip.start_time)
+
+
 def finalize_candidates(
     proposals: list[ClipResult],
     words: list[Word],
@@ -379,48 +515,7 @@ def finalize_candidates(
     the same 30-60 s, sentence-aligned, well-spaced rules. Proposals are ranked
     by virality_score; any shortfall is filled with spaced heuristic clips.
     """
-    ordered_words = sorted(words, key=lambda word: (word.start, word.end))
-    sentences = _sentence_spans(ordered_words)
-    candidates_by_interval: dict[tuple[float, float], ClipResult] = {}
-    for proposed_clip in proposals:
-        normalized = _normalize_clip(
-            proposed_clip,
-            video_duration,
-            words,
-            ordered_words=ordered_words,
-            sentences=sentences,
-        )
-        if normalized is None:
-            continue
-        interval = (normalized.start_time, normalized.end_time)
-        existing = candidates_by_interval.get(interval)
-        if existing is None or normalized.virality_score > existing.virality_score:
-            candidates_by_interval[interval] = normalized
-
-    candidates = sorted(
-        candidates_by_interval.values(),
-        key=lambda clip: clip.virality_score,
-        reverse=True,
-    )
-    selected: list[ClipResult] = []
-    for candidate in candidates:
-        if _has_minimum_gap(candidate, selected):
-            selected.append(candidate)
-        if len(selected) == requested_count:
-            break
-    if len(selected) < requested_count:
-        fallback_candidates = _fallback_clips(
-            requested_count,
-            video_duration,
-            words,
-        )
-        selected = _select_spaced_candidates(
-            fallback_candidates,
-            selected,
-            requested_count,
-            video_duration,
-        )
-    return sorted(selected[:requested_count], key=lambda clip: clip.start_time)
+    return choose_clips(prepare_candidates(proposals, words, video_duration), words, video_duration, requested_count)
 
 
 def select_clips(

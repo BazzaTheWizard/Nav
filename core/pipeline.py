@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from config import Settings
-from core.agent_brain import select_clips_and_draft_pitch
+from core.agent_brain import judge_clips, select_clips_and_draft_pitch
 from core.clipper import _center_crop
 from core.downloader import extract_audio_segment, fetch_video_info
 from core.face_tracker import CropBox, CropPlan, analyze_crop_plan
-from core.hook_selector import ClipResult, finalize_candidates, replay_peaks
+from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
 from core.outreach import build_outreach_email
 from core.title_card import TitleOverlay, prepare_title_overlay
@@ -167,15 +167,16 @@ def pick_clips_with_agent(
 ) -> tuple[list[ClipResult], str]:
     """Gemini/OpenAI picks (ranked) + outreach email, snapped like every other clip.
 
-    The model returns count + 2 ranked candidates; finalize_candidates snaps
-    them to sentences and keeps the best non-overlapping ``count``.
+    The model returns count + EXTRA_CANDIDATES ranked candidates. They're snapped
+    to sentences, weak moments are fixed or dropped, a second AI pass scores
+    each clip's exact words, and the best non-overlapping ``count`` are kept.
     """
     result = select_clips_and_draft_pitch(
         transcript_segments=transcript_segments(words),
         channel_name=channel_name,
         video_title=video_title,
         drive_link="",
-        candidate_count=count + 2,
+        candidate_count=count + EXTRA_CANDIDATES,
         replay_peaks=peaks,
     )
     proposals = [
@@ -189,7 +190,8 @@ def pick_clips_with_agent(
         )
         for rank, item in enumerate(result["clips"])
     ]
-    clips = finalize_candidates(proposals, words, video_duration, count)
+    candidates = rescore_with_judge(prepare_candidates(proposals, words, video_duration), words, count)
+    clips = choose_clips(candidates, words, video_duration, count)
     if not clips:
         return clips, str(result["outreach_email"])
     # Quote the opening words of the best clip back to them (proof the clips are real).
@@ -203,6 +205,27 @@ def pick_clips_with_agent(
         opening_at=best.start_time,
     )
     return clips, email
+
+
+EXTRA_CANDIDATES = 5  # spare picks, so dropping weak moments rarely leaves a gap
+JUDGE_WEIGHT = 0.7  # the judge reads the final clip text; the first pass only ranked moments
+
+
+def rescore_with_judge(candidates: list[ClipResult], words: list[Word], count: int) -> list[ClipResult]:
+    """Blend the judge's score into each candidate's rank score (best effort)."""
+    if len(candidates) <= count:
+        return candidates  # nothing to choose between
+    scores = judge_clips([clip_text(words, clip.start_time, clip.end_time) for clip in candidates])
+    if scores is None:
+        return candidates
+    rescored = [
+        clip.model_copy(
+            update={"virality_score": round(JUDGE_WEIGHT * score + (1 - JUDGE_WEIGHT) * clip.virality_score)}
+        )
+        for clip, score in zip(candidates, scores)
+    ]
+    logger.info("Clip judge scores: %s", ", ".join(str(score) for score in scores))
+    return sorted(rescored, key=lambda clip: clip.virality_score, reverse=True)
 
 
 def opening_words(words: list[Word], start: float, seconds: float = 15.0) -> str:

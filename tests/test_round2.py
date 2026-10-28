@@ -50,7 +50,7 @@ check("Outreach email still produced", "Chan" in email)
 sent = {}
 A._request_openai = lambda key, prompt: (sent.update(json.loads(prompt)), json.dumps({"clips": cands, "channel_content_summary": "s", "specific_moment_reference": "m"}))[1]
 P.pick_clips_with_agent(words, duration, 3, "Chan", "Title", [(410.0, 420.0, 0.9)])
-check("Picker asks for 5 candidates and gets replay peaks", sent.get("candidate_count") == 5 and sent.get("most_replayed"))
+check("Picker asks for 3 + spare candidates and gets replay peaks", sent.get("candidate_count") == 3 + P.EXTRA_CANDIDATES and sent.get("most_replayed"))
 
 # ---------- Layout choice ----------
 def plan(width=1920, height=1080, shots=None):
