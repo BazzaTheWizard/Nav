@@ -55,6 +55,10 @@ check("New email is not seen as old", not O.is_old_template(redone) and not O.is
 
 # ---------- Website address: one line, unsent drafts follow it ----------
 check("Signature shows the site", email.endswith("\nNav Studios | " + O.site_host()))
+# Start from the old Base44 address whatever SITE_URL is set to in your copy.
+REAL_SITE_URL = O.SITE_URL
+O.SITE_URL = "https://navstudios.base44.app"
+old_email = O.set_greeting(email, "Coach Dana").replace("| " + O.site_host(REAL_SITE_URL), "| navstudios.base44.app")
 O.SITE_URL = "https://navstudios.co"
 check("Swap old address for new", O.refresh_site_links("see navstudios.base44.app and https://navstudios.base44.app/#samples",
                                                        "https://navstudios.base44.app") == "see navstudios.co and https://navstudios.co/#samples")
@@ -66,7 +70,6 @@ W.STORAGE_DIR = tmp
 W.PENDING_OUTREACH_PATH = tmp / "pending.json"
 W.LOCK_PATH = tmp / ".lock"
 W.SITE_URL = O.SITE_URL
-old_email = email  # signed with navstudios.base44.app
 W._write_json_atomic(W.PENDING_OUTREACH_PATH, [
     {"record_id": "p", "channel_title": "Coach Dana", "drive_link": DRIVE, "full_email_body": old_email, "status": "pending"},
     {"record_id": "s", "channel_title": "Sent", "drive_link": DRIVE, "full_email_body": old_email, "status": "sent",
@@ -77,7 +80,7 @@ saved = json.loads(W.PENDING_OUTREACH_PATH.read_text())
 check("Unsent draft switches to the new site address", pending[0]["full_email_body"].endswith("| navstudios.co") and saved[0]["site_url"] == "https://navstudios.co")
 check("Sent email left as it was", saved[1]["full_email_body"] == old_email)
 check("Second load changes nothing", W.get_pending_outreach()[0]["full_email_body"] == pending[0]["full_email_body"])
-O.SITE_URL = W.SITE_URL = "https://navstudios.base44.app"
+O.SITE_URL = W.SITE_URL = REAL_SITE_URL
 
 # ---------- Sent, waiting for a reply ----------
 now = datetime.now(timezone.utc)
