@@ -37,7 +37,7 @@ from core.downloader import (
     download_source_video,
     extract_audio_only,
 )
-from core.clipper import rerender_clip
+from core.clipper import rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
 from core.drive_uploader import upload_clips_to_drive
 from core.outreach import SUBJECT, build_outreach_email, fill_drive_link, greeting_name_of, set_greeting, subject_for
@@ -916,9 +916,7 @@ def main() -> None:
                                     continue
                                 adjusted_start = max(0.0, original_start + start_shift)
                                 adjusted_end = original_end + end_shift
-                                replacement_path = clip_path.with_name(
-                                    f"{clip_path.stem}_adjusted_{uuid.uuid4().hex[:8]}.mp4"
-                                )
+                                replacement_path = rerender_output_path(clip_path)
                                 try:
                                     updated_path = rerender_clip(
                                         source_path=str(context["source_path"]),
