@@ -10,7 +10,7 @@ import re
 AGENCY = "Nav Studios"  # one name everywhere: email, signature, Drive folder, site
 # Your website, shown in the signature. After the new site is live, change this one
 # line (no trailing slash). Unsent drafts in the Outbox switch to it automatically.
-SITE_URL = "https://navstudios.base44.app"
+SITE_URL = "https://navstudiolab.com"
 DRIVE_LINK_PLACEHOLDER = "[Google Drive link is added after the clips upload]"
 SUBJECT = "3 Shorts from your latest video"
 
