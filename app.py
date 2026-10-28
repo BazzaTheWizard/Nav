@@ -18,7 +18,12 @@ from pydantic import BaseModel
 from autonomous_worker import (
     get_awaiting_reply,
     get_cached_leads,
+    get_recently_passed,
+    get_worker_status,
     mark_follow_up,
+    prioritize_queued_lead,
+    restore_passed_as_sent,
+    update_pending_draft,
     get_lead_queue,
     get_pending_outreach,
     is_youtube_quota_exhausted,
@@ -35,7 +40,7 @@ from core.downloader import (
 from core.clipper import rerender_clip
 from core.face_tracker import CropBox
 from core.drive_uploader import upload_clips_to_drive
-from core.outreach import SUBJECT, build_outreach_email, fill_drive_link, subject_for
+from core.outreach import SUBJECT, build_outreach_email, fill_drive_link, greeting_name_of, set_greeting, subject_for
 from core.hook_selector import ClipResult, select_clips
 from core.pipeline import (
     pick_clips_with_agent,
@@ -70,6 +75,48 @@ FINISHED_LEAD_STATUSES = frozenset({"sent", "completed", "skipped"})
 QUEUE_PREVIEW_SIZE = 15
 
 
+WORKER_COMMAND = (
+    'cd "/Users/barrynavan/Short form content project" && '
+    ".venv/bin/python autonomous_worker.py --continuous"
+)
+_STATE_TEXT = {
+    "starting": "starting up",
+    "processing": "making clips for {detail}",
+    "outbox_full": "paused: the Outbox is full ({detail}). Send or pass a pitch in 📬 Outbox / Approval",
+    "discovering": "looking for new creators",
+    "idle": "waiting: {detail}",
+    "quota_pause": "paused: {detail}",
+    "drive_sign_in": "paused: {detail}",
+}
+
+
+def _render_worker_status() -> None:
+    """Is the worker actually running, and what is it doing?"""
+    try:
+        status = get_worker_status()
+    except Exception as exc:
+        st.warning(f"Could not read the worker status: {exc}")
+        return
+    if status["running"]:
+        text = _STATE_TEXT.get(status["state"], status["state"] or "running").format(detail=status["detail"])
+        try:
+            updated = datetime.fromisoformat(status["updated_at"]).astimezone().strftime("%-I:%M %p")
+        except ValueError:
+            updated = ""
+        message = f"**Worker running:** {text}." + (f" (updated {updated})" if updated else "")
+        if status["state"] in {"outbox_full", "quota_pause", "drive_sign_in"}:
+            st.info(message, icon="⏸️")
+        else:
+            st.success(message, icon="🟢")
+    else:
+        st.warning(
+            "**The worker isn't running**, so the queue won't move and no new pitches are made. "
+            "Start it in Terminal:",
+            icon="🔴",
+        )
+        st.code(WORKER_COMMAND, language="bash")
+
+
 def _render_lead_queue() -> None:
     """Up-next list: the worker takes these top-down; one click skips a creator."""
     try:
@@ -82,8 +129,9 @@ def _render_lead_queue() -> None:
         st.caption("The queue is empty. The worker will look for new creators when it needs one.")
         return
     st.caption(
-        "The worker processes these from the top, automatically. "
-        "Skip anyone you don't want before it gets to them."
+        "There's no approve step here: while the worker is running and the Outbox has room "
+        "(up to 5 pitches), it takes creators from the top and makes their clips and email. "
+        "**Do next** moves a creator to the top; **Skip** removes them before any work is done."
     )
     for index, lead in enumerate(queue[:QUEUE_PREVIEW_SIZE]):
         channel_id = str(lead.get("channel_id", ""))
@@ -99,10 +147,18 @@ def _render_lead_queue() -> None:
         video_title = lead.get("latest_video_title") or "Target video"
         shorts_text = lead.get("shorts_summary") or "Shorts: not checked (queued before this update)"
         with st.container(border=True):
-            info, action = st.columns([6, 1])
+            info, next_col, action = st.columns([6, 1, 1])
             with info:
                 st.markdown(f"**{index + 1}. [{title}]({channel_url})** · {subscriber_text} · {email_text}")
                 st.caption(f"{shorts_text} · [{video_title}]({video_url}) ({length_text})")
+            with next_col:
+                if index > 0 and st.button("Do next", key=f"do_next_{channel_id}_{index}", use_container_width=True):
+                    try:
+                        prioritize_queued_lead(channel_id)
+                    except Exception as exc:
+                        st.error(f"Could not move it: {exc}")
+                    else:
+                        st.rerun()
             with action:
                 if st.button("Skip", key=f"skip_queued_{channel_id}_{index}", use_container_width=True):
                     try:
@@ -942,6 +998,10 @@ def main() -> None:
                 )
             else:
                 st.write("Review the clips above, then choose what to do next.")
+            st.caption(
+                "This page doesn't track pitches. Discard / Reset only clears these clips. "
+                "Creators the worker found are sent and tracked in 📬 Outbox / Approval (✅ Mark as Sent)."
+            )
 
             approve_column, discard_column = st.columns(2)
             with approve_column:
@@ -1088,7 +1148,10 @@ def main() -> None:
                     drive_link = lead.get("drive_link")
                     if drive_link:
                         st.link_button("Open Google Drive clips", drive_link)
-                    st.caption("Pitch is ready in the Outbox / Approval tab.")
+                    st.caption(
+                        "Pitch is ready: review and copy it in 📬 Outbox / Approval, send it from Gmail, "
+                        "then click ✅ Mark as Sent there."
+                    )
                     col_proc, col_skip = st.columns([1, 1])
                     with col_proc:
                         if video_url and st.button(
@@ -1102,7 +1165,7 @@ def main() -> None:
                             st.rerun()
                     with col_skip:
                         if st.button(
-                            "❌ Pass / Next Creator",
+                            "❌ Pass (not pitching)",
                             key=f"skip_lead_tab_{channel_id}_{index}",
                             use_container_width=True,
                         ):
@@ -1165,12 +1228,8 @@ def main() -> None:
                 "YouTube API quota limit reached. Harvester is on cooldown. "
                 "Existing pending leads remain available for review and manual URL processing is fully operational."
             )
-        else:
-            st.success(
-                "Autonomous worker is ready. Background process queries YouTube for high-potential creator leads.",
-                icon="🧭",
-            )
 
+        _render_worker_status()
         _render_lead_queue()
 
         with st.container(border=True):
@@ -1194,14 +1253,15 @@ def main() -> None:
 
     with outbox_tab:
         if st.session_state.pop("outreach_marked_sent", False):
-            st.success("Sent! Worker is now preparing the next lead.")
+            st.success("Marked as sent. It's under 'Sent: waiting for a reply' below, and the worker will fill the free spot.")
         if st.session_state.pop("lead_skipped", False):
-            st.info("Lead passed. Showing next creator in queue.")
-        st.write(
-            "Review your ready-to-send pitches here. Run "
-            "`python autonomous_worker.py --continuous-queue` in a terminal to "
-            "automatically prepare the next lead after a pitch is marked sent."
+            st.info("Passed. If you actually sent it, use 'Passed recently' at the bottom to move it to Sent.")
+        st.markdown(
+            "**For each pitch:** set the first name → review the email → **Copy email** → paste into "
+            "Gmail and send → **✅ Mark as Sent**. Not pitching someone? **❌ Pass**. "
+            "Either way the worker fills the free spot with the next creator."
         )
+        _render_worker_status()
         try:
             pending_outreach = get_pending_outreach()
         except Exception as exc:
@@ -1229,29 +1289,52 @@ def main() -> None:
                 drive_link = str(record.get("drive_link") or "")
                 if drive_link:
                     st.link_button("Open Google Drive clips", drive_link)
+                subject_key = f"pending_subject_{record_id}"
+                body_key = f"pending_pitch_{record_id}"
+                name_key = f"pending_name_{record_id}"
                 email_body = str(record.get("full_email_body") or "")
+                # Widgets start from the saved draft; edits are saved as you make them.
+                st.session_state.setdefault(subject_key, str(record.get("subject") or SUBJECT))
+                st.session_state.setdefault(body_key, email_body)
+                st.session_state.setdefault(
+                    name_key, str(record.get("greeting_name") or greeting_name_of(email_body))
+                )
+                st.text_input(
+                    "First name for the greeting",
+                    key=name_key,
+                    on_change=_on_greeting_change,
+                    args=(record_id, name_key, body_key),
+                    help="Who you're writing to, e.g. Marcela. Updates the 'Hi ___,' line.",
+                )
                 st.text_input(
                     "Subject",
-                    value=str(record.get("subject") or SUBJECT),
-                    key=f"pending_subject_{record_id}",
+                    key=subject_key,
+                    on_change=_on_draft_edit,
+                    args=(record_id, subject_key, "subject"),
                 )
                 st.text_area(
                     "Barry Navan outreach pitch",
-                    value=email_body,
                     height=320,
-                    key=f"pending_pitch_{record_id}",
+                    key=body_key,
+                    on_change=_on_draft_edit,
+                    args=(record_id, body_key, "body"),
                 )
-                _render_copy_email_button(email_body)
+                _render_copy_email_button(st.session_state[body_key])
                 col_send, col_skip = st.columns([1, 1])
                 with col_send:
                     if st.button(
-                        "Mark as Sent & Queue Next Lead",
+                        "✅ Mark as Sent",
                         type="primary",
                         key=f"mark_sent_{record_id}",
                         use_container_width=True,
+                        help="Click after you've sent it from Gmail. It moves to 'Sent: waiting for a reply'.",
                     ):
                         try:
-                            marked = mark_outreach_sent(record_id)
+                            marked = mark_outreach_sent(
+                                record_id,
+                                subject=st.session_state.get(subject_key),
+                                body=st.session_state.get(body_key),
+                            )
                         except Exception as exc:
                             logging.exception("Could not mark outreach as sent")
                             st.error(f"Could not update this pitch: {exc}")
@@ -1265,9 +1348,10 @@ def main() -> None:
                                 )
                 with col_skip:
                     if st.button(
-                        "❌ Pass / Next Creator",
+                        "❌ Pass (not pitching)",
                         key=f"skip_lead_{record_id}",
                         use_container_width=True,
+                        help="You're not sending this one. The creator won't come back.",
                     ):
                         try:
                             skipped = skip_lead(channel_id)
@@ -1282,6 +1366,56 @@ def main() -> None:
                                 st.warning("This lead is no longer pending.")
 
         _render_sent_pitches()
+        _render_recently_passed()
+
+
+def _on_draft_edit(record_id: str, key: str, field: str) -> None:
+    """Save an edited subject or email text right away."""
+    value = st.session_state.get(key, "")
+    try:
+        update_pending_draft(record_id, **{field: value})
+    except Exception:
+        logging.exception("Could not save the draft edit")
+
+
+def _on_greeting_change(record_id: str, name_key: str, body_key: str) -> None:
+    """Put the new first name into the 'Hi ___,' line and save both."""
+    name = str(st.session_state.get(name_key, "")).strip()
+    if not name:
+        return
+    body = set_greeting(str(st.session_state.get(body_key, "")), name)
+    st.session_state[body_key] = body
+    try:
+        update_pending_draft(record_id, body=body, greeting_name=name)
+    except Exception:
+        logging.exception("Could not save the greeting")
+
+
+def _render_recently_passed() -> None:
+    """Passed pitches from the last two weeks, for ones that were actually sent."""
+    try:
+        passed = get_recently_passed()
+    except Exception as exc:
+        st.error(f"Could not load passed pitches: {exc}")
+        return
+    if not passed:
+        return
+    with st.expander(f"Passed recently ({len(passed)}): sent one by mistake? Move it to Sent"):
+        st.caption(
+            "Pass removes a creator without recording a send, so no follow-up is scheduled. "
+            "If you did email them, click **I sent this one**."
+        )
+        for record in passed:
+            record_id = str(record.get("record_id"))
+            left, right = st.columns([4, 1])
+            with left:
+                st.markdown(
+                    f"**{record.get('channel_title') or 'Creator'}** · passed {str(record.get('skipped_at', ''))[:10]}"
+                )
+            with right:
+                if st.button("I sent this one", key=f"restore_sent_{record_id}", use_container_width=True):
+                    restore_passed_as_sent(record_id)
+                    st.rerun()
 
 
 def _render_sent_pitches() -> None:

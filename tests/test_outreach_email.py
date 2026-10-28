@@ -67,7 +67,7 @@ check("No topic from the AI -> uses the video title", 'your recent video "How to
 check("Before upload a placeholder marks the Drive link", O.DRIVE_LINK_PLACEHOLDER in no_topic)
 check("Drive link fills the placeholder", DRIVE in O.fill_drive_link(no_topic, DRIVE) and O.DRIVE_LINK_PLACEHOLDER not in O.fill_drive_link(no_topic, DRIVE))
 quoted = O.build_outreach_email("X", "T", "t", DRIVE, opening_line="Most people squat way too deep. And that is it")
-check("No key point -> quotes their words instead", '—especially when you said "Most people squat way too deep".' in quoted, quoted.split("\n\n")[1])
+check("No key point -> quotes the clip's opening words (not 'you said')", '—especially the part that starts "Most people squat way too deep".' in quoted, quoted.split("\n\n")[1])
 check("Neither -> just the video", O.build_outreach_email("X", "T", "topic", DRIVE).split("\n\n")[1] == "I loved your recent video on topic.")
 check("Key point cleanup", O.clean_key_point(' "The point about deep squats." ') == "deep squats" or O.clean_key_point("The point about deep squats being safe.") == "deep squats being safe")
 check("Too short/long key points are dropped", O.clean_key_point("squats") == "" and O.clean_key_point(" ".join(["w"] * 25)) == "")

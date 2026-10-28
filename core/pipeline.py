@@ -211,6 +211,7 @@ def pick_clips_with_agent(
         opening_at=best.start_time,
         key_point=str(result.get("key_point") or ""),
         shorts_status=shorts_status,
+        greeting_name=str(result.get("host_first_name") or ""),
     )
     return clips, email
 

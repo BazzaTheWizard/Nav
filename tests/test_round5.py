@@ -40,7 +40,7 @@ email = O.build_outreach_email(
     "Coach Dana", "Knee Pain Fixes", "fixing knee pain when squatting", DRIVE,
     opening_line="Most people squat way too deep. And that is the problem", opening_at=762.4,
 )
-check("Quotes their own words when there's no key point", '—especially when you said "Most people squat way too deep".' in email, email.split("\n\n")[1][-200:])
+check("Quotes their own words when there's no key point", '—especially the part that starts "Most people squat way too deep".' in email, email.split("\n\n")[1][-200:])
 check("One brand name everywhere", "\nNav Studios | " in email and "I run Nav," not in email)
 check("Drive link in the first email", DRIVE in email)
 check("Subject is the template's", O.subject_for(email) == O.SUBJECT == "3 Shorts from your latest video")

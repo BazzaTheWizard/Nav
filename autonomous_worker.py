@@ -25,6 +25,7 @@ from core.outreach import (
     SITE_URL,
     build_follow_up,
     fill_drive_link,
+    greeting_name_of,
     is_old_template,
     refresh_site_links,
     rewrite_old_draft,
@@ -89,6 +90,60 @@ def is_permanent_error(error: Exception) -> bool:
 
 class NotAFit(Exception):
     """The creator isn't a fit (for example, nobody on camera). Skipped, never retried."""
+
+
+# --- Worker status, for the app ------------------------------------------------------
+# The worker writes what it's doing here; the app shows it, and checks the process
+# id to tell "running" from "stopped" (or closed without saying so).
+def _worker_status_path() -> Path:
+    return STORAGE_DIR / "worker_status.json"
+
+
+def _set_status(state: str, detail: str = "") -> None:
+    """Best effort: a status write must never stop the worker."""
+    try:
+        _write_json_atomic(
+            _worker_status_path(),
+            {
+                "pid": os.getpid(),
+                "state": state,
+                "detail": detail,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("Could not write worker status.", exc_info=True)
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def get_worker_status() -> dict[str, Any]:
+    """{"running": bool, "state": str, "detail": str, "updated_at": str}."""
+    raw = _read_json(_worker_status_path(), None)
+    if not isinstance(raw, dict):
+        return {"running": False, "state": "never_started", "detail": "", "updated_at": ""}
+    pid = raw.get("pid")
+    running = (
+        raw.get("state") != "stopped"
+        and isinstance(pid, int)
+        and _process_alive(pid)
+    )
+    return {
+        "running": running,
+        "state": str(raw.get("state") or ""),
+        "detail": str(raw.get("detail") or ""),
+        "updated_at": str(raw.get("updated_at") or ""),
+    }
 
 
 def is_youtube_quota_exhausted() -> bool:
@@ -334,6 +389,7 @@ def _wait_for_pending_slot(
             )
         if pending_count < MAX_PENDING_LEADS:
             return
+        _set_status("outbox_full", f"{pending_count}/{MAX_PENDING_LEADS} pitches waiting")
         logger.info(
             "Pending outreach buffer is full (%d/%d); waiting for a lead to be "
             "processed.",
@@ -409,7 +465,7 @@ def get_follow_ups_due(now: datetime | None = None) -> list[dict[str, Any]]:
                 **record,
                 "follow_up_subject": f"Re: {record.get('subject') or subject_for(body)}",
                 "follow_up_body": build_follow_up(
-                    str(record.get("channel_title") or ""),
+                    str(record.get("greeting_name") or record.get("channel_title") or ""),
                     video_title=str(record.get("video_title") or ""),
                     video_topic=topic_from_email(body),
                     drive_link=str(record.get("drive_link") or ""),
@@ -449,7 +505,7 @@ def get_awaiting_reply(now: datetime | None = None) -> list[dict[str, Any]]:
         if item["follow_up_due"]:
             item["follow_up_subject"] = f"Re: {record.get('subject') or subject_for(body)}"
             item["follow_up_body"] = build_follow_up(
-                str(record.get("channel_title") or ""),
+                str(record.get("greeting_name") or record.get("channel_title") or ""),
                 video_title=str(record.get("video_title") or ""),
                 video_topic=topic_from_email(body),
                 drive_link=str(record.get("drive_link") or ""),
@@ -457,6 +513,75 @@ def get_awaiting_reply(now: datetime | None = None) -> list[dict[str, Any]]:
         waiting.append(item)
     waiting.sort(key=lambda item: str(item.get("sent_at")), reverse=True)
     return waiting
+
+
+def update_pending_draft(
+    record_id: str,
+    *,
+    subject: str | None = None,
+    body: str | None = None,
+    greeting_name: str | None = None,
+) -> bool:
+    """Save your edits to an unsent pitch (subject, email text, greeting name)."""
+    with _worker_lock():
+        records = _pending_records()
+        for record in records:
+            if record.get("record_id") == record_id and record.get("status", "pending") == "pending":
+                if subject is not None:
+                    record["subject"] = subject
+                if body is not None:
+                    record["full_email_body"] = body
+                if greeting_name is not None:
+                    record["greeting_name"] = greeting_name
+                _write_json_atomic(PENDING_OUTREACH_PATH, records)
+                return True
+    return False
+
+
+PASSED_LOOKBACK_DAYS = 14
+
+
+def get_recently_passed(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Pitches you passed on in the last PASSED_LOOKBACK_DAYS (newest first), so one
+    you actually sent can be moved to Sent."""
+    now = now or datetime.now(timezone.utc)
+    with _worker_lock():
+        skipped = _skipped_records()
+    recent: list[dict[str, Any]] = []
+    for record in skipped:
+        if not record.get("drive_link") or not record.get("record_id"):
+            continue  # skipped from the queue before any clips were made
+        try:
+            when = datetime.fromisoformat(str(record.get("skipped_at")))
+        except ValueError:
+            continue
+        if now - when <= timedelta(days=PASSED_LOOKBACK_DAYS):
+            recent.append(record)
+    recent.sort(key=lambda record: str(record.get("skipped_at")), reverse=True)
+    return recent
+
+
+def restore_passed_as_sent(record_id: str) -> bool:
+    """You did send it: move a passed pitch to Sent (follow-ups then work for it)."""
+    with _worker_lock():
+        skipped = _skipped_records()
+        index = next((i for i, r in enumerate(skipped) if r.get("record_id") == record_id), None)
+        if index is None:
+            return False
+        record = skipped.pop(index)
+        sent_at = str(record.get("skipped_at") or datetime.now(timezone.utc).isoformat())
+        for key in ("skip_reason", "skipped_at"):
+            record.pop(key, None)
+        record["status"] = "sent"
+        record["sent_at"] = sent_at
+        records = _pending_records()
+        records.append(record)
+        _write_json_atomic(PENDING_OUTREACH_PATH, records)
+        _write_json_atomic(SKIPPED_LEADS_PATH, skipped)
+        channel_id = record.get("channel_id")
+        if isinstance(channel_id, str):
+            _update_lead_status(_processed_state(), channel_id, "sent")
+    return True
 
 
 def mark_follow_up(record_id: str, outcome: str) -> bool:
@@ -472,7 +597,8 @@ def mark_follow_up(record_id: str, outcome: str) -> bool:
     return False
 
 
-def mark_outreach_sent(record_id: str) -> bool:
+def mark_outreach_sent(record_id: str, *, subject: str | None = None, body: str | None = None) -> bool:
+    """Record a pitch as sent. ``subject``/``body``: the text you actually sent, if edited."""
     if not record_id.strip():
         raise ValueError("record_id must not be empty.")
     with _worker_lock():
@@ -489,6 +615,10 @@ def mark_outreach_sent(record_id: str) -> bool:
                 record["record_id"] = record_id
                 record["status"] = "sent"
                 record["sent_at"] = datetime.now(timezone.utc).isoformat()
+                if subject:
+                    record["subject"] = subject
+                if body:
+                    record["full_email_body"] = body
                 _write_json_atomic(PENDING_OUTREACH_PATH, pending)
                 state = _processed_state()
                 channel_id = record.get("channel_id")
@@ -646,6 +776,18 @@ def get_lead_queue() -> list[dict[str, Any]]:
     with _worker_lock():
         queue = _lead_queue()
     return sorted(queue, key=_lead_priority, reverse=True)  # sorted() is stable
+
+
+def prioritize_queued_lead(channel_id: str) -> bool:
+    """Move a queued creator to the top, so the worker does them next."""
+    with _worker_lock():
+        queue = _lead_queue()
+        index = next((i for i, lead in enumerate(queue) if str(lead.get("channel_id")) == channel_id), None)
+        if index is None:
+            return False
+        queue.insert(0, queue.pop(index))
+        _write_json_atomic(LEAD_QUEUE_PATH, queue)
+    return True
 
 
 def skip_queued_lead(channel_id: str, reason: str = "user_skipped_before_processing") -> bool:
@@ -861,6 +1003,7 @@ def _process_lead(
             "subject": subject_for(email_body),
             "full_email_body": email_body,
             "video_title": video_title,
+            "greeting_name": greeting_name_of(email_body),
             "shorts_status": shorts_status,
             "site_url": SITE_URL,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -963,6 +1106,7 @@ def run_worker(batch: int = 3) -> int:
             continue
 
         channel_id = str(lead.get("channel_id", ""))
+        _set_status("processing", str(lead.get("channel_title") or channel_id))
         try:
             pending_record = _process_lead(lead, settings)
         except DriveAuthError as exc:
@@ -1014,6 +1158,7 @@ def run_continuous_queue(
     settings = load_settings()
     init_storage_files()
     _prune_leftovers(settings)
+    _set_status("starting")
     discovery_backoff = DISCOVERY_BACKOFF_START_SEC
     logged_full_at: int | None = None
     while True:
@@ -1025,6 +1170,7 @@ def run_continuous_queue(
 
         if pending_count >= buffer_size:
             if logged_full_at != pending_count:  # say it once, not every 5 seconds
+                _set_status("outbox_full", f"{pending_count}/{buffer_size} pitches waiting")
                 logger.info(
                     "Outbox is full (%d/%d pitches waiting). Send or skip one in the "
                     "app and the worker continues.",
@@ -1039,10 +1185,12 @@ def run_continuous_queue(
         fresh_lead = _pop_fresh_lead()
         if fresh_lead is None:
             print("Lead queue empty. Scouting new creators...", flush=True)
+            _set_status("discovering", "looking for new creators")
             try:
                 leads = _discover_leads(max_results=10)
             except YouTubeQuotaExceededError as exc:
                 set_youtube_quota_exhausted(True, str(exc))
+                _set_status("quota_pause", f"YouTube quota reached; trying again in {QUOTA_COOLDOWN_SEC // 60} min")
                 logger.info(
                     "YouTube quota limit reached; pausing discovery for %d minutes.",
                     QUOTA_COOLDOWN_SEC // 60,
@@ -1058,6 +1206,7 @@ def run_continuous_queue(
                 continue
             added = _enqueue_leads(leads)
             if added == 0:
+                _set_status("idle", f"no new creators found; looking again in {discovery_backoff // 60} min")
                 logger.info(
                     "No new qualified creators found; next discovery in %d minutes.",
                     discovery_backoff // 60,
@@ -1071,10 +1220,12 @@ def run_continuous_queue(
 
         channel_id = str(fresh_lead["channel_id"])
         print("Buffer below threshold. Processing next creator...", flush=True)
+        _set_status("processing", str(fresh_lead.get("channel_title") or channel_id))
         try:
             pending_record = _process_lead(fresh_lead, settings)
         except DriveAuthError as exc:
             _handle_lead_failure(fresh_lead, exc, count_attempt=False)
+            _set_status("drive_sign_in", "Google Drive needs signing in again")
             logger.error("%s Checking again in %d minutes.", exc, DRIVE_SIGN_IN_WAIT_SEC // 60)
             time.sleep(DRIVE_SIGN_IN_WAIT_SEC)
             continue
@@ -1140,18 +1291,25 @@ def main() -> int:
         parser.error("--batch must be at least 1.")
     _setup_logging()
     init_storage_files()
-    if arguments.continuous_queue:
+    try:
+        if arguments.continuous_queue:
+            try:
+                run_continuous_queue(
+                    buffer_size=arguments.buffer_size,
+                    poll_interval_sec=arguments.poll_interval_sec,
+                )
+            except KeyboardInterrupt:
+                logger.info("Continuous queue stopped.")
+                return 0
+            except ValueError as exc:
+                parser.error(str(exc))
         try:
-            run_continuous_queue(
-                buffer_size=arguments.buffer_size,
-                poll_interval_sec=arguments.poll_interval_sec,
-            )
+            return run_worker(arguments.batch)
         except KeyboardInterrupt:
-            logger.info("Continuous queue stopped.")
+            logger.info("Worker stopped.")
             return 0
-        except ValueError as exc:
-            parser.error(str(exc))
-    return run_worker(arguments.batch)
+    finally:
+        _set_status("stopped")
 
 
 if __name__ == "__main__":

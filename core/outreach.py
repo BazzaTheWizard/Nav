@@ -56,6 +56,9 @@ OLD_TEMPLATE_MARKERS = (
 )
 _OLD_TITLE_PATTERNS = (re.compile(r'I loved the "(.+?)"'), re.compile(r'your recent video "(.+?)"'))
 _OLD_QUOTE_PATTERN = re.compile(r'opens on your line "(.+?)" \((\d+(?::\d{2}){1,2})\)')
+_QUOTE_PATTERNS = (re.compile(r'especially the part that starts "(.+?)"'), re.compile(r'especially when you said "(.+?)"'))
+_KEY_POINT_PATTERN = re.compile(r"—especially the point about (.+?)\.\n")
+_GREETING_PATTERN = re.compile(r"^(?:Hi|Hello|Hey) (.+?),\n")
 _FILE_EXTENSION = re.compile(r"\.(?:mp4|mov|mkv|webm|avi|m4v|mp3|wav|m4a)$", re.IGNORECASE)
 
 
@@ -126,12 +129,25 @@ def clean_key_point(point: object) -> str:
     return text if 3 <= len(text.split()) <= 18 else ""
 
 
+def clean_first_name(name: object) -> str:
+    """'marcela' -> 'Marcela'; anything that isn't one plain first name -> ''."""
+    if not isinstance(name, str):
+        return ""
+    text = name.strip().strip(".,!\"'")
+    if not re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{1,19}", text):
+        return ""
+    if text.lower() in {"host", "unknown", "none", "null", "the", "guest", "speaker"}:
+        return ""
+    return text[0].upper() + text[1:]
+
+
 def _highlight(key_point: str, quote: str) -> str:
     point = clean_key_point(key_point)
     if point:
         return f"—especially the point about {point}"
     if quote:
-        return f'—especially when you said "{quote.rstrip(".")}"'
+        # Not "when you said": the first words of a clip may be a guest's.
+        return f'—especially the part that starts "{quote.rstrip(".")}"'
     return ""
 
 
@@ -145,6 +161,7 @@ def build_outreach_email(
     opening_at: float | None = None,
     key_point: str = "",
     shorts_status: str = "",
+    greeting_name: str = "",
 ) -> str:
     """The first email. Without a Drive link yet, a placeholder marks where it goes.
 
@@ -152,6 +169,8 @@ def build_outreach_email(
     missing, ``opening_line`` (their words at the start of a clip) is quoted instead.
     ``shorts_status``: the lead finder's Shorts status; the "you aren't posting
     much vertical content" line is only used when that's actually true.
+    ``greeting_name``: the host's first name when known ("Hi Marcela,"); otherwise
+    the channel name is used.
     """
     del opening_at  # kept for older callers; the timestamp isn't in this template
     noticed = (
@@ -160,7 +179,7 @@ def build_outreach_email(
         else ""
     )
     body = _BODY.format(
-        recipient=channel_name.strip() or "there",
+        recipient=clean_first_name(greeting_name) or channel_name.strip() or "there",
         topic_text=_topic_text(video_title, video_topic),
         highlight=_highlight(key_point, clean_quote(opening_line)),
         noticed=noticed,
@@ -219,34 +238,52 @@ def is_old_template(email: str) -> bool:
     return any(marker in email for marker in OLD_TEMPLATE_MARKERS)
 
 
-def _seconds(timestamp: str) -> float:
-    total = 0
-    for part in timestamp.split(":"):
-        total = total * 60 + int(part)
-    return float(total)
-
-
 def rewrite_old_draft(
     email: str, channel_name: str, drive_link: str, video_title: str = "", shorts_status: str = ""
 ) -> str:
     """Rebuild a not-yet-sent draft from an older template with the current one,
-    keeping its topic or title and the quoted opening line."""
+    keeping its topic or title, key point or quoted line, and greeting name."""
     topic = topic_from_email(email)
     for pattern in _OLD_TITLE_PATTERNS:
         if video_title:
             break
         match = pattern.search(email)
         video_title = match.group(1) if match else ""
-    quote = _OLD_QUOTE_PATTERN.search(email)
+    old_quote = _OLD_QUOTE_PATTERN.search(email)
+    quote = old_quote.group(1) if old_quote else ""
+    for pattern in _QUOTE_PATTERNS:
+        match = pattern.search(email)
+        if match and not quote:
+            quote = match.group(1)
+    key_point = _KEY_POINT_PATTERN.search(email)
+    greeting = _GREETING_PATTERN.search(email)
+    greeting_name = greeting.group(1) if greeting and greeting.group(1) != channel_name.strip() else ""
     return build_outreach_email(
         channel_name,
         video_title=video_title,
         video_topic=topic,
         drive_link=drive_link,
-        opening_line=quote.group(1) if quote else "",
-        opening_at=_seconds(quote.group(2)) if quote else None,
+        opening_line=quote,
+        key_point=key_point.group(1) if key_point else "",
         shorts_status=shorts_status,
+        greeting_name=greeting_name,
     )
+
+
+def greeting_name_of(email: str) -> str:
+    """The name in an email's 'Hi ___,' line."""
+    match = _GREETING_PATTERN.search(email)
+    return match.group(1) if match else ""
+
+
+def set_greeting(email: str, name: str) -> str:
+    """Replace the name in the 'Hi ___,' line (adds one if missing)."""
+    name = name.strip()
+    if not name:
+        return email
+    if _GREETING_PATTERN.search(email):
+        return _GREETING_PATTERN.sub(lambda _m: f"Hi {name},\n", email, count=1)
+    return f"Hi {name},\n\n{email}"
 
 
 # Website address used before SITE_URL existed; drafts without a saved address used it.

@@ -48,7 +48,7 @@ check("Round 5 'marketing agency' draft is recognised", O.is_old_template(market
 check("Round 5 softer draft is recognised", O.is_old_template(softer))
 redone = O.rewrite_old_draft(marketing, "Tristan", "https://drive.google.com/x")
 check("Rewrite keeps the title and the quote",
-      '"The Death Of Ivan Ilych"—especially when you said "His life had been most simple"' in redone, redone[:300])
+      '"The Death Of Ivan Ilych"—especially the part that starts "His life had been most simple"' in redone, redone[:300])
 check("Rewrite puts the Drive link in", "https://drive.google.com/x" in redone)
 check("Rewrite keeps the topic", "on squat depth" in O.rewrite_old_draft(softer, "Coach", "https://drive.google.com/x"))
 check("New email is not seen as old", not O.is_old_template(redone) and not O.is_old_template(email))
