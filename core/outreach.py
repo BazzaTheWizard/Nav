@@ -8,38 +8,54 @@ from __future__ import annotations
 import re
 
 AGENCY = "Nav Studios"  # one name everywhere: email, signature, Drive folder, site
-PORTFOLIO_URL = "https://navstudios.base44.app/#samples"
+# Your website, shown in the signature. After the new site is live, change this one
+# line (no trailing slash). Unsent drafts in the Outbox switch to it automatically.
+SITE_URL = "https://navstudios.base44.app"
 DRIVE_LINK_PLACEHOLDER = "[Google Drive link is added after the clips upload]"
-SIGNATURE = f"Best,\nBarry Navan\n{AGENCY}"
-SUBJECT = "3 ready-to-post Shorts from your latest video"
-_TOPIC_SUBJECT_MAX = 50
+SUBJECT = "3 Shorts from your latest video"
 
-# 4 sentences. The quote of their own words proves the clips are real before any
-# click: a phishing email can't quote someone's video back to them.
+
+def site_host(url: str | None = None) -> str:
+    """'https://navstudios.co' -> 'navstudios.co' (how the site shows in a signature)."""
+    return re.sub(r"^https?://", "", SITE_URL if url is None else url).split("/")[0]
+
+
+SIGNATURE = f"Best,\nBarry Navan\n{AGENCY} | {site_host()}"
+
+# Lead finder Shorts statuses where "you aren't posting much vertical content" is
+# true. Anyone else (posting Shorts regularly, or unknown) gets the line without it.
+LOW_SHORTS_STATUSES = frozenset({"none", "tried", "lapsed", "fading", "occasional"})
+
 _BODY = (
     "Hi {recipient},\n\n"
-    "I run " + AGENCY + ", a short-form post-production and marketing agency that turns "
-    "long-form podcasts and video backlogs into high-retention vertical clips, and I cut "
-    "{clip_text} from your recent video {topic_text}. "
-    "{proof}a private Google Drive folder for you: {drive_link}\n\n"
-    "You can check out examples of our hook retention cuts, dynamic captions, and "
-    "production standards here: {portfolio_url}\n\n"
-    "No channel passwords or API access needed: we deliver raw MP4 files only, so just "
-    "reply if you'd like this for every new upload.\n\n"
+    "I loved your recent video {topic_text}{highlight}.\n\n"
+    "{noticed}I edited {clip_text} from that episode, complete with active framing and dynamic captions:\n"
+    "{drive_link}\n\n"
+    "Feel free to download and post them across Shorts, TikTok, or Reels—no strings attached.\n\n"
+    "Open to having me turn your future uploads into 3–5 finished vertical clips like this?\n\n"
     "{signature}"
 )
 
+# No reply after a few days: the link again and the same question, shorter.
 _FOLLOW_UP = (
     "Hi {recipient},\n\n"
-    "Quick follow-up on the {clip_text} I cut from your recent video {topic_text}: "
+    "Quick follow-up in case this got buried: the {clip_text} from your recent video {topic_text} "
+    "are still here, free to post:\n"
     "{drive_link}\n\n"
-    "Happy to adjust the cuts or send them over another way, just reply.\n\n"
+    "Open to having me do this for your future uploads?\n\n"
     "{signature}"
 )
 
 # Text from older templates, used to spot unsent drafts written before an update.
-OLD_TEMPLATE_MARKERS = ("aspiring entrepreneur", "Access the 3 edited clips here:", "I run Nav, a short-form")
-_OLD_TITLE_PATTERN = re.compile(r'I loved the "(.+?)"')
+OLD_TEMPLATE_MARKERS = (
+    "aspiring entrepreneur",
+    "Access the 3 edited clips here:",
+    "I run Nav, a short-form",
+    "hook retention cuts",
+    "a private Google Drive folder for you:",  # Oct 2026: link in the first email
+)
+_OLD_TITLE_PATTERNS = (re.compile(r'I loved the "(.+?)"'), re.compile(r'your recent video "(.+?)"'))
+_OLD_QUOTE_PATTERN = re.compile(r'opens on your line "(.+?)" \((\d+(?::\d{2}){1,2})\)')
 _FILE_EXTENSION = re.compile(r"\.(?:mp4|mov|mkv|webm|avi|m4v|mp3|wav|m4a)$", re.IGNORECASE)
 
 
@@ -89,7 +105,34 @@ def _topic_text(video_title: str, video_topic: str) -> str:
 
 
 def _clip_text(clip_count: int) -> str:
-    return f"{clip_count} sample Short" + ("" if clip_count == 1 else "s")
+    return f"{clip_count} ready-to-post (9:16) sample Short" + ("" if clip_count == 1 else "s")
+
+
+def _tidy(body: str) -> str:
+    """Fix spacing when there's no topic or title to name."""
+    return (
+        body.replace("your recent video .", "your recent video.")
+        .replace("your recent video —", "your recent video—")
+        .replace("your recent video  ", "your recent video ")
+    )
+
+
+def clean_key_point(point: object) -> str:
+    """The AI's one-line insight, ready for '...especially the point about ___.'"""
+    if not isinstance(point, str):
+        return ""
+    text = " ".join(point.split()).strip(" \"'“”‘’.,;:!-—")
+    text = re.sub(r"^(?:the point about|about)\s+", "", text, flags=re.IGNORECASE)
+    return text if 3 <= len(text.split()) <= 18 else ""
+
+
+def _highlight(key_point: str, quote: str) -> str:
+    point = clean_key_point(key_point)
+    if point:
+        return f"—especially the point about {point}"
+    if quote:
+        return f'—especially when you said "{quote.rstrip(".")}"'
+    return ""
 
 
 def build_outreach_email(
@@ -100,28 +143,32 @@ def build_outreach_email(
     clip_count: int = 3,
     opening_line: str = "",
     opening_at: float | None = None,
+    key_point: str = "",
+    shorts_status: str = "",
 ) -> str:
-    """The full email. Without a Drive link yet, a placeholder marks where it goes.
+    """The first email. Without a Drive link yet, a placeholder marks where it goes.
 
-    ``opening_line``/``opening_at``: the first words of one clip and where they are
-    in their video, quoted back as proof the clips are real.
+    ``key_point``: one specific insight from their video (from the AI step); if
+    missing, ``opening_line`` (their words at the start of a clip) is quoted instead.
+    ``shorts_status``: the lead finder's Shorts status; the "you aren't posting
+    much vertical content" line is only used when that's actually true.
     """
-    quote = clean_quote(opening_line)
-    if quote and opening_at is not None:
-        everything = "all three are" if clip_count == 3 else "they're all"
-        proof = f'One opens on your line "{quote}" ({format_timestamp(opening_at)}), and {everything} in '
-    else:
-        proof = "They're in "
+    del opening_at  # kept for older callers; the timestamp isn't in this template
+    noticed = (
+        "I noticed you aren't posting much vertical content, so "
+        if shorts_status in LOW_SHORTS_STATUSES
+        else ""
+    )
     body = _BODY.format(
         recipient=channel_name.strip() or "there",
-        clip_text=_clip_text(clip_count),
         topic_text=_topic_text(video_title, video_topic),
-        proof=proof,
+        highlight=_highlight(key_point, clean_quote(opening_line)),
+        noticed=noticed,
+        clip_text=_clip_text(clip_count),
         drive_link=drive_link.strip() or DRIVE_LINK_PLACEHOLDER,
-        portfolio_url=PORTFOLIO_URL,
         signature=SIGNATURE,
     )
-    return body.replace("your recent video .", "your recent video.")
+    return _tidy(body)
 
 
 def build_follow_up(
@@ -134,22 +181,21 @@ def build_follow_up(
     """A short second email for creators who haven't replied after a few days."""
     body = _FOLLOW_UP.format(
         recipient=channel_name.strip() or "there",
-        clip_text=_clip_text(clip_count),
+        clip_text=f"{clip_count} sample Short" + ("" if clip_count == 1 else "s"),
         topic_text=_topic_text(video_title, video_topic),
         drive_link=drive_link.strip() or DRIVE_LINK_PLACEHOLDER,
         signature=SIGNATURE,
     )
-    return body.replace("your recent video :", "your recent video:")
+    return _tidy(body)
 
 
-_TOPIC_IN_EMAIL = re.compile(r"from your recent video on (.+?)[.,]")
+# "your recent video on <topic>" followed by a dash (current) or . , (older emails)
+_TOPIC_IN_EMAIL = re.compile(r"your recent video on (.+?)(?:—|[.,]\s)")
 
 
 def subject_for(email: str) -> str:
-    """Subject naming their video's topic when the email has one."""
-    match = _TOPIC_IN_EMAIL.search(email)
-    if match and len(match.group(1)) <= _TOPIC_SUBJECT_MAX:
-        return f"3 Shorts from your video on {match.group(1)}"
+    """One subject for every first email (kept as a function for older callers)."""
+    del email
     return SUBJECT
 
 
@@ -159,7 +205,7 @@ def topic_from_email(email: str) -> str:
 
 
 def fill_drive_link(email: str, drive_link: str) -> str:
-    """Put the Drive folder link into a draft made before the upload."""
+    """Put the Drive folder link into a draft made before the upload (older drafts)."""
     if DRIVE_LINK_PLACEHOLDER in email:
         return email.replace(DRIVE_LINK_PLACEHOLDER, drive_link.strip())
     # Drafts from the old template.
@@ -173,10 +219,43 @@ def is_old_template(email: str) -> bool:
     return any(marker in email for marker in OLD_TEMPLATE_MARKERS)
 
 
-def rewrite_old_draft(email: str, channel_name: str, drive_link: str, video_title: str = "") -> str:
-    """Rebuild a not-yet-sent draft from an older template with the current one."""
+def _seconds(timestamp: str) -> float:
+    total = 0
+    for part in timestamp.split(":"):
+        total = total * 60 + int(part)
+    return float(total)
+
+
+def rewrite_old_draft(
+    email: str, channel_name: str, drive_link: str, video_title: str = "", shorts_status: str = ""
+) -> str:
+    """Rebuild a not-yet-sent draft from an older template with the current one,
+    keeping its topic or title and the quoted opening line."""
     topic = topic_from_email(email)
-    if not video_title:
-        match = _OLD_TITLE_PATTERN.search(email)
+    for pattern in _OLD_TITLE_PATTERNS:
+        if video_title:
+            break
+        match = pattern.search(email)
         video_title = match.group(1) if match else ""
-    return build_outreach_email(channel_name, video_title=video_title, video_topic=topic, drive_link=drive_link)
+    quote = _OLD_QUOTE_PATTERN.search(email)
+    return build_outreach_email(
+        channel_name,
+        video_title=video_title,
+        video_topic=topic,
+        drive_link=drive_link,
+        opening_line=quote.group(1) if quote else "",
+        opening_at=_seconds(quote.group(2)) if quote else None,
+        shorts_status=shorts_status,
+    )
+
+
+# Website address used before SITE_URL existed; drafts without a saved address used it.
+LEGACY_SITE_URL = "https://navstudios.base44.app"
+
+
+def refresh_site_links(email: str, old_site_url: str) -> str:
+    """Swap an older website address for the current SITE_URL (signature and links)."""
+    old_host, new_host = site_host(old_site_url), site_host()
+    if not old_host or old_host == new_host:
+        return email
+    return email.replace(old_host, new_host)

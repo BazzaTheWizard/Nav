@@ -95,9 +95,12 @@ def render_selected_clip(
                 logger.warning("Framing analysis failed; using a fallback layout.", exc_info=True)
         layout = choose_layout(layout_mode, plan)
 
+        full_frame: list[tuple[float, float]] = []
         if layout in CROP_LAYOUTS:
             crop = plan.crop if plan is not None else _center_crop(source_video, None)
             x_expression = plan.x_expression(start, end) if plan is not None else None
+            if layout == "smart_crop" and plan is not None:
+                full_frame = plan.full_frame_ranges(start, end)
         else:
             crop, x_expression = _PLACEHOLDER_CROP, None
 
@@ -136,12 +139,14 @@ def render_selected_clip(
             layout_mode=layout,
             crop_x_expression=x_expression,
             title=title,
+            full_frame_ranges=full_frame or None,
         )
         logger.info(
-            "Rendered %s (%s, %d shot(s))",
+            "Rendered %s (%s, %d shot(s), %d shown full-frame)",
             rendered.name,
             layout,
             len(plan.shots) if plan else 1,
+            len(full_frame),
         )
         return RenderedClip(
             path=rendered,
@@ -164,6 +169,7 @@ def pick_clips_with_agent(
     channel_name: str,
     video_title: str,
     peaks: list[tuple[float, float, float]] | None = None,
+    shorts_status: str = "",
 ) -> tuple[list[ClipResult], str]:
     """Gemini/OpenAI picks (ranked) + outreach email, snapped like every other clip.
 
@@ -203,6 +209,8 @@ def pick_clips_with_agent(
         clip_count=len(clips),
         opening_line=opening_words(words, best.start_time),
         opening_at=best.start_time,
+        key_point=str(result.get("key_point") or ""),
+        shorts_status=shorts_status,
     )
     return clips, email
 

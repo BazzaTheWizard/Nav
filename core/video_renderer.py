@@ -29,6 +29,14 @@ _BLURRED_BACKGROUND = (
     "[0:v]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
     "boxblur=5:2,eq=brightness=-0.15,scale=1080:1920[bg];"
 )
+# Full-frame shots inside a cropped clip (slides, wide shots): the whole frame sits
+# over a blurred copy, with its bottom edge here so captions (which start around
+# y=1080) sit below it instead of covering the slide.
+FULL_FRAME_BOTTOM_Y = 1050
+
+
+def _enable_expression(spans: list[tuple[float, float]]) -> str:
+    return "+".join(f"between(t,{start:.3f},{end:.3f})" for start, end in spans)
 
 
 @functools.lru_cache(maxsize=4)
@@ -58,12 +66,15 @@ def render_clip(
     layout_mode: str = "blurred_background",
     crop_x_expression: str | None = None,
     title: TitleOverlay | None = None,
+    full_frame_ranges: list[tuple[float, float]] | None = None,
 ) -> Path:
     """Render one vertical clip.
 
     ``crop_x_expression`` (from CropPlan.x_expression) lets the crop follow
     camera cuts; when omitted, ``crop.x`` is used for the whole clip.
     ``title`` (from core.title_card) is laid over the video, under the captions.
+    ``full_frame_ranges`` (smart_crop only, from CropPlan.full_frame_ranges): spans
+    where the whole frame is shown over a blurred background instead of the crop.
     """
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -119,6 +130,17 @@ def render_clip(
             "pad=1080:960:(ow-iw)/2:(oh-ih)/2[top];"
             f"[0:v]{stacked_crop_filter},"
             "scale=1080:960[bottom];[top][bottom]vstack=inputs=2[base]"
+        )
+    elif layout_mode == "smart_crop" and full_frame_ranges:
+        filter_complex = (
+            "[0:v]split=3[src_crop][src_bg][src_fg];"
+            + _BLURRED_BACKGROUND.replace("[0:v]", "[src_bg]")
+            + "[src_fg]scale=1080:-2[fg];"
+            f"[bg][fg]overlay=x=(W-w)/2:y='max(0,{FULL_FRAME_BOTTOM_Y}-h)'[full];"
+            f"[src_crop]{crop_filter},"
+            "scale=1080:1920:flags=lanczos,"
+            "unsharp=5:5:0.7:5:5:0.0[cropped];"
+            f"[cropped][full]overlay=0:0:enable='{_enable_expression(full_frame_ranges)}'[base]"
         )
     else:
         filter_complex = (

@@ -363,6 +363,24 @@ class CropPlan:
         best = max(face_shots, key=lambda shot: shot.end - shot.start)
         return CropBox(x=best.x, y=self.y, width=self.crop_width, height=self.crop_height)
 
+    def full_frame_ranges(self, clip_start: float, clip_end: float) -> list[tuple[float, float]]:
+        """Clip-relative (start, end) spans to show uncropped: shots with no face
+        (slides, screen shares, b-roll) and wide shots of 2+ people. A 9:16 crop
+        would cut those off; the renderer shows the whole frame there instead."""
+        spans: list[tuple[float, float]] = []
+        for shot in self.shots:
+            if shot.has_face and not shot.group:
+                continue
+            start = max(shot.start, clip_start) - clip_start
+            end = min(shot.end, clip_end) - clip_start
+            if end - start < MIN_SHOT_SECONDS:
+                continue
+            if spans and start - spans[-1][1] < 0.05:
+                spans[-1] = (spans[-1][0], end)
+            else:
+                spans.append((start, end))
+        return spans
+
     def x_expression(self, clip_start: float, clip_end: float) -> str:
         """FFmpeg crop x expression that switches position at each camera cut.
 

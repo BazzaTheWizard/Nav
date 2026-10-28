@@ -16,8 +16,8 @@ import streamlit as st
 from pydantic import BaseModel
 
 from autonomous_worker import (
+    get_awaiting_reply,
     get_cached_leads,
-    get_follow_ups_due,
     mark_follow_up,
     get_lead_queue,
     get_pending_outreach,
@@ -212,7 +212,7 @@ def _generate_outreach_pitch(
 
 def _render_copy_email_button(email_body: str) -> None:
     encoded_email = base64.b64encode(email_body.encode("utf-8")).decode("ascii")
-    st.components.v1.html(
+    st.iframe(
         f"""
         <button id="copy-email" style="padding: 0.45rem 0.8rem; cursor: pointer;">
           Copy email
@@ -1033,14 +1033,14 @@ def main() -> None:
                         height=320,
                         key="outreach_email_body",
                     )
+                    _render_copy_email_button(
+                        st.session_state.get("outreach_email_body", "")
+                    )
                     if not st.session_state.get("drive_folder_link"):
                         st.caption(
                             "The Drive link will be inserted after you approve and "
                             "upload the clips."
                         )
-                    _render_copy_email_button(
-                        st.session_state.get("outreach_email_body", "")
-                    )
 
     with lead_tab:
         st.write("Review creators discovered for short-form video repurposing.")
@@ -1281,30 +1281,41 @@ def main() -> None:
                             else:
                                 st.warning("This lead is no longer pending.")
 
-        _render_follow_ups()
+        _render_sent_pitches()
 
 
-def _render_follow_ups() -> None:
-    """Sent pitches with no reply after a few days, each with a ready follow-up."""
+def _render_sent_pitches() -> None:
+    """Sent pitches waiting for a reply, with a short follow-up once due."""
     try:
-        due = get_follow_ups_due()
+        waiting = get_awaiting_reply()
     except Exception as exc:
-        st.error(f"Could not load follow-ups: {exc}")
+        st.error(f"Could not load sent pitches: {exc}")
         return
-    st.subheader(f"Follow-ups due ({len(due)})")
-    if not due:
-        st.caption("Creators you emailed 4+ days ago without a reply show up here with a short follow-up.")
+    due_count = sum(1 for record in waiting if record.get("follow_up_due"))
+    st.subheader(f"Sent: waiting for a reply ({len(waiting)})")
+    if not waiting:
+        st.caption(
+            "Pitches you mark as sent show up here, with a short follow-up after 4 days "
+            "without an answer."
+        )
         return
-    for record in due:
+    if due_count:
+        st.caption(f"{due_count} follow-up(s) due.")
+    for record in waiting:
         record_id = str(record["record_id"])
+        title = str(record.get("channel_title") or "Creator")
         with st.container(border=True):
-            st.markdown(f"**{record.get('channel_title') or 'Creator'}** · sent {str(record.get('sent_at', ''))[:10]}")
-            st.text_input("Subject", value=record["follow_up_subject"], key=f"follow_subject_{record_id}")
-            st.text_area("Follow-up", value=record["follow_up_body"], height=200, key=f"follow_body_{record_id}")
-            _render_copy_email_button(record["follow_up_body"])
+            label = " · follow-up due" if record.get("follow_up_due") else ""
+            st.markdown(f"**{title}** · sent {str(record.get('sent_at', ''))[:10]}{label}")
+            if record.get("follow_up_due"):
+                st.text_input("Follow-up subject", value=record["follow_up_subject"], key=f"follow_subject_{record_id}")
+                st.text_area("Follow-up", value=record["follow_up_body"], height=180, key=f"follow_body_{record_id}")
+                _render_copy_email_button(record["follow_up_body"])
             sent_col, replied_col = st.columns(2)
             with sent_col:
-                if st.button("Follow-up sent", key=f"followed_{record_id}", use_container_width=True):
+                if record.get("follow_up_due") and st.button(
+                    "Follow-up sent", key=f"followed_{record_id}", use_container_width=True
+                ):
                     mark_follow_up(record_id, "followed_up")
                     st.rerun()
             with replied_col:

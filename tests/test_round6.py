@@ -4,7 +4,6 @@ import json, os, subprocess, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(ROOT))
@@ -151,7 +150,7 @@ def make_words(sentences, gap=0.5):
     out, t = [], 0.0
     for sentence in sentences:
         tokens = sentence.split()
-        for i, tok in enumerate(tokens):
+        for tok in tokens:
             out.append(Word(tok, t, t + 0.3, None, None)); t += 0.32
         t += gap
     return out, t
@@ -255,7 +254,7 @@ titles = [c.viral_title for c in clips]
 check("Final 3 never include the ad", "Ad" not in titles, str(titles))
 check("Final clips have no moment problems",
       all(H.moment_problem(H.clip_text(words, c.start_time, c.end_time)) is None for c in clips))
-check("Picker still returns 3 clips and an email", len(clips) == 3 and "I run Nav Studios" in email)
+check("Picker still returns 3 clips and an email", len(clips) == 3 and "I loved your recent video" in email)
 
 # Judge failing must not change anything versus no judge
 A._request_openai = lambda key, prompt, system_prompt=A._SYSTEM_PROMPT: (

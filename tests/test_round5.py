@@ -4,7 +4,6 @@ AI retries, safe cleanup. Uses fakes and a temp folder; touches nothing real.
 Run from the project root:  .venv/bin/python tests/test_round5.py
 """
 import json
-import re
 import sys
 import tempfile
 import time
@@ -41,21 +40,17 @@ email = O.build_outreach_email(
     "Coach Dana", "Knee Pain Fixes", "fixing knee pain when squatting", DRIVE,
     opening_line="Most people squat way too deep. And that is the problem", opening_at=762.4,
 )
-body = email.split("\n\n", 1)[1].rsplit("\n\nBest,", 1)[0]
-sentences = sum(len([x for x in re.split(r"(?<=[.!?])\s+(?=[A-Z])", para.strip()) if x]) for para in body.split("\n\n"))
-check("Quotes their own opening line with its timestamp", 'One opens on your line "Most people squat way too deep." (12:42)' in email, email.split("\n\n")[1][-200:])
-check("Still 4 sentences", sentences == 4, f"{sentences}")
-check("One brand name everywhere", "I run Nav Studios" in email and email.endswith("Nav Studios") and "I run Nav," not in email)
-check("Portfolio link and Drive link present", O.PORTFOLIO_URL in email and DRIVE in email)
-check("Subject names the topic", O.subject_for(email) == "3 Shorts from your video on fixing knee pain when squatting")
-check("Long topic -> plain subject", O.subject_for(O.build_outreach_email("X", "", "a" * 80, DRIVE)) == O.SUBJECT)
-check("Without a quote it still reads well", "They're in a private Google Drive folder for you" in O.build_outreach_email("X", "T", "topic", DRIVE))
+check("Quotes their own words when there's no key point", '—especially when you said "Most people squat way too deep".' in email, email.split("\n\n")[1][-200:])
+check("One brand name everywhere", "\nNav Studios | " in email and "I run Nav," not in email)
+check("Drive link in the first email", DRIVE in email)
+check("Subject is the template's", O.subject_for(email) == O.SUBJECT == "3 Shorts from your latest video")
 check("Short/empty quotes are skipped", O.clean_quote("Yeah so") == "")
 check("Timestamps over an hour", O.format_timestamp(3725) == "1:02:05")
 words = [Word(text=t, start=100 + i * 0.4, end=100.3 + i * 0.4) for i, t in enumerate("Most people squat way too deep. And here is why".split())]
 check("Opening words come from the clip start", opening_words(words, 100.0).startswith("Most people squat"))
 follow = O.build_follow_up("Coach Dana", "", "fixing knee pain", DRIVE)
-check("Follow-up is short and has the link", DRIVE in follow and follow.count("\n\n") == 3 and follow.endswith("Nav Studios"))
+check("Follow-up is short, has the link and the same question",
+      DRIVE in follow and "Open to having me do this for your future uploads?" in follow and follow.count("\n\n") == 3 and follow.endswith(O.site_host()))
 check("Older 'Nav' drafts are recognised for an upgrade", O.is_old_template("Hi X,\n\nI run Nav, a short-form post-production"))
 
 # --- worker: follow-ups due ------------------------------------------------------------
@@ -76,8 +71,8 @@ W._write_json_atomic(W.PENDING_OUTREACH_PATH, [
 ])
 due = W.get_follow_ups_due()
 check("Only pitches sent 4+ days ago without a reply are due", [d["record_id"] for d in due] == ["old"], str([d["record_id"] for d in due]))
-check("Follow-up keeps the topic and link", "fixing knee pain when squatting" in due[0]["follow_up_body"] and DRIVE in due[0]["follow_up_body"])
-check("Follow-up subject is a reply to the first email", due[0]["follow_up_subject"].startswith("Re: 3 Shorts from your video on"))
+check("Follow-up keeps the topic", "fixing knee pain when squatting" in due[0]["follow_up_body"])
+check("Follow-up subject is a reply to the first email", due[0]["follow_up_subject"] == "Re: " + O.SUBJECT, due[0]["follow_up_subject"])
 W.mark_follow_up("old", "followed_up")
 check("Marked follow-ups leave the list", W.get_follow_ups_due() == [])
 

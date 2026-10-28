@@ -15,7 +15,7 @@ from core.gemini_resilience import (
     gemini_thinking_config,
     generate_content_with_fallback,
 )
-from core.outreach import build_outreach_email, clean_topic
+from core.outreach import build_outreach_email, clean_key_point, clean_topic
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,11 @@ Analyze the supplied transcript and return one JSON object with:
   lowercase except names), written to complete the sentence "I cut 3 sample
   Shorts from your recent video on ___". Be specific to what the video actually
   covers, e.g. "squatting pain-free with knee arthritis", not "fitness".
+- "key_point": one specific insight, claim or story from this video as a short
+  phrase (5–15 words, lowercase except names, no quotes), written to complete
+  "I loved your recent video — especially the point about ___". Use what the
+  speaker actually says, e.g. "squatting below parallel being fine for healthy
+  knees", not a generic summary.
 - The clips must not overlap and should come from different parts of the
   video.
 - When "most_replayed" moments are supplied, YouTube viewers rewatched those
@@ -243,13 +248,20 @@ def select_clips_and_draft_pitch(
     # A missing topic is not worth failing the lead over: the email falls back to
     # the video title.
     video_topic = clean_topic(result.get("video_topic"))
+    key_point = clean_key_point(result.get("key_point"))
     outreach_email = build_outreach_email(
         channel_name,
         video_title=video_title,
         video_topic=video_topic,
         drive_link=drive_link,
+        key_point=key_point,
     )
-    return {"clips": validated_clips, "outreach_email": outreach_email, "video_topic": video_topic}
+    return {
+        "clips": validated_clips,
+        "outreach_email": outreach_email,
+        "video_topic": video_topic,
+        "key_point": key_point,
+    }
 
 
 # --- Second opinion on the actual clips --------------------------------------------

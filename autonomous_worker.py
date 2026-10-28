@@ -21,10 +21,14 @@ from core.face_tracker import on_camera_share
 from core.storage_manager import prune_stale_files
 from core.hook_selector import ClipResult
 from core.outreach import (
+    LEGACY_SITE_URL,
+    SITE_URL,
     build_follow_up,
     fill_drive_link,
     is_old_template,
+    refresh_site_links,
     rewrite_old_draft,
+    site_host,
     subject_for,
     topic_from_email,
 )
@@ -358,8 +362,15 @@ def get_pending_outreach() -> list[dict[str, Any]]:
                     str(record.get("channel_title") or ""),
                     str(record.get("drive_link") or ""),
                     str(record.get("video_title") or ""),
+                    shorts_status=str(record.get("shorts_status") or ""),
                 )
                 record["subject"] = subject_for(record["full_email_body"])
+                changed = True
+            # Unsent drafts follow the current website address (core/outreach.py SITE_URL).
+            old_site = str(record.get("site_url") or LEGACY_SITE_URL)
+            if record.get("status", "pending") == "pending" and site_host(old_site) != site_host(SITE_URL):
+                record["full_email_body"] = refresh_site_links(str(record.get("full_email_body") or ""), old_site)
+                record["site_url"] = SITE_URL
                 changed = True
         if changed:
             _write_json_atomic(PENDING_OUTREACH_PATH, pending)
@@ -406,6 +417,46 @@ def get_follow_ups_due(now: datetime | None = None) -> list[dict[str, Any]]:
             }
         )
     return due
+
+
+AWAITING_REPLY_DAYS = 30  # sent emails older than this drop off the "waiting" list
+
+
+def get_awaiting_reply(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Sent pitches with no reply yet (newest first). "follow_up_due" is True once
+    FOLLOW_UP_AFTER_DAYS passed without a follow-up, with "follow_up_subject" and
+    "follow_up_body" ready to send.
+    """
+    now = now or datetime.now(timezone.utc)
+    with _worker_lock():
+        records = _pending_records()
+    waiting: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("status") != "sent" or record.get("replied_at"):
+            continue
+        try:
+            sent_at = datetime.fromisoformat(str(record.get("sent_at")))
+        except ValueError:
+            continue
+        age = now - sent_at
+        if age > timedelta(days=AWAITING_REPLY_DAYS):
+            continue
+        body = str(record.get("full_email_body") or "")
+        item = {
+            **record,
+            "follow_up_due": not record.get("followed_up_at") and age >= timedelta(days=FOLLOW_UP_AFTER_DAYS),
+        }
+        if item["follow_up_due"]:
+            item["follow_up_subject"] = f"Re: {record.get('subject') or subject_for(body)}"
+            item["follow_up_body"] = build_follow_up(
+                str(record.get("channel_title") or ""),
+                video_title=str(record.get("video_title") or ""),
+                video_topic=topic_from_email(body),
+                drive_link=str(record.get("drive_link") or ""),
+            )
+        waiting.append(item)
+    waiting.sort(key=lambda item: str(item.get("sent_at")), reverse=True)
+    return waiting
 
 
 def mark_follow_up(record_id: str, outcome: str) -> bool:
@@ -759,6 +810,7 @@ def _process_lead(
     video_title = str(lead["latest_video_title"])
     video_url = str(lead["latest_video_url"])
     video_id = video_url.rsplit("=", maxsplit=1)[-1]
+    shorts_status = str((lead.get("shorts") or {}).get("status") or "")
     job_dir = settings.temp_dir / f"worker_{uuid.uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=False)
     source_video: Path | None = None
@@ -781,6 +833,7 @@ def _process_lead(
             channel_title,
             video_title,
             peaks,
+            shorts_status=shorts_status,
         )
         rendered = _render_selected_clips(
             source_video,
@@ -808,6 +861,8 @@ def _process_lead(
             "subject": subject_for(email_body),
             "full_email_body": email_body,
             "video_title": video_title,
+            "shorts_status": shorts_status,
+            "site_url": SITE_URL,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "channel_id": str(lead["channel_id"]),
             "target_video_id": video_id,
