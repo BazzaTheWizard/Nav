@@ -15,34 +15,14 @@ from core.gemini_resilience import (
     gemini_thinking_config,
     generate_content_with_fallback,
 )
+from core.outreach import build_outreach_email, clean_topic
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _JSON_CODE_BLOCK = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
-_EMAIL_TEMPLATE = """Hello {recipient_name},
-
-I hope all is well.
-
-My name is Barry Navan and I am an aspiring entrepreneur building a short-form content agency that turns {channel_content_summary} into high-retention vertical clips formatted specifically for short-form algorithms. Since short-form video is redefining modern marketing, actively circulating these clips across your channels is crucial for reaching younger fans and maximizing visibility.
-
-I loved the "{video_title}" and thought there were a couple of standout sequence moments that work especially well for TikTok and Reels, particularly when {specific_moment_reference}.
-
-To show you what I mean, I edited 3 vertical (9:16) shorts directly from that video, complete with kinetic captions and active framing:
-
-Access the 3 edited clips here:
-{drive_link}
-
-No strings attached—feel free to download and post them across YouTube Shorts, Instagram Reels, or TikTok if you like how they look.
-
-If you're interested in a hands-off setup that automatically turns every future video into 3–5 optimized vertical clips, let me know and we can set something up.
-
-Best,
-Barry Navan
-201-466-4807"""
-
 DEFAULT_CANDIDATE_COUNT = 5
 
-_SYSTEM_PROMPT = f"""You are an expert short-form video editor and creator outreach writer.
+_SYSTEM_PROMPT = """You are an expert short-form video editor.
 Analyze the supplied transcript and return one JSON object with:
 - "clips": exactly "candidate_count" items (given in the request), ranked best
   first, each with numeric start_time and end_time (seconds), hook_title (string,
@@ -61,21 +41,17 @@ Analyze the supplied transcript and return one JSON object with:
   Every clip must be between 30 and 60 seconds long. Each
   clip must capture a complete, self-contained thought with a strong hook,
   explanation, and natural conclusion. Use only transcript timestamps and do not invent dialogue.
-- "channel_content_summary": one concise factual description of the channel/video
-  content, suitable for the email.
-- "specific_moment_reference": a concise reference to a specific moment in the
-  transcript that fits the email sentence.
+- "video_topic": the specific topic of this video as a short phrase (3–10 words,
+  lowercase except names), written to complete the sentence "I cut 3 sample
+  Shorts from your recent video on ___". Be specific to what the video actually
+  covers, e.g. "squatting pain-free with knee arthritis", not "fitness".
 - The clips must not overlap and should come from different parts of the
   video.
 - When "most_replayed" moments are supplied, YouTube viewers rewatched those
   parts the most. Prefer clips that contain them, as long as each clip still
   stands on its own.
 
-The two text fields are inserted into this email template by the application
-(do NOT return the email itself):
-
-{_EMAIL_TEMPLATE}
-
+The application writes the outreach email itself; do NOT return an email.
 Do not include markdown or extra commentary."""
 
 
@@ -152,7 +128,7 @@ def select_clips_and_draft_pitch(
     candidate_count: int = DEFAULT_CANDIDATE_COUNT,
     replay_peaks: list[tuple[float, float, float]] | None = None,
 ) -> dict[str, Any]:
-    """Select three transcript clips and draft personalized outreach."""
+    """Select transcript clips and build the outreach email (see core/outreach.py)."""
     if not transcript_segments:
         raise ValueError("transcript_segments must not be empty.")
     normalized_segments: list[dict[str, float | str]] = []
@@ -240,24 +216,16 @@ def select_clips_and_draft_pitch(
     if not validated_clips:
         raise ValueError("The AI response did not contain any usable clips.")
 
-    channel_content_summary = str(result.get("channel_content_summary", "")).strip()
-    specific_moment_reference = str(
-        result.get("specific_moment_reference", "")
-    ).strip()
-    if not channel_content_summary or not specific_moment_reference:
-        raise ValueError(
-            "The AI response must include channel_content_summary and "
-            "specific_moment_reference."
-        )
-
-    outreach_email = _EMAIL_TEMPLATE.format(
-        recipient_name=channel_name.strip() or "there",
-        channel_content_summary=channel_content_summary,
-        video_title=video_title.strip(),
-        specific_moment_reference=specific_moment_reference,
-        drive_link=drive_link.strip(),
+    # A missing topic is not worth failing the lead over: the email falls back to
+    # the video title.
+    video_topic = clean_topic(result.get("video_topic"))
+    outreach_email = build_outreach_email(
+        channel_name,
+        video_title=video_title,
+        video_topic=video_topic,
+        drive_link=drive_link,
     )
-    return {"clips": validated_clips, "outreach_email": outreach_email}
+    return {"clips": validated_clips, "outreach_email": outreach_email, "video_topic": video_topic}
 
 
 def qualify_channel_candidate(

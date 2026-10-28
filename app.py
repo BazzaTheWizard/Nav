@@ -33,6 +33,7 @@ from core.downloader import (
 from core.clipper import rerender_clip
 from core.face_tracker import CropBox
 from core.drive_uploader import upload_clips_to_drive
+from core.outreach import SUBJECT, build_outreach_email, fill_drive_link
 from core.hook_selector import ClipResult, select_clips
 from core.pipeline import (
     pick_clips_with_agent,
@@ -185,7 +186,9 @@ def _generate_outreach_pitch(
     video_title: str,
     drive_link: str,
     clip_count: int,
+    channel_name: str = "",
 ) -> OutreachPitch:
+    """Email for when the AI step didn't produce one (same template as the worker)."""
     clean_title = _sanitize_outreach_video_title(video_title)
     if not clean_title:
         raise ValueError("The video title is empty after cleaning.")
@@ -195,24 +198,12 @@ def _generate_outreach_pitch(
         raise ValueError("At least one uploaded clip is required for the outreach email.")
 
     return OutreachPitch(
-        subject=f"{clip_count} ready-to-post shorts for your {clean_title}",
-        body=(
-            "Hi team,\n\n"
-            f'Loved the energy in your "{clean_title}" upload—there were a couple '
-            "of standout moments that work especially well for vertical platforms "
-            "like TikTok, Reels, and Shorts.\n\n"
-            f"To show you what I mean, I went ahead and edited {clip_count} vertical "
-            "(9:16) shorts directly from that upload, complete with kinetic captions "
-            "and active framing:\n\n"
-            f"👉 Access the {clip_count} finished clips here: {drive_link}\n\n"
-            "No strings attached—feel free to download and post them across YouTube "
-            "Shorts, IG Reels, or TikTok if you like how they look.\n\n"
-            "If you'd be interested in a hands-off setup that automatically turns "
-            "every future upload into 3–5 optimized vertical clips, let me know and "
-            "we can set something up.\n\n"
-            "Best,\n"
-            "Barry Navan\n"
-            "201-466-4807"
+        subject=SUBJECT,
+        body=build_outreach_email(
+            channel_name,
+            video_title=clean_title,
+            drive_link=drive_link,
+            clip_count=clip_count,
         ),
     )
 
@@ -486,6 +477,7 @@ def _generate_clips(
             st.session_state["outreach_email_body"] = st.session_state[
                 "ai_outreach_email"
             ]
+            st.session_state["outreach_email_subject"] = SUBJECT
         else:
             st.session_state.pop("outreach_email_body", None)
         st.session_state["outreach_video_title"] = video_title
@@ -988,10 +980,7 @@ def main() -> None:
                     st.session_state["drive_folder_link"] = drive_link
                     ai_email = st.session_state.get("ai_outreach_email", "")
                     if ai_email:
-                        completed_email = ai_email.replace(
-                            "Access the 3 edited clips here:\n\n",
-                            f"Access the 3 edited clips here:\n{drive_link}\n\n",
-                        )
+                        completed_email = fill_drive_link(ai_email, drive_link)
                         st.session_state["ai_outreach_email"] = completed_email
                         st.session_state["outreach_email_body"] = completed_email
                     else:
@@ -1000,6 +989,7 @@ def main() -> None:
                                 video_title,
                                 drive_link,
                                 len(generated_clips),
+                                resolved_channel_name,
                             )
                         except Exception as exc:
                             logging.exception("Fallback outreach email generation failed")
@@ -1029,7 +1019,7 @@ def main() -> None:
                     "📬 AI Creator Outreach Email Draft",
                     expanded=True,
                 ):
-                    if not ai_email and pitch_data:
+                    if st.session_state.get("outreach_email_subject"):
                         st.text_input(
                             "Subject",
                             key="outreach_email_subject",
@@ -1236,6 +1226,11 @@ def main() -> None:
                 if drive_link:
                     st.link_button("Open Google Drive clips", drive_link)
                 email_body = str(record.get("full_email_body") or "")
+                st.text_input(
+                    "Subject",
+                    value=str(record.get("subject") or SUBJECT),
+                    key=f"pending_subject_{record_id}",
+                )
                 st.text_area(
                     "Barry Navan outreach pitch",
                     value=email_body,

@@ -16,6 +16,7 @@ from config import PROJECT_ROOT, load_settings
 from core.downloader import download_source_video, extract_audio_only
 from core.drive_uploader import upload_clips_to_drive
 from core.hook_selector import ClipResult
+from core.outreach import SUBJECT, fill_drive_link, is_old_template, rewrite_old_draft
 from core.lead_harvester import (
     YouTubeQuotaExceededError,
     discover_channels,
@@ -314,6 +315,17 @@ def get_pending_outreach() -> list[dict[str, Any]]:
                     f"{record.get('channel_id', 'unknown')}:"
                     f"{record.get('target_video_id', uuid.uuid4().hex)}"
                 )
+                changed = True
+            # Unsent drafts written with the old template get the new email once.
+            body = str(record.get("full_email_body") or "")
+            if record.get("status", "pending") == "pending" and is_old_template(body):
+                record["full_email_body"] = rewrite_old_draft(
+                    body,
+                    str(record.get("channel_title") or ""),
+                    str(record.get("drive_link") or ""),
+                    str(record.get("video_title") or ""),
+                )
+                record.setdefault("subject", SUBJECT)
                 changed = True
         if changed:
             _write_json_atomic(PENDING_OUTREACH_PATH, pending)
@@ -664,10 +676,7 @@ def _process_lead(
             video_title,
             [str(path) for path in rendered],
         )
-        email_body = outreach_email.replace(
-            "Access the 3 edited clips here:\n\n",
-            f"Access the 3 edited clips here:\n{drive_link}\n\n",
-        )
+        email_body = fill_drive_link(outreach_email, drive_link)
         channel_url = str(
             lead.get("channel_url")
             or f"https://www.youtube.com/channel/{lead['channel_id']}"
@@ -678,7 +687,9 @@ def _process_lead(
             "channel_title": channel_title,
             "contact_email": contact,
             "drive_link": drive_link,
+            "subject": SUBJECT,
             "full_email_body": email_body,
+            "video_title": video_title,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "channel_id": str(lead["channel_id"]),
             "target_video_id": video_id,
