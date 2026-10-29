@@ -18,7 +18,7 @@ from core.face_tracker import CropBox, CropPlan, analyze_crop_plan
 from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
 from core.outreach import build_outreach_email, build_subject
-from core.title_card import TitleOverlay, prepare_title_overlay
+from core.title_card import SEAM_PLACEMENT, TitleOverlay, prepare_title_overlay
 from core.transcriber import (
     Word,
     clip_words_from_transcript,
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # "auto" uses a full-screen face crop only when it will look good:
 MIN_SMART_CROP_WIDTH = 540  # 9:16 crop width in source pixels (needs ~1080p+)
 AUTO_MIN_FACE_COVERAGE = 0.6  # share of the clip where a face is found
-AUTO_MAX_GROUP_COVERAGE = 0.35  # share in wide shots with 2+ people far apart
+AUTO_MAX_GROUP_COVERAGE = 0.35  # share in wide shots with 2+ people that can't be split
 AUTO_MAX_SHOTS = 40  # very fast cutting looks jumpy with a moving crop
 _PLACEHOLDER_CROP = CropBox(x=0, y=0, width=2, height=2)
 
@@ -57,7 +57,9 @@ def choose_layout(requested: str, plan: CropPlan | None) -> str:
         plan is not None
         and plan.crop_width >= MIN_SMART_CROP_WIDTH
         and plan.face_coverage >= AUTO_MIN_FACE_COVERAGE
-        and plan.group_coverage <= AUTO_MAX_GROUP_COVERAGE
+        # Two-person shots become the two-speaker split view, so only wide shots
+        # that can't be split (3+ people, faces too small) count against the crop.
+        and plan.unsplit_group_coverage <= AUTO_MAX_GROUP_COVERAGE
         and len(plan.shots) <= AUTO_MAX_SHOTS
     ):
         return "smart_crop"
@@ -96,11 +98,13 @@ def render_selected_clip(
         layout = choose_layout(layout_mode, plan)
 
         full_frame: list[tuple[float, float]] = []
+        split = None
         if layout in CROP_LAYOUTS:
             crop = plan.crop if plan is not None else _center_crop(source_video, None)
             x_expression = plan.x_expression(start, end) if plan is not None else None
             if layout == "smart_crop" and plan is not None:
                 full_frame = plan.full_frame_ranges(start, end)
+                split = plan.split_view(start, end)
         else:
             crop, x_expression = _PLACEHOLDER_CROP, None
 
@@ -128,6 +132,8 @@ def render_selected_clip(
             # The card replaces the old subtitle-style title; that one is only a fallback.
             hook_title=None if title else clip.viral_title,
             hook_seconds=settings.hook_title_seconds,
+            seam_spans=split.spans if split else None,
+            seam_title=_seam_title(title),
         )
         rendered = render_clip(
             source_video,
@@ -140,13 +146,15 @@ def render_selected_clip(
             crop_x_expression=x_expression,
             title=title,
             full_frame_ranges=full_frame or None,
+            split_view=split,
         )
         logger.info(
-            "Rendered %s (%s, %d shot(s), %d shown full-frame)",
+            "Rendered %s (%s, %d shot(s), %d shown full-frame, %d as two-speaker split)",
             rendered.name,
             layout,
             len(plan.shots) if plan else 1,
             len(full_frame),
+            len(split.spans) if split else 0,
         )
         return RenderedClip(
             path=rendered,
@@ -170,6 +178,9 @@ def pick_clips_with_agent(
     video_title: str,
     peaks: list[tuple[float, float, float]] | None = None,
     shorts_status: str = "",
+    *,
+    min_judge_score: int | None = None,
+    report: dict[str, Any] | None = None,
 ) -> tuple[list[ClipResult], str, str]:
     """Gemini/OpenAI picks (ranked) + outreach email and subject, snapped like
     every other clip. Returns (clips, email, subject).
@@ -178,6 +189,12 @@ def pick_clips_with_agent(
     to sentences, weak moments are fixed or dropped, a second AI pass scores
     each clip's exact words, and the best non-overlapping ``count`` are kept.
     The email opens on the best clip: its start time and what its point is.
+
+    ``min_judge_score`` (the worker's quality gate): clips the second AI pass
+    scored below this are dropped, and so are filler picks it never scored. With
+    fewer than MIN_CLIPS left, WeakMoments is raised. Without judge scores (no
+    AI answer) nothing is dropped. ``report`` (optional dict) receives
+    "judge_scores": one score (or None) per returned clip.
     """
     result = select_clips_and_draft_pitch(
         transcript_segments=transcript_segments(words),
@@ -198,8 +215,21 @@ def pick_clips_with_agent(
         )
         for rank, item in enumerate(result["clips"])
     ]
-    candidates = rescore_with_judge(prepare_candidates(proposals, words, video_duration), words, count)
+    judged: dict[tuple[float, float], int] = {}
+    candidates = rescore_with_judge(prepare_candidates(proposals, words, video_duration), words, count, judged)
     clips = choose_clips(candidates, words, video_duration, count)
+    if min_judge_score is not None and judged and clips:
+        good = [clip for clip in clips if judged.get(_clip_key(clip), -1) >= min_judge_score]
+        if len(good) < MIN_CLIPS:
+            raise WeakMoments(
+                f"only {len(good)} clip(s) scored {min_judge_score}+ "
+                f"(scores: {', '.join(str(judged.get(_clip_key(c), '-')) for c in clips)})"
+            )
+        if len(good) < len(clips):
+            logger.info("Dropped %d weak clip(s); sending %d.", len(clips) - len(good), len(good))
+        clips = good
+    if report is not None:
+        report["judge_scores"] = [judged.get(_clip_key(clip)) for clip in clips]
     short_topic = str(result.get("short_topic") or "")
     content_format = str(result.get("format") or "")
     if not clips:
@@ -234,17 +264,46 @@ def _ai_pick_for(clip: ClipResult, picks: list[dict[str, Any]]) -> dict[str, Any
     return min(nearby, key=lambda pick: abs(float(pick["start_time"]) - clip.start_time), default={})
 
 
+def _seam_title(title: TitleOverlay | None) -> tuple[float, int] | None:
+    """(seconds, bottom y) when the title sits on the split view's seam."""
+    if title is None or title.placement != SEAM_PLACEMENT:
+        return None
+    return title.seconds, title.card_top + title.card_height
+
+
+class WeakMoments(Exception):
+    """Fewer than MIN_CLIPS clips passed the quality bar; the lead isn't worth sending."""
+
+
+MIN_CLIPS = 2  # with fewer good clips than this, the lead is skipped
+
+
+def _clip_key(clip: ClipResult) -> tuple[float, float]:
+    return (round(clip.start_time, 2), round(clip.end_time, 2))
+
+
 EXTRA_CANDIDATES = 5  # spare picks, so dropping weak moments rarely leaves a gap
 JUDGE_WEIGHT = 0.7  # the judge reads the final clip text; the first pass only ranked moments
 
 
-def rescore_with_judge(candidates: list[ClipResult], words: list[Word], count: int) -> list[ClipResult]:
-    """Blend the judge's score into each candidate's rank score (best effort)."""
+def rescore_with_judge(
+    candidates: list[ClipResult],
+    words: list[Word],
+    count: int,
+    scores_out: dict[tuple[float, float], int] | None = None,
+) -> list[ClipResult]:
+    """Blend the judge's score into each candidate's rank score (best effort).
+
+    ``scores_out`` collects each candidate's own judge score (0-100), keyed by
+    (start_time, end_time), for the quality gate and the Outbox record."""
     if len(candidates) <= count:
         return candidates  # nothing to choose between
     scores = judge_clips([clip_text(words, clip.start_time, clip.end_time) for clip in candidates])
     if scores is None:
         return candidates
+    if scores_out is not None:
+        for clip, score in zip(candidates, scores):
+            scores_out[_clip_key(clip)] = score
     rescored = [
         clip.model_copy(
             update={"virality_score": round(JUDGE_WEIGHT * score + (1 - JUDGE_WEIGHT) * clip.virality_score)}

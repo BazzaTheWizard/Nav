@@ -5,6 +5,7 @@ import functools
 import logging
 import math
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -32,6 +33,45 @@ GROQ_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 # keeps the upload under GROQ_MAX_UPLOAD_BYTES is chosen, so long videos still fit.
 _GROQ_MP3_BITRATES_KBPS = (64, 56, 48, 40, 32, 24, 16)
 _WHISPER_MODEL_LOCK = threading.Lock()
+GROQ_LIMIT_DEFAULT_WAIT_SEC = 60 * 60  # when Groq doesn't say how long to wait
+FFMPEG_TIMEOUT_SEC = 15 * 60
+
+
+class TranscriptionLimitReached(RuntimeError):
+    """Groq's transcription limit is used up. Nothing falls back to the slower,
+    less accurate local model; wait ``retry_after`` seconds and try again."""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def local_whisper_allowed() -> bool:
+    """Local faster-whisper only runs when there's no Groq key, or when
+    ALLOW_LOCAL_WHISPER=1 is set in .env. Off by default: its captions are less
+    accurate than Groq's, so a Groq problem stops the job instead."""
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    return os.getenv("ALLOW_LOCAL_WHISPER", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _groq_wait_seconds(error: Exception) -> float:
+    """How long Groq says to wait: the retry-after header, else "try again in 1h2m3s"."""
+    headers = getattr(getattr(error, "response", None), "headers", None) or {}
+    try:
+        value = float(headers.get("retry-after"))
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    match = re.search(r"try again in\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:([\d.]+)s)?", str(error))
+    if match and any(match.groups()):
+        hours, minutes, seconds = (float(group or 0) for group in match.groups())
+        return hours * 3600 + minutes * 60 + seconds
+    return GROQ_LIMIT_DEFAULT_WAIT_SEC
+
+
+def _is_rate_limit(error: Exception) -> bool:
+    return getattr(error, "status_code", None) == 429 or type(error).__name__ == "RateLimitError"
 
 
 @dataclass(frozen=True)
@@ -152,7 +192,11 @@ def transcribe_audio(
                 groq_key,
                 settings.whisper_language,
             )
+        except TranscriptionLimitReached:
+            raise
         except Exception as exc:
+            if not local_whisper_allowed():
+                raise RuntimeError(f"Groq transcription failed: {exc}") from exc
             logger.warning(
                 "Groq transcription failed; using local faster-whisper: %s",
                 exc,
@@ -162,6 +206,8 @@ def transcribe_audio(
                 if on_progress is not None:
                     on_progress(1.0, "100% complete")
                 return words
+            if not local_whisper_allowed():
+                raise RuntimeError("Groq transcription returned no timestamped speech.")
             logger.warning(
                 "Groq transcription returned no valid timestamped segments; "
                 "using local faster-whisper."
@@ -219,7 +265,11 @@ def transcribe_clip_audio(audio_path: str | Path, settings: Settings) -> list[Wo
     if groq_key:
         try:
             words = _transcribe_with_groq(audio_file, groq_key, language)
+        except TranscriptionLimitReached:
+            raise
         except Exception as exc:
+            if not local_whisper_allowed():
+                raise RuntimeError(f"Groq clip transcription failed: {exc}") from exc
             logger.warning(
                 "Groq clip transcription failed; using local faster-whisper: %s",
                 exc,
@@ -227,6 +277,8 @@ def transcribe_clip_audio(audio_path: str | Path, settings: Settings) -> list[Wo
         else:
             if words:
                 return words
+            if not local_whisper_allowed():
+                raise RuntimeError("Groq clip transcription returned no timestamped speech.")
             logger.warning(
                 "Groq clip transcription returned no valid timestamped segments; "
                 "using local faster-whisper."
@@ -281,7 +333,8 @@ def _transcribe_with_groq(
             "Install it with `python -m pip install -r requirements.txt`."
         ) from exc
 
-    client = Groq(api_key=api_key)
+    # One quick retry for a blip; a used-up limit is reported instead of retried.
+    client = Groq(api_key=api_key, max_retries=1)
     with tempfile.TemporaryDirectory(prefix="groq-transcription-") as temp_dir:
         upload_path = audio_path
         if audio_path.stat().st_size > GROQ_MAX_UPLOAD_BYTES:
@@ -306,7 +359,10 @@ def _transcribe_with_groq(
                     check=True,
                     capture_output=True,
                     text=True,
+                    timeout=FFMPEG_TIMEOUT_SEC,
                 )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("Preparing audio for Groq took too long and was stopped.") from exc
             except (OSError, subprocess.CalledProcessError) as exc:
                 stderr = (
                     exc.stderr.strip()
@@ -333,10 +389,19 @@ def _transcribe_with_groq(
         if language:
             request_options["language"] = language
         with upload_path.open("rb") as audio_file:
-            response = client.audio.transcriptions.create(
-                file=audio_file,
-                **request_options,
-            )
+            try:
+                response = client.audio.transcriptions.create(
+                    file=audio_file,
+                    **request_options,
+                )
+            except Exception as exc:
+                if not _is_rate_limit(exc):
+                    raise
+                wait = _groq_wait_seconds(exc)
+                raise TranscriptionLimitReached(
+                    f"Groq's transcription limit is used up; it resets in about {round(wait / 60)} min.",
+                    wait,
+                ) from exc
 
     segments = _parse_timed_items(_response_field(response, "segments"), "text")
     words = _parse_timed_items(_response_field(response, "words"), "word")
@@ -476,9 +541,10 @@ def _audio_duration(audio_path: Path) -> float:
             check=True,
             capture_output=True,
             text=True,
+            timeout=60,
         )
         duration = float(result.stdout.strip())
-    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         raise RuntimeError(
             f"Could not read audio duration metadata for {audio_path}."
         ) from exc

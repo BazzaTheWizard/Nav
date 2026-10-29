@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from core.face_tracker import CropBox, CropPlan, _face_detector, _probe_display_size
+from core.face_tracker import CropBox, CropPlan, SplitView, _face_detector, _probe_display_size
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +31,16 @@ FONT_PATH = PROJECT_ROOT / "assets" / "fonts" / "Montserrat-ExtraBold.ttf"
 FRAME_WIDTH, FRAME_HEIGHT = 1080, 1920
 # TikTok/Reels/Shorts draw tabs and the status bar over roughly the top 9%.
 SAFE_TOP = 170
-# Captions end at y=1240 and can wrap to two lines, so keep the title above this.
+# Captions end at y=1240 and can wrap to two lines (from about y=1010).
 CAPTION_ZONE_TOP = 1010
+CAPTION_ZONE_BOTTOM = 1240
+# During a two-speaker split view the captions sit on the seam instead.
+SEAM_CAPTION_ZONE = (860, 1060)
+SEAM_Y = 960
+SEAM_PLACEMENT = "on the seam"
+# When the face fills the top of the frame, the title may go under the captions,
+# but no lower than this: TikTok/Reels/Shorts put the caption and buttons below.
+LOWEST_TITLE_BOTTOM = 1500
 GAP = 28  # space between the title and a face or the video band
 
 MAX_CARD_WIDTH = 900
@@ -203,6 +211,7 @@ def _sample_frames(
         ],
         check=True,
         capture_output=True,
+        timeout=120,
     )
     frame_bytes = FACE_SAMPLE_WIDTH * sample_height * 3
     data = np.frombuffer(result.stdout, dtype=np.uint8)
@@ -218,9 +227,14 @@ def _face_zones(
     frame_size: tuple[int, int],
     clip_start: float,
     seconds: float,
+    split: SplitView | None = None,
+    full_frame: list[tuple[float, float]] | None = None,
 ) -> list[list[tuple[float, float]]]:
     """For each sampled frame, the vertical spans (output pixels, smart crop) the
-    title must not cover: each face plus hair above it and neck below it."""
+    title must not cover: each face plus hair above it and neck below it.
+
+    Frames in a two-speaker split view (``split``) or a full-frame span
+    (``full_frame``, clip-relative) are mapped the way the renderer shows them."""
     detector = _face_detector()
     if not detector.available:
         return []
@@ -235,8 +249,36 @@ def _face_zones(
     to_source = width / FACE_SAMPLE_WIDTH
     to_output = FRAME_HEIGHT / crop_height
     zones: list[list[tuple[float, float]]] = []
+    full_scale = FRAME_WIDTH / width
+    full_top = max(0, 1050 - round(height * full_scale))  # video_renderer.FULL_FRAME_BOTTOM_Y
     for index, frame in enumerate(_sample_frames(source, clip_start, seconds, frame_size)):
-        moment = clip_start + index / FACE_SAMPLE_FPS
+        relative = index / FACE_SAMPLE_FPS
+        moment = clip_start + relative
+        window = next((w for w in (split.windows if split else ()) if w[0] <= relative < w[1]), None)
+        if window is not None:
+            _a, _b, top_x, top_y, bottom_x, bottom_y = window
+            panel_scale = 960 / split.height
+            spans = []
+            for cx, cy, _w, h, _score in detector.detect(frame):
+                sx, sy, sh = cx * to_source, cy * to_source, h * to_source
+                if top_x <= sx <= top_x + split.width:
+                    center = (sy - top_y) * panel_scale
+                elif bottom_x <= sx <= bottom_x + split.width:
+                    center = 960 + (sy - bottom_y) * panel_scale
+                else:
+                    continue
+                face = sh * panel_scale
+                spans.append((center - face / 2 - 0.45 * face - GAP, center + face / 2 + 0.35 * face + GAP))
+            zones.append(spans)
+            continue
+        if any(a <= relative < b for a, b in (full_frame or [])):
+            spans = []
+            for _cx, cy, _w, h, _score in detector.detect(frame):
+                center = full_top + cy * to_source * full_scale
+                face = h * to_source * full_scale
+                spans.append((center - face / 2 - 0.45 * face - GAP, center + face / 2 + 0.35 * face + GAP))
+            zones.append(spans)
+            continue
         if plan is not None:
             shot = next((s for s in plan.shots if s.start <= moment < s.end), plan.shots[-1])
             crop_x = shot.x
@@ -255,17 +297,32 @@ def _face_zones(
     return zones
 
 
-def _best_slot(card_height: int, zones: list[list[tuple[float, float]]]) -> tuple[int, int]:
-    """Highest card position that covers a face in the fewest sampled frames."""
+def _best_slot(
+    card_height: int,
+    zones: list[list[tuple[float, float]]],
+    blocked: list[tuple[float, float]] | None = None,
+) -> tuple[int, int]:
+    """Highest card position that covers a face in the fewest sampled frames.
+
+    ``blocked``: output y ranges the card must not touch (the captions). The
+    search runs from the top of the safe area down to LOWEST_TITLE_BOTTOM, so a
+    close-up whose face fills the top puts the title under the captions instead
+    of over the face.
+    """
+    if blocked is None:
+        blocked = [(CAPTION_ZONE_TOP, CAPTION_ZONE_BOTTOM)]
     best: tuple[int, int] | None = None
-    for top in range(SAFE_TOP, max(SAFE_TOP, CAPTION_ZONE_TOP - card_height) + 1, 10):
+    for top in range(SAFE_TOP, max(SAFE_TOP, LOWEST_TITLE_BOTTOM - card_height) + 1, 10):
         bottom = top + card_height
+        if any(top < b + GAP and bottom > a - GAP for a, b in blocked):
+            continue
         covered = sum(any(top < b and bottom > a for a, b in spans) for spans in zones)
         if best is None or covered < best[1]:
             best = (top, covered)
             if covered == 0:
                 break
-    assert best is not None
+    if best is None:  # every slot touches a caption zone: fall back to the top
+        best = (SAFE_TOP, sum(bool(spans) for spans in zones))
     return best
 
 
@@ -282,6 +339,7 @@ def _place(
     card_height: int,
     frame_size: tuple[int, int],
     zones: list[list[tuple[float, float]]],
+    blocked: list[tuple[float, float]] | None = None,
 ) -> tuple[int, str, int]:
     """(card top, description, sampled frames where it covers a face)."""
     if layout in {"blurred_background", "wide_blurred_background"}:
@@ -293,14 +351,18 @@ def _place(
         content = min(960, round(FRAME_WIDTH * height / max(1, width)))
         bar_top = (960 + content) // 2
         return round((bar_top + 960) / 2 - card_height / 2), "between the panels", 0
-    top, covered = _best_slot(card_height, zones)
+    top, covered = _best_slot(card_height, zones, blocked)
     if not any(zones):
         return top, "top (no face found)", 0
-    return (
-        top,
-        ("top" if top == SAFE_TOP else "under the face") if covered == 0 else "least face overlap",
-        covered,
-    )
+    if covered:
+        label = "least face overlap"
+    elif top == SAFE_TOP:
+        label = "top"
+    elif top >= CAPTION_ZONE_BOTTOM:
+        label = "under the captions"
+    else:
+        label = "under the face"
+    return top, label, covered
 
 
 def prepare_title_overlay(
@@ -331,10 +393,47 @@ def prepare_title_overlay(
         frame_size = _probe_display_size(source_video)
 
     zones: list[list[tuple[float, float]]] = []
+    blocked: list[tuple[float, float]] | None = None
     if layout not in {"blurred_background", "wide_blurred_background", "stacked"}:
+        split = full_frame = None
+        if plan is not None and layout == "smart_crop":
+            split = plan.split_view(clip_start, clip_start + clip_duration)
+            full_frame = plan.full_frame_ranges(clip_start, clip_start + clip_duration)
+        # Captions sit on the seam during the split view and low otherwise; the
+        # title must miss whichever ones are on screen while it shows.
+        split_time = sum(
+            max(0.0, min(b, seconds) - a) for a, b in (split.spans if split else ())
+        )
+        if split_time >= seconds / 2:
+            # Two-speaker split view: both panels are mostly face, so the title sits
+            # on the seam between them (over the top speaker's chest and the space
+            # above the lower speaker's head); the captions move just under it
+            # while it shows (core.subtitle_engine, seam_title).
+            image_path = work_dir / f"{name}_title_{FONT_SIZES[0]}.png"
+            _path, card_width, card_height = render_title_card(
+                text, image_path, style=style, max_font_size=FONT_SIZES[0]
+            )
+            card_top = SEAM_Y - card_height // 2
+            logger.info("Title card: on the seam (split view) at y=%d (%d px tall)", card_top, card_height)
+            return TitleOverlay(
+                image_path=image_path,
+                x=(FRAME_WIDTH - card_width) // 2 - SHADOW_MARGIN,
+                y=card_top - SHADOW_MARGIN,
+                seconds=seconds,
+                card_top=card_top,
+                card_height=card_height,
+                placement=SEAM_PLACEMENT,
+            )
+        blocked = []
+        if split_time > 0:
+            blocked.append(SEAM_CAPTION_ZONE)
+        if split_time < seconds - 0.05:
+            blocked.append((CAPTION_ZONE_TOP, CAPTION_ZONE_BOTTOM))
         try:
-            zones = _face_zones(source_video, plan, crop, frame_size, clip_start, seconds)
-        except (subprocess.CalledProcessError, OSError, ValueError):
+            zones = _face_zones(
+                source_video, plan, crop, frame_size, clip_start, seconds, split=split, full_frame=full_frame
+            )
+        except (subprocess.CalledProcessError, OSError, ValueError, subprocess.TimeoutExpired):
             logger.warning("Could not check the face position for the title.", exc_info=True)
 
     # Try the normal size, then a smaller one if the big card would cover the face.
@@ -344,7 +443,7 @@ def prepare_title_overlay(
         _path, card_width, card_height = render_title_card(
             text, image_path, style=style, max_font_size=max_size
         )
-        card_top, label, covered = _place(layout, card_height, frame_size, zones)
+        card_top, label, covered = _place(layout, card_height, frame_size, zones, blocked)
         candidates.append((covered, image_path, card_width, card_height, card_top, label))
         if covered == 0:
             break

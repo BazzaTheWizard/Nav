@@ -10,7 +10,7 @@ from typing import Any
 from config import PROJECT_ROOT
 from core.face_tracker import CropBox, CropPlan
 from core.subtitle_engine import create_ass_subtitles
-from core.title_card import TitleOverlay, prepare_title_overlay
+from core.title_card import SEAM_PLACEMENT, TitleOverlay, prepare_title_overlay
 from core.transcriber import Word
 from core.video_renderer import CROP_LAYOUTS, render_clip
 
@@ -58,11 +58,12 @@ def _center_crop(source_path: Path, cached_crop_x: int | None) -> CropBox:
             ],
             check=True,
             capture_output=True,
+            timeout=60,
             text=True,
         )
         width_text, height_text = result.stdout.strip().split("x", maxsplit=1)
         input_width, input_height = int(width_text), int(height_text)
-    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         raise RuntimeError(
             f"Could not read source video dimensions for re-rendering: {source_path}"
         ) from exc
@@ -152,12 +153,15 @@ def rerender_clip(
 
         x_expression = None
         full_frame: list[tuple[float, float]] = []
+        split = None
         if crop_plan is not None and layout_mode in CROP_LAYOUTS:
             crop = crop_plan.crop
             x_expression = crop_plan.x_expression(new_start, new_end)
             if layout_mode == "smart_crop":
-                # Same as first renders: slides and wide shots show the whole frame.
+                # Same as first renders: slides and wide shots show the whole frame,
+                # two-person shots the two-speaker split view.
                 full_frame = crop_plan.full_frame_ranges(new_start, new_end)
+                split = crop_plan.split_view(new_start, new_end)
 
         try:
             title = prepare_title_overlay(
@@ -183,6 +187,10 @@ def rerender_clip(
             # The card replaces the old subtitle-style title; that one is only a fallback.
             hook_title=None if title else hook_title,
             hook_seconds=hook_seconds,
+            seam_spans=split.spans if split else None,
+            seam_title=(title.seconds, title.card_top + title.card_height)
+            if title is not None and title.placement == SEAM_PLACEMENT
+            else None,
         )
         render_clip(
             source,
@@ -195,6 +203,7 @@ def rerender_clip(
             crop_x_expression=x_expression,
             title=title,
             full_frame_ranges=full_frame or None,
+            split_view=split,
         )
         temporary_output.replace(destination)
     finally:

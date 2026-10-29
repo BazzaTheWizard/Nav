@@ -157,7 +157,11 @@ check("App runs", not at.exception, str([e.value for e in at.exception]))
 check("Worker not running -> says so, with the start command",
       any("isn't running" in str(w.value) for w in at.warning) and any("autonomous_worker.py --continuous" in str(c.value) for c in at.code))
 labels = [b.label for b in at.button]
-check("Buttons: '✅ Mark as Sent' and '❌ Pass (not pitching)'", "✅ Mark as Sent" in labels and "❌ Pass (not pitching)" in labels and "❌ Pass / Next Creator" not in labels)
+# Round 11: Pass opens a small menu of reasons (one button per reason).
+popovers = [p.proto.popover.label for p in at.get("popover")]
+check("Buttons: '✅ Mark as Sent' and '❌ Pass (not pitching)'",
+      "✅ Mark as Sent" in labels and "❌ Pass (not pitching)" in popovers
+      and all(reason in labels for reason in W.PASS_REASONS.values()) and "❌ Pass / Next Creator" not in labels, str(popovers))
 check("Queue has 'Do next' (not on the first one)", sum(1 for b in at.button if (b.key or "").startswith("do_next_")) == 1)
 at.button(key="do_next_b_1").click().run()
 check("Do next works from the app", [l["channel_id"] for l in json.loads(W.LEAD_QUEUE_PATH.read_text())] == ["b", "a"])

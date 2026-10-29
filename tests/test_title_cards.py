@@ -64,7 +64,12 @@ with tempfile.TemporaryDirectory() as tmp:
     check("No face: card goes to the top", top == T.SAFE_TOP and covered == 0)
     high_face = [[(150.0, 1100.0)]] * 12
     top, covered = T._best_slot(200, high_face)
-    check("No free spot: still placed inside the safe area", T.SAFE_TOP <= top <= T.CAPTION_ZONE_TOP - 200)
+    # Round 11: a face that fills the top puts the card under the captions, not on the face.
+    check("Face fills the top: card goes under the captions",
+          covered == 0 and top >= T.CAPTION_ZONE_BOTTOM and top + 200 <= T.LOWEST_TITLE_BOTTOM, f"top={top}")
+    everywhere = [[(150.0, 1600.0)]] * 12
+    top, covered = T._best_slot(200, everywhere)
+    check("No free spot at all: top of the safe area", top == T.SAFE_TOP and covered == 12, f"top={top}")
     top, label, _ = T._place("blurred_background", 200, (1920, 1080), [])
     check("Blurred layout: card sits above the video", top + 200 <= 656, f"top={top} ({label})")
     top, label, _ = T._place("stacked", 200, (1920, 1080), [])

@@ -7,7 +7,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from core.face_tracker import CropBox
+from core.face_tracker import CropBox, SplitView
 from core.title_card import TitleOverlay, overlay_filter
 
 
@@ -33,6 +33,10 @@ _BLURRED_BACKGROUND = (
 # over a blurred copy, with its bottom edge here so captions (which start around
 # y=1080) sit below it instead of covering the slide.
 FULL_FRAME_BOTTOM_Y = 1050
+# A stuck FFmpeg (damaged file, full disk) must not stall the worker forever.
+RENDER_TIMEOUT_SEC = 10 * 60
+# Two-speaker split view: two 1080x960 panels with a thin dark line on the seam.
+SEAM_LINE = "drawbox=x=0:y=958:w=1080:h=4:color=black@0.85:t=fill"
 
 
 def _enable_expression(spans: list[tuple[float, float]]) -> str:
@@ -67,6 +71,7 @@ def render_clip(
     crop_x_expression: str | None = None,
     title: TitleOverlay | None = None,
     full_frame_ranges: list[tuple[float, float]] | None = None,
+    split_view: SplitView | None = None,
 ) -> Path:
     """Render one vertical clip.
 
@@ -75,6 +80,8 @@ def render_clip(
     ``title`` (from core.title_card) is laid over the video, under the captions.
     ``full_frame_ranges`` (smart_crop only, from CropPlan.full_frame_ranges): spans
     where the whole frame is shown over a blurred background instead of the crop.
+    ``split_view`` (smart_crop only, from CropPlan.split_view): two-person shots
+    shown as two stacked panels, one speaker each.
     """
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -131,17 +138,55 @@ def render_clip(
             f"[0:v]{stacked_crop_filter},"
             "scale=1080:960[bottom];[top][bottom]vstack=inputs=2[base]"
         )
-    elif layout_mode == "smart_crop" and full_frame_ranges:
-        filter_complex = (
-            "[0:v]split=3[src_crop][src_bg][src_fg];"
-            + _BLURRED_BACKGROUND.replace("[0:v]", "[src_bg]")
-            + "[src_fg]scale=1080:-2[fg];"
-            f"[bg][fg]overlay=x=(W-w)/2:y='max(0,{FULL_FRAME_BOTTOM_Y}-h)'[full];"
-            f"[src_crop]{crop_filter},"
-            "scale=1080:1920:flags=lanczos,"
-            "unsharp=5:5:0.7:5:5:0.0[cropped];"
-            f"[cropped][full]overlay=0:0:enable='{_enable_expression(full_frame_ranges)}'[base]"
+    elif layout_mode == "smart_crop" and (full_frame_ranges or (split_view and split_view.spans)):
+        sources = ["[src_crop]"]
+        parts: list[str] = []
+        layers: list[tuple[str, list[tuple[float, float]]]] = []
+        if full_frame_ranges:
+            sources += ["[src_bg]", "[src_fg]"]
+            parts.append(
+                _BLURRED_BACKGROUND.replace("[0:v]", "[src_bg]")
+                + "[src_fg]scale=1080:-2[fg];"
+                f"[bg][fg]overlay=x=(W-w)/2:y='max(0,{FULL_FRAME_BOTTOM_Y}-h)'[full];"
+            )
+            layers.append(("[full]", full_frame_ranges))
+        if split_view and split_view.spans:
+            sources += ["[src_top]", "[src_bottom]"]
+            panel = f"crop=w={split_view.width}:h={split_view.height}"
+            parts.append(
+                f"[src_top]{panel}:x='{split_view.top_x}':y='{split_view.top_y}',"
+                "scale=1080:960:flags=lanczos,unsharp=5:5:0.5:5:5:0.0[top];"
+                f"[src_bottom]{panel}:x='{split_view.bottom_x}':y='{split_view.bottom_y}',"
+                "scale=1080:960:flags=lanczos,unsharp=5:5:0.5:5:5:0.0[bottom];"
+                f"[top][bottom]vstack=inputs=2,{SEAM_LINE}[pair];"
+            )
+            layers.append(("[pair]", list(split_view.spans)))
+        whole_clip_split = (
+            not full_frame_ranges
+            and len(layers) == 1
+            and layers[0][1][0][0] <= 0.05
+            and layers[0][1][-1][1] >= end_time - start_time - 0.05
+            and len(layers[0][1]) == 1
         )
+        if whole_clip_split:
+            # The whole clip is the split view: skip the unused single-face crop.
+            filter_complex = (
+                "[0:v]split=2[src_top][src_bottom];" + "".join(parts) + "[pair]null[base]"
+            )
+            layers = []
+        else:
+            filter_complex = (
+                f"[0:v]split={len(sources)}{''.join(sources)};"
+                + "".join(parts)
+                + f"[src_crop]{crop_filter},"
+                "scale=1080:1920:flags=lanczos,"
+                "unsharp=5:5:0.7:5:5:0.0[layer0]"
+            )
+        for index, (label, spans) in enumerate(layers):
+            target = "[base]" if index == len(layers) - 1 else f"[layer{index + 1}]"
+            filter_complex += (
+                f";[layer{index}]{label}overlay=0:0:enable='{_enable_expression(spans)}'{target}"
+            )
     else:
         filter_complex = (
             f"[0:v]{crop_filter},"
@@ -195,7 +240,13 @@ def render_clip(
             capture_output=True,
             text=True,
             shell=False,
+            timeout=RENDER_TIMEOUT_SEC,
         )
+    except subprocess.TimeoutExpired as exc:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"FFmpeg clip rendering took longer than {RENDER_TIMEOUT_SEC // 60} minutes and was stopped."
+        ) from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()
         logger.error("FFmpeg clip rendering failed: %s", detail)

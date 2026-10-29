@@ -39,11 +39,12 @@ from core.lead_harvester import (
     generate_search_queries,
 )
 from core.pipeline import (
+    WeakMoments,
     pick_clips_with_agent,
     render_selected_clip,
     video_info_and_peaks,
 )
-from core.transcriber import Word, transcribe_audio
+from core.transcriber import TranscriptionLimitReached, Word, transcribe_audio
 from main import _video_duration
 
 
@@ -67,6 +68,9 @@ QUOTA_COOLDOWN_SEC = 15 * 60
 # times before it's marked failed for good.
 MAX_LEAD_ATTEMPTS = 3
 CLIPS_PER_LEAD = 3
+# Quality gate: clips the second AI pass scores below this (0-100) aren't sent. A
+# lead with fewer than 2 clips left is skipped automatically, before your Outbox.
+MIN_CLIP_SCORE = 60
 DRIVE_SIGN_IN_WAIT_SEC = 10 * 60
 # Below this share of sampled frames with a face, nobody is really on camera
 # (narration, slides, animation): those creators aren't a fit, so they're
@@ -89,7 +93,13 @@ def is_permanent_error(error: Exception) -> bool:
 
 
 class NotAFit(Exception):
-    """The creator isn't a fit (for example, nobody on camera). Skipped, never retried."""
+    """The creator isn't a fit (nobody on camera, or no clip good enough to send).
+    Skipped, never retried."""
+
+
+def _groq_pause_text(error: TranscriptionLimitReached) -> str:
+    resume = (datetime.now() + timedelta(seconds=error.retry_after + 60)).strftime("%-I:%M %p")
+    return f"Groq transcription limit reached; continues at about {resume}"
 
 
 # --- Worker status, for the app ------------------------------------------------------
@@ -561,6 +571,33 @@ def get_recently_passed(now: datetime | None = None) -> list[dict[str, Any]]:
     return recent
 
 
+def pass_summary(now: datetime | None = None) -> dict[str, int]:
+    """Last PASSED_LOOKBACK_DAYS: how often each pass reason was used, plus leads
+    the worker skipped by itself ("auto_weak": no clip good enough, "auto_faceless":
+    nobody on camera)."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = timedelta(days=PASSED_LOOKBACK_DAYS)
+    counts: dict[str, int] = {}
+
+    def recent(value: object) -> bool:
+        try:
+            return now - datetime.fromisoformat(str(value)) <= cutoff
+        except ValueError:
+            return False
+
+    with _worker_lock():
+        skipped = _skipped_records()
+        state = _processed_state()
+    for record in skipped:
+        if record.get("pass_reason") and recent(record.get("skipped_at")):
+            counts[record["pass_reason"]] = counts.get(record["pass_reason"], 0) + 1
+    for record in state.get("records", []):
+        if record.get("status") == "not a fit" and recent(record.get("updated_at")):
+            key = "auto_weak" if str(record.get("error", "")).startswith("weak moments") else "auto_faceless"
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def restore_passed_as_sent(record_id: str) -> bool:
     """You did send it: move a passed pitch to Sent (follow-ups then work for it)."""
     with _worker_lock():
@@ -570,7 +607,7 @@ def restore_passed_as_sent(record_id: str) -> bool:
             return False
         record = skipped.pop(index)
         sent_at = str(record.get("skipped_at") or datetime.now(timezone.utc).isoformat())
-        for key in ("skip_reason", "skipped_at"):
+        for key in ("skip_reason", "skipped_at", "pass_reason"):
             record.pop(key, None)
         record["status"] = "sent"
         record["sent_at"] = sent_at
@@ -628,9 +665,23 @@ def mark_outreach_sent(record_id: str, *, subject: str | None = None, body: str 
     return False
 
 
-def skip_lead(channel_id: str, reason: str = "user_skipped") -> bool:
+# Why you passed on a pitch (Outbox buttons). Saved on the record so the lead
+# finder, clip picking and framing can be tuned from real numbers.
+PASS_REASONS = {
+    "bad_fit": "Not a good creator fit",
+    "weak_moments": "Clips aren't strong enough",
+    "bad_framing": "Framing or captions look off",
+    "no_contact": "Can't find a way to contact them",
+    "other": "Other",
+}
+
+
+def skip_lead(channel_id: str, reason: str = "user_skipped", pass_reason: str | None = None) -> bool:
+    """Pass on a pitch. ``pass_reason``: one of PASS_REASONS (why)."""
     if not channel_id.strip():
         raise ValueError("channel_id must not be empty.")
+    if pass_reason is not None and pass_reason not in PASS_REASONS:
+        raise ValueError(f"Unknown pass reason {pass_reason!r}.")
     with _worker_lock():
         pending = _pending_records()
         target_index = None
@@ -653,6 +704,8 @@ def skip_lead(channel_id: str, reason: str = "user_skipped") -> bool:
         skipped_leads = _skipped_records()
         skipped_record["status"] = "skipped"
         skipped_record["skip_reason"] = reason
+        if pass_reason:
+            skipped_record["pass_reason"] = pass_reason
         skipped_record["skipped_at"] = datetime.now(timezone.utc).isoformat()
         skipped_leads.append(skipped_record)
         _write_json_atomic(SKIPPED_LEADS_PATH, skipped_leads)
@@ -673,6 +726,8 @@ def skip_lead(channel_id: str, reason: str = "user_skipped") -> bool:
                 if record.get("channel_id") == actual_channel_id:
                     record["status"] = "skipped"
                     record["skip_reason"] = reason
+                    if pass_reason:
+                        record["pass_reason"] = pass_reason
                     record["updated_at"] = datetime.now(timezone.utc).isoformat()
                     found = True
                     break
@@ -865,8 +920,11 @@ def _render_selected_clips(
     job_dir: Path,
     settings: Any,
     words: list[Word],
+    layouts_out: list[str] | None = None,
 ) -> list[Path]:
-    rendered_paths = [
+    """Render each clip (2 or 3 after the quality gate). ``layouts_out`` receives
+    each clip's layout, for the Outbox record."""
+    rendered = [
         render_selected_clip(
             source_path,
             clip,
@@ -875,14 +933,14 @@ def _render_selected_clips(
             job_dir / f"clip_{index:02d}.mp4",
             layout_mode="auto",
             work_dir=job_dir,
-        ).path
+        )
         for index, clip in enumerate(clips, start=1)
     ]
-    if len(rendered_paths) != CLIPS_PER_LEAD:
-        raise RuntimeError(
-            f"Expected {CLIPS_PER_LEAD} rendered clips; got {len(rendered_paths)}."
-        )
-    return rendered_paths
+    if not clips or len(rendered) != len(clips):
+        raise RuntimeError(f"Expected {len(clips)} rendered clips; got {len(rendered)}.")
+    if layouts_out is not None:
+        layouts_out.extend(item.layout_mode for item in rendered)
+    return [item.path for item in rendered]
 
 
 def _handle_lead_failure(
@@ -968,21 +1026,29 @@ def _process_lead(
             raise RuntimeError(f"Source video has invalid duration: {source_video}")
 
         _info, peaks = video_info_and_peaks(video_url)
-        clips, outreach_email, subject = pick_clips_with_agent(
-            words,
-            duration,
-            CLIPS_PER_LEAD,
-            channel_title,
-            video_title,
-            peaks,
-            shorts_status=shorts_status,
-        )
+        report: dict[str, Any] = {}
+        try:
+            clips, outreach_email, subject = pick_clips_with_agent(
+                words,
+                duration,
+                CLIPS_PER_LEAD,
+                channel_title,
+                video_title,
+                peaks,
+                shorts_status=shorts_status,
+                min_judge_score=MIN_CLIP_SCORE,
+                report=report,
+            )
+        except WeakMoments as exc:
+            raise NotAFit(f"weak moments: {exc}") from exc
+        layouts: list[str] = []
         rendered = _render_selected_clips(
             source_video,
             clips,
             job_dir,
             settings,
             words,
+            layouts,
         )
         drive_link = upload_clips_to_drive(
             channel_title,
@@ -1006,6 +1072,22 @@ def _process_lead(
             "greeting_name": greeting_name_of(email_body),
             "shorts_status": shorts_status,
             "site_url": SITE_URL,
+            # For tuning later: what was sent, and how it scored and looked.
+            "clips": [
+                {
+                    "start": round(clip.start_time, 1),
+                    "end": round(clip.end_time, 1),
+                    "judge": score,
+                    "layout": layout,
+                }
+                for clip, score, layout in zip(
+                    clips,
+                    report.get("judge_scores") or [None] * len(clips),
+                    layouts or [None] * len(clips),
+                )
+            ],
+            "subscriber_count": lead.get("subscriber_count"),
+            "video_seconds": round(duration),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "channel_id": str(lead["channel_id"]),
             "target_video_id": video_id,
@@ -1112,6 +1194,11 @@ def run_worker(batch: int = 3) -> int:
         except DriveAuthError as exc:
             _handle_lead_failure(lead, exc, count_attempt=False)
             logger.error("%s Stopping; the lead is back in the queue.", exc)
+            return 1
+        except TranscriptionLimitReached as exc:
+            _handle_lead_failure(lead, exc, count_attempt=False)
+            _set_status("quota_pause", _groq_pause_text(exc))
+            logger.warning("%s Stopping; the lead is back in the queue.", exc)
             return 1
         except NotAFit as exc:
             _skip_not_a_fit(lead, exc)
@@ -1228,6 +1315,13 @@ def run_continuous_queue(
             _set_status("drive_sign_in", "Google Drive needs signing in again")
             logger.error("%s Checking again in %d minutes.", exc, DRIVE_SIGN_IN_WAIT_SEC // 60)
             time.sleep(DRIVE_SIGN_IN_WAIT_SEC)
+            continue
+        except TranscriptionLimitReached as exc:
+            # No switching to the less accurate local model: wait for Groq to reset.
+            _handle_lead_failure(fresh_lead, exc, count_attempt=False)
+            _set_status("quota_pause", _groq_pause_text(exc))
+            logger.warning("%s Waiting; the lead is back in the queue.", exc)
+            time.sleep(exc.retry_after + 60)
             continue
         except NotAFit as exc:
             _skip_not_a_fit(fresh_lead, exc)

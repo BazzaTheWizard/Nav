@@ -18,6 +18,7 @@ ProgressCallback = Callable[[float, str], None]
 # filter chain) never falls through to "best": the old chain sometimes ended at
 # 4K AV1 (587 MB for 14 minutes), which is far slower to decode on a MacBook.
 VIDEO_FORMAT = "bv*+ba/b"
+FFMPEG_TIMEOUT_SEC = 15 * 60  # audio extraction from a 90-min video takes about a minute
 VIDEO_FORMAT_SORT = ["res:1080", "vcodec:h264", "ext:mp4:m4a"]
 
 __all__ = [
@@ -272,6 +273,7 @@ def download_audio_only(
                         str(wav_destination),
                     ],
                     check=True,
+                    timeout=FFMPEG_TIMEOUT_SEC,  # a stuck FFmpeg must not stall the worker
                     capture_output=True,
                     text=True,
                 )
@@ -324,6 +326,7 @@ def extract_audio_only(video_path: str | Path, output_path: str | Path) -> Path:
                 str(destination),
             ],
             check=True,
+            timeout=FFMPEG_TIMEOUT_SEC,  # a stuck FFmpeg must not stall the worker
             capture_output=True,
             text=True,
         )
@@ -379,6 +382,7 @@ def extract_audio_segment(
                 str(destination),
             ],
             check=True,
+            timeout=FFMPEG_TIMEOUT_SEC,  # a stuck FFmpeg must not stall the worker
             capture_output=True,
             text=True,
         )

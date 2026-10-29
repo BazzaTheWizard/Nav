@@ -25,6 +25,7 @@ __all__ = [
     "CropBox",
     "CropPlan",
     "Shot",
+    "SplitView",
     "analyze_crop_plan",
     "analyze_vertical_crop",
     "find_vertical_crop",
@@ -318,17 +319,49 @@ MIN_SHOT_SECONDS = 0.6
 FACE_SHOT_PRESENCE = 0.4
 GROUP_SHOT_PRESENCE = 0.5
 SAME_X_TOLERANCE_PX = 8
+# Two-speaker split view: two people side by side (a two-person shot or a remote
+# call's side-by-side webcams) become two stacked 1080x960 panels, one face each.
+PAIR_PRESENCE = 0.4  # each face is found in at least this share of the shot's samples
+PANEL_FACE_WIDTHS = 5.5  # panel width = this many face widths (head and shoulders)
+MAX_PANEL_UPSCALE = 2.0  # a panel window is at least 1080 / this source pixels wide
+TOP_PANEL_FACE_Y = 0.58  # face height in the top panel: room for the title above it
+BOTTOM_PANEL_FACE_Y = 0.45  # bottom panel: room for the captions on the seam above it
+PANEL_OUTPUT = (1080, 960)
 
 
 @dataclass(frozen=True)
 class Shot:
-    """One camera shot, in absolute source seconds, with its crop x position."""
+    """One camera shot, in absolute source seconds, with its crop x position.
+
+    ``speakers``: for a two-person shot, the left and right faces as
+    (center_x, center_y, face_width) in source pixels; None otherwise.
+    """
 
     start: float
     end: float
     x: int
     has_face: bool
     group: bool
+    speakers: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+
+
+@dataclass(frozen=True)
+class SplitView:
+    """Where the two stacked panels come from during a clip's two-person shots.
+
+    ``spans`` are clip-relative; the x/y values are FFmpeg expressions in ``t``
+    (clip seconds) for the top-left corner of each panel's source window.
+    """
+
+    spans: tuple[tuple[float, float], ...]
+    width: int
+    height: int
+    top_x: str
+    top_y: str
+    bottom_x: str
+    bottom_y: str
+    # Same windows as plain numbers per span, for the title-card face check.
+    windows: tuple[tuple[float, float, int, int, int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -353,6 +386,101 @@ class CropPlan:
         return sum(s.end - s.start for s in self.shots if s.group) / self.duration
 
     @property
+    def unsplit_group_coverage(self) -> float:
+        """Wide shots of 2+ people that can't become a two-speaker split view."""
+        return sum(s.end - s.start for s in self.shots if s.group and not self._splittable(s)) / self.duration
+
+    def _room(self, shot: Shot) -> float:
+        """Widest panel window this shot allows: each panel stays on its own
+        speaker's side of the midpoint between them (so it never shows the other
+        person or the other webcam), and is never taller than the frame."""
+        if shot.speakers is None:
+            return 0.0
+        mid = (shot.speakers[0][0] + shot.speakers[1][0]) / 2
+        return min(mid, self.frame_width - mid, self.frame_height * PANEL_OUTPUT[0] / PANEL_OUTPUT[1])
+
+    def _splittable(self, shot: Shot) -> bool:
+        """Two speakers with room for a sharp panel each (upscaled at most MAX_PANEL_UPSCALE)."""
+        return shot.speakers is not None and self._room(shot) >= PANEL_OUTPUT[0] / MAX_PANEL_UPSCALE
+
+    def panel_size(self, clip_start: float | None = None, clip_end: float | None = None) -> tuple[int, int] | None:
+        """One source window size (9:8) for every split panel in the clip, or None.
+
+        Sized to about PANEL_FACE_WIDTHS face widths, never wider than every
+        split shot's room allows (see _room), and never so small that a panel is
+        upscaled more than MAX_PANEL_UPSCALE.
+        """
+        shots = [
+            shot
+            for shot in self.shots
+            if self._splittable(shot)
+            and (clip_start is None or shot.end > clip_start)
+            and (clip_end is None or shot.start < clip_end)
+        ]
+        if not shots:
+            return None
+        largest = min(self._room(shot) for shot in shots)
+        wanted = statistics.median(face[2] for shot in shots for face in shot.speakers) * PANEL_FACE_WIDTHS
+        width = max(PANEL_OUTPUT[0] / MAX_PANEL_UPSCALE, min(wanted, largest))
+        width = int(width) // 2 * 2
+        height = int(round(width * PANEL_OUTPUT[1] / PANEL_OUTPUT[0])) // 2 * 2
+        return width, height
+
+    def split_view(self, clip_start: float, clip_end: float) -> SplitView | None:
+        """The two-speaker split view for this clip, or None when it has no
+        two-person shots that can be split."""
+        size = self.panel_size(clip_start, clip_end)
+        if size is None:
+            return None
+        width, height = size
+        windows: list[tuple[float, float, int, int, int, int]] = []
+        for shot in self.shots:
+            if not self._splittable(shot) or shot.end <= clip_start or shot.start >= clip_end:
+                continue
+            start = max(shot.start, clip_start) - clip_start
+            end = min(shot.end, clip_end) - clip_start
+            if end - start < MIN_SHOT_SECONDS:
+                continue
+            (lx, ly, _lw), (rx, ry, _rw) = shot.speakers
+            mid = (lx + rx) / 2
+            top = self._panel_origin(lx, ly, width, height, TOP_PANEL_FACE_Y, 0, mid)
+            bottom = self._panel_origin(rx, ry, width, height, BOTTOM_PANEL_FACE_Y, mid, self.frame_width)
+            if windows and start - windows[-1][1] < 0.05 and windows[-1][2:] == (*top, *bottom):
+                windows[-1] = (windows[-1][0], end, *top, *bottom)
+            else:
+                windows.append((start, end, *top, *bottom))
+        if not windows:
+            return None
+
+        def expression(index: int) -> str:
+            # Piecewise by span; outside the spans the value doesn't matter.
+            value = str(windows[-1][index])
+            for window in reversed(windows[:-1]):
+                value = f"if(lt(t,{window[1]:.3f}),{window[index]},{value})"
+            return value
+
+        return SplitView(
+            spans=tuple((start, end) for start, end, *_rest in windows),
+            width=width,
+            height=height,
+            top_x=expression(2),
+            top_y=expression(3),
+            bottom_x=expression(4),
+            bottom_y=expression(5),
+            windows=tuple(windows),
+        )
+
+    def _panel_origin(
+        self, cx: float, cy: float, width: int, height: int, face_y: float, left: float, right: float
+    ) -> tuple[int, int]:
+        """Top-left of a panel window centred on a face, kept between ``left`` and
+        ``right`` (that speaker's side) and inside the frame."""
+        low, high = int(left + 1) // 2 * 2, int(right - width) // 2 * 2
+        x = int(min(max(cx - width / 2, low), max(low, high))) // 2 * 2
+        y = int(max(0, min(self.frame_height - height, cy - face_y * height))) // 2 * 2
+        return x, y
+
+    @property
     def cut_count(self) -> int:
         return max(0, len(self.shots) - 1)
 
@@ -368,9 +496,12 @@ class CropPlan:
         (slides, screen shares, b-roll) and wide shots of 2+ people. A 9:16 crop
         would cut those off; the renderer shows the whole frame there instead."""
         spans: list[tuple[float, float]] = []
+        split = self.split_view(clip_start, clip_end) is not None
         for shot in self.shots:
             if shot.has_face and not shot.group:
                 continue
+            if split and self._splittable(shot):
+                continue  # shown as the two-speaker split view instead
             start = max(shot.start, clip_start) - clip_start
             end = min(shot.end, clip_end) - clip_start
             if end - start < MIN_SHOT_SECONDS:
@@ -422,6 +553,7 @@ def _probe_display_size(video_path: Path) -> tuple[int, int]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     stream = (json.loads(result.stdout).get("streams") or [{}])[0]
     width, height = int(stream.get("width", 0)), int(stream.get("height", 0))
@@ -478,7 +610,8 @@ def _decode_analysis_frames(
             "rawvideo",
             str(face_file),
         ]
-        result = subprocess.run(command, check=True, capture_output=True)
+        # A 60 s clip decodes in seconds; a stuck FFmpeg must not stall the worker.
+        result = subprocess.run(command, check=True, capture_output=True, timeout=300)
         cut_frames = np.frombuffer(result.stdout, dtype=np.uint8)
         cut_frames = cut_frames[: cut_frames.size - cut_frames.size % (cut_w * cut_h)]
         cut_frames = cut_frames.reshape(-1, cut_h, cut_w)
@@ -539,6 +672,26 @@ def _cluster(values: list[tuple[float, float]], distance: float) -> list[list[tu
     return clusters
 
 
+def _speaker_pair(
+    clusters: list[list[tuple[float, ...]]], sample_count: int
+) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+    """Exactly two people who stay on screen through the shot: (left, right) as
+    (center_x, center_y, face_width). Three or more steady faces -> None (the
+    whole frame is shown instead)."""
+    steady = [cluster for cluster in clusters if len(cluster) >= PAIR_PRESENCE * sample_count]
+    if len(steady) != 2:
+        return None
+    faces = sorted(
+        (
+            statistics.median(face[0] for face in cluster),
+            statistics.median(face[2] for face in cluster),
+            statistics.median(face[3] for face in cluster),
+        )
+        for cluster in steady
+    )
+    return faces[0], faces[1]
+
+
 def analyze_crop_plan(
     video_path: str | Path,
     start_time: float,
@@ -575,11 +728,15 @@ def analyze_crop_plan(
     for index, frame in enumerate(face_frames):
         faces = detector.detect(frame) if detector.available else []
         samples.append(
-            (index / FACE_ANALYSIS_FPS, [(cx * scale, w * h * scale * scale) for cx, _cy, w, h, _s in faces])
+            (
+                index / FACE_ANALYSIS_FPS,
+                # (center x, area, center y, width) in source pixels
+                [(cx * scale, w * h * scale * scale, cy * scale, w * scale) for cx, cy, w, h, _s in faces],
+            )
         )
 
     cluster_distance = frame_width * FACE_CLUSTER_DISTANCE_RATIO
-    raw_shots: list[tuple[float, float, int | None, bool]] = []
+    raw_shots: list[tuple[float, float, int | None, bool, tuple | None]] = []
     for shot_start, shot_end in zip(boundaries, boundaries[1:]):
         shot_samples = [faces for t, faces in samples if shot_start <= t < shot_end]
         if not shot_samples:  # very short shot between two face samples
@@ -589,25 +746,28 @@ def analyze_crop_plan(
         x: int | None = None
         has_face = False
         group = False
+        speakers = None
         if detections:
             clusters = _cluster(detections, cluster_distance)
-            dominant = max(clusters, key=lambda c: (len(c), sum(a for _x, a in c) / len(c)))
+            dominant = max(clusters, key=lambda c: (len(c), sum(face[1] for face in c) / len(c)))
             has_face = len(dominant) >= FACE_SHOT_PRESENCE * len(shot_samples)
-            face_center = statistics.median(cx for cx, _a in dominant)
+            face_center = statistics.median(face[0] for face in dominant)
             x = int(max(0, min(frame_width - crop_width, face_center - crop_width / 2))) // 2 * 2
             spread_samples = sum(
                 1
                 for faces in shot_samples
                 if len(faces) >= 2
-                and max(cx for cx, _a in faces) - min(cx for cx, _a in faces) > crop_width * 0.9
+                and max(face[0] for face in faces) - min(face[0] for face in faces) > crop_width * 0.9
             )
             group = spread_samples >= GROUP_SHOT_PRESENCE * len(shot_samples)
-        raw_shots.append((shot_start, shot_end, x if has_face else None, group))
+            if group:
+                speakers = _speaker_pair(clusters, len(shot_samples))
+        raw_shots.append((shot_start, shot_end, x if has_face else None, group, speakers))
 
     # Shots without a face reuse the nearest face shot's position (or the center).
     shots: list[Shot] = []
-    known = [(s, x) for s, _e, x, _g in raw_shots if x is not None]
-    for shot_start, shot_end, x, group in raw_shots:
+    known = [(s, x) for s, _e, x, _g, _p in raw_shots if x is not None]
+    for shot_start, shot_end, x, group, speakers in raw_shots:
         has_face = x is not None
         if x is None:
             x = min(known, key=lambda item: abs(item[0] - shot_start))[1] if known else center_x
@@ -618,6 +778,7 @@ def analyze_crop_plan(
                 x=x,
                 has_face=has_face,
                 group=group,
+                speakers=speakers,
             )
         )
     return CropPlan(

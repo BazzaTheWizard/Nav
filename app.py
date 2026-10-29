@@ -16,6 +16,7 @@ import streamlit as st
 from pydantic import BaseModel
 
 from autonomous_worker import (
+    PASS_REASONS,
     get_awaiting_reply,
     get_cached_leads,
     get_recently_passed,
@@ -28,6 +29,7 @@ from autonomous_worker import (
     get_pending_outreach,
     is_youtube_quota_exhausted,
     mark_outreach_sent,
+    pass_summary,
     skip_lead,
     skip_queued_lead,
 )
@@ -1175,19 +1177,7 @@ def main() -> None:
                             st.session_state["target_video_title"] = lead.get("latest_video_title", "")
                             st.rerun()
                     with col_skip:
-                        if st.button(
-                            "❌ Pass (not pitching)",
-                            key=f"skip_lead_tab_{channel_id}_{index}",
-                            use_container_width=True,
-                        ):
-                            try:
-                                skipped = skip_lead(str(channel_id))
-                            except Exception as exc:
-                                st.error(f"Could not skip lead: {exc}")
-                            else:
-                                if skipped:
-                                    st.session_state["lead_skipped"] = True
-                                    st.rerun()
+                        _render_pass_menu(str(channel_id), f"skip_lead_tab_{channel_id}_{index}")
 
             for index, r in enumerate(cached_leads):
                 if any(p.get("channel_id") == r.get("channel_id") for p in background_pending):
@@ -1358,23 +1348,7 @@ def main() -> None:
                                     "This pitch is no longer pending. Refresh the outbox."
                                 )
                 with col_skip:
-                    if st.button(
-                        "❌ Pass (not pitching)",
-                        key=f"skip_lead_{record_id}",
-                        use_container_width=True,
-                        help="You're not sending this one. The creator won't come back.",
-                    ):
-                        try:
-                            skipped = skip_lead(channel_id)
-                        except Exception as exc:
-                            logging.exception("Could not skip lead")
-                            st.error(f"Could not skip this lead: {exc}")
-                        else:
-                            if skipped:
-                                st.session_state["lead_skipped"] = True
-                                st.rerun()
-                            else:
-                                st.warning("This lead is no longer pending.")
+                    _render_pass_menu(channel_id, f"skip_lead_{record_id}")
 
         _render_sent_pitches()
         _render_recently_passed()
@@ -1402,8 +1376,55 @@ def _on_greeting_change(record_id: str, name_key: str, body_key: str) -> None:
         logging.exception("Could not save the greeting")
 
 
+def _render_pass_menu(channel_id: str, key: str) -> None:
+    """Pass on a pitch with a one-click reason (saved so the worker can be tuned)."""
+    with st.popover(
+        "❌ Pass (not pitching)",
+        use_container_width=True,
+        help="You're not sending this one. The creator won't come back.",
+    ):
+        st.caption("Why? One click; it's saved so the lead finder and clip picking can be tuned.")
+        for code, label in PASS_REASONS.items():
+            if st.button(label, key=f"{key}_{code}", use_container_width=True):
+                try:
+                    skipped = skip_lead(channel_id, pass_reason=code)
+                except Exception as exc:
+                    logging.exception("Could not skip lead")
+                    st.error(f"Could not skip this lead: {exc}")
+                else:
+                    if skipped:
+                        st.session_state["lead_skipped"] = True
+                        st.rerun()
+                    else:
+                        st.warning("This lead is no longer pending.")
+
+
+_AUTO_SKIP_LABELS = {
+    "auto_weak": "no clip strong enough",
+    "auto_faceless": "nobody on camera",
+}
+
+
+def _render_pass_summary() -> None:
+    """One line: why pitches were passed in the last two weeks."""
+    try:
+        counts = pass_summary()
+    except Exception:
+        logging.exception("Could not count pass reasons")
+        return
+    yours = [f"{PASS_REASONS[code]} {counts[code]}" for code in PASS_REASONS if counts.get(code)]
+    auto = [f"{label} {counts[code]}" for code, label in _AUTO_SKIP_LABELS.items() if counts.get(code)]
+    if not yours and not auto:
+        return
+    line = "**Passed, last 14 days:** " + (" · ".join(yours) if yours else "none")
+    if auto:
+        line += "  \n**Skipped by the worker:** " + " · ".join(auto)
+    st.caption(line)
+
+
 def _render_recently_passed() -> None:
     """Passed pitches from the last two weeks, for ones that were actually sent."""
+    _render_pass_summary()
     try:
         passed = get_recently_passed()
     except Exception as exc:
@@ -1420,8 +1441,10 @@ def _render_recently_passed() -> None:
             record_id = str(record.get("record_id"))
             left, right = st.columns([4, 1])
             with left:
+                reason = PASS_REASONS.get(str(record.get("pass_reason") or ""), "")
                 st.markdown(
                     f"**{record.get('channel_title') or 'Creator'}** · passed {str(record.get('skipped_at', ''))[:10]}"
+                    + (f" · {reason}" if reason else "")
                 )
             with right:
                 if st.button("I sent this one", key=f"restore_sent_{record_id}", use_container_width=True):

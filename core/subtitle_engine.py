@@ -8,7 +8,9 @@ from core.transcriber import Word
 
 
 MAX_WORDS_PER_CHUNK = 4
-MAX_CHARACTERS_PER_CHUNK = 24
+# 72 px Arial Black capitals: about 37 px a character, 860 px of usable width.
+# 24 characters with wide letters (W, M) wrapped onto a second line.
+MAX_CHARACTERS_PER_CHUNK = 21
 MAX_WORD_GAP_SECONDS = 0.4
 _SOUND_CUE_PATTERN = re.compile(r"\[[^\]]*?\]|\([^)]*?\)")
 _SPEAKER_MARKER_PATTERN = re.compile(r">>|>|--")
@@ -140,6 +142,9 @@ def _centiseconds(seconds: float) -> int:
 # username, description and buttons over roughly the bottom 35% and the top 15%,
 # so captions sit just above 1248 px and the hook title just below 288 px.
 CAPTION_MARGIN_V = 680
+# Captions during a two-speaker split view: centred on the seam between the panels.
+SEAM_POSITION = r"{\an5\pos(540,960)}"
+SEAM_CAPTION_ZONE = (860, 1060)  # output pixels they can cover (two lines)
 CAPTION_MARGIN_H = 110
 HOOK_MARGIN_V = 300
 HOOK_MAX_CHARACTERS = 70
@@ -163,12 +168,18 @@ def create_ass_subtitles(
     highlight_active_word: bool = True,
     hook_title: str | None = None,
     hook_seconds: float = 0.0,
+    seam_spans: list[tuple[float, float]] | tuple[tuple[float, float], ...] | None = None,
+    seam_title: tuple[float, int] | None = None,
 ) -> Path:
     """Write short, clip-relative ASS subtitle cards with non-overlapping timing.
 
     highlight_active_word: colour the word being spoken in each card.
     hook_title / hook_seconds: show the clip's title at the top for the first
     ``hook_seconds`` (0 turns it off).
+    seam_spans: clip-relative spans shown as the two-speaker split view; captions
+    there sit on the seam between the two panels instead of over the lower face.
+    seam_title: (seconds, bottom y) of a title card shown on the seam; captions
+    in that time sit just under it instead.
     """
     if not words:
         raise ValueError("Cannot create subtitles without word timestamps.")
@@ -199,7 +210,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     groups = _make_groups(ordered)
     events: list[str] = []
 
+    seams = [(_centiseconds(a), _centiseconds(b)) for a, b in (seam_spans or [])]
+    title_until_cs = _centiseconds(seam_title[0]) if seam_title else 0
+    under_title = f"{{\\an8\\pos(540,{seam_title[1] + 14})}}" if seam_title else ""
+
     def add_event(start_cs: int, end_cs: int, text: str, style: str = "ShortForm", layer: int = 0) -> None:
+        middle = (start_cs + end_cs) / 2
+        if style == "ShortForm" and any(a <= middle < b for a, b in seams):
+            text = (under_title if start_cs < title_until_cs else SEAM_POSITION) + text
         if end_cs > start_cs:
             events.append(
                 f"Dialogue: {layer},{_ass_time(start_cs / 100)},"
