@@ -11,6 +11,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(root))
+import os as _os; _os.environ["NAV_NO_CLIP_PAGES"] = "1"  # never touch the real clip-page bucket
 
 import autonomous_worker as W  # noqa: E402
 import core.agent_brain as A  # noqa: E402

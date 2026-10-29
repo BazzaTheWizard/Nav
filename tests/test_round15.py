@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(ROOT))
+import os as _os; _os.environ["NAV_NO_CLIP_PAGES"] = "1"  # never touch the real clip-page bucket
 
 fails = 0
 def check(name, cond, detail=""):
@@ -276,7 +277,7 @@ check("Use this cut: replaces clip_01.mp4 in the pitch's Drive folder",
 saved = next(r for r in json.loads(W.PENDING_OUTREACH_PATH.read_text()) if r["record_id"] == rid)["clips"][0]
 check("...saves the new times on the pitch", saved["start"] == 47.5 and saved["end"] == 83.0 and saved["ai_start"] == 50.0)
 check("...says the link didn't change, and the inputs reset to 0",
-      any("Drive link in the email stays the same" in s.value for s in at.success)
+      any("link in the email stays the same" in s.value for s in at.success)
       and next(n for n in at.number_input if n.key == f"trim_start_{rid}_1").value == 0.0)
 check("...and the clip line shows the new times", any(m.value.startswith("**Clip 1** · 0:47–1:23") for m in at.markdown))
 

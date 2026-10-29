@@ -48,6 +48,7 @@ from core.pipeline import (
     render_selected_clip,
     video_info_and_peaks,
 )
+from core import clip_pages
 from core.pitch_files import prune_pitch_files, remove_pitch_files, save_pitch_files
 from core.transcriber import TranscriptionLimitReached, Word, transcribe_audio
 from main import _video_duration
@@ -112,6 +113,17 @@ def _groq_pause_text(error: TranscriptionLimitReached) -> str:
 # id to tell "running" from "stopped" (or closed without saying so).
 def _worker_status_path() -> Path:
     return STORAGE_DIR / "worker_status.json"
+
+
+def clip_link(record: dict[str, Any]) -> str:
+    """The link the prospect got: their clip page, or the Drive folder (older pitches,
+    or when the page couldn't be made)."""
+    return str(record.get("page_url") or record.get("drive_link") or "")
+
+
+def drive_backup_on() -> bool:
+    """DRIVE_BACKUP=off in .env stops the Drive copy once clip pages are set up."""
+    return os.getenv("DRIVE_BACKUP", "on").strip().lower() not in {"off", "0", "false", "no"}
 
 
 def _pitches_dir() -> Path:
@@ -526,7 +538,7 @@ def get_pending_outreach() -> list[dict[str, Any]]:
                 record["full_email_body"] = rewrite_old_draft(
                     body,
                     str(record.get("channel_title") or ""),
-                    str(record.get("drive_link") or ""),
+                    clip_link(record),
                     str(record.get("video_title") or ""),
                     shorts_status=str(record.get("shorts_status") or ""),
                 )
@@ -578,7 +590,7 @@ def get_follow_ups_due(now: datetime | None = None) -> list[dict[str, Any]]:
                     str(record.get("greeting_name") or record.get("channel_title") or ""),
                     video_title=str(record.get("video_title") or ""),
                     video_topic=topic_from_email(body),
-                    drive_link=str(record.get("drive_link") or ""),
+                    drive_link=clip_link(record),
                 ),
             }
         )
@@ -618,7 +630,7 @@ def get_awaiting_reply(now: datetime | None = None) -> list[dict[str, Any]]:
                 str(record.get("greeting_name") or record.get("channel_title") or ""),
                 video_title=str(record.get("video_title") or ""),
                 video_topic=topic_from_email(body),
-                drive_link=str(record.get("drive_link") or ""),
+                drive_link=clip_link(record),
             )
         waiting.append(item)
     waiting.sort(key=lambda item: str(item.get("sent_at")), reverse=True)
@@ -659,7 +671,7 @@ def get_recently_passed(now: datetime | None = None) -> list[dict[str, Any]]:
         skipped = _skipped_records()
     recent: list[dict[str, Any]] = []
     for record in skipped:
-        if not record.get("drive_link") or not record.get("record_id"):
+        if not clip_link(record) or not record.get("record_id"):
             continue  # skipped from the queue before any clips were made
         try:
             when = datetime.fromisoformat(str(record.get("skipped_at")))
@@ -1142,7 +1154,9 @@ def _process_lead(
     settings: Any,
 ) -> dict[str, Any]:
     _wait_for_pending_slot()
-    check_drive_access()  # before any download: a dead Drive login must not burn the lead
+    use_drive = drive_backup_on() or not clip_pages.configured()
+    if use_drive:
+        check_drive_access()  # before any download: a dead Drive login must not burn the lead
     channel_title = str(lead["channel_title"])
     video_title = str(lead["latest_video_title"])
     video_url = str(lead["latest_video_url"])
@@ -1153,6 +1167,7 @@ def _process_lead(
     source_video: Path | None = None
     record_id = uuid.uuid4().hex
     queued = False
+    page_name: str | None = None
     try:
         source_video = Path(download_source_video(video_url))
         share = on_camera_share(source_video)
@@ -1197,12 +1212,28 @@ def _process_lead(
             except Exception:
                 # The pitch is still good; it just can't be previewed or trimmed in the app.
                 logger.warning("Could not save the Outbox preview files for %s.", channel_title, exc_info=True)
-        drive_link = upload_clips_to_drive(
-            channel_title,
-            video_title,
-            [str(path) for path in rendered],
-        )
-        email_body = fill_drive_link(outreach_email, drive_link)
+        drive_link = ""
+        if use_drive:
+            drive_link = upload_clips_to_drive(
+                channel_title,
+                video_title,
+                [str(path) for path in rendered],
+            )
+        page_url = ""
+        if clip_pages.configured():
+            try:
+                page_name, page_url = clip_pages.publish_page(
+                    channel_title,
+                    video_title,
+                    [{"path": path, "start": clip.start_time, "end": clip.end_time} for path, clip in zip(rendered, clips)],
+                    kind="episode" if " from the episode " in outreach_email else "video",
+                )
+            except Exception:
+                logger.warning("Couldn't make the clip page for %s; the email uses the Drive link.", channel_title, exc_info=True)
+        link = page_url or drive_link
+        if not link:
+            raise RuntimeError("The clip page couldn't be made and DRIVE_BACKUP is off, so there's no link to send.")
+        email_body = fill_drive_link(outreach_email, link)
         channel_url = str(
             lead.get("channel_url")
             or f"https://www.youtube.com/channel/{lead['channel_id']}"
@@ -1213,6 +1244,8 @@ def _process_lead(
             "channel_title": channel_title,
             "contact_email": contact,
             "drive_link": drive_link,
+            "page_name": page_name,
+            "page_url": page_url or None,
             "subject": subject,
             "full_email_body": email_body,
             "video_title": video_title,
@@ -1262,6 +1295,11 @@ def _process_lead(
     finally:
         if not queued:
             remove_pitch_files(record_id, _pitches_dir())
+            if page_name:
+                try:
+                    clip_pages.delete_page(page_name)
+                except Exception:
+                    logger.warning("Couldn't remove the unused clip page %s.", page_name, exc_info=True)
         if source_video is not None:
             source_video.unlink(missing_ok=True)
             for path in settings.raw_dir.glob(f"{source_video.stem}*"):
@@ -1292,6 +1330,65 @@ def _prune_leftovers(settings: Any) -> None:
         return
     if pruned:
         logger.info("Removed preview files of %d pitch(es) that left the Outbox.", pruned)
+    try:
+        removed_pages = prune_clip_pages()
+    except Exception:
+        logger.warning("Skipped clip page cleanup.", exc_info=True)
+        return
+    if removed_pages:
+        logger.info("Removed %d old clip page(s).", removed_pages)
+
+
+PAGE_KEEP_DAYS = 60  # a sent pitch's page, if they never replied
+
+
+def _older_than(value: Any, days: float, now: datetime) -> bool:
+    try:
+        when = datetime.fromisoformat(str(value))
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return now - when > timedelta(days=days)
+
+
+def prune_clip_pages(now: datetime | None = None) -> int:
+    """Delete pages nobody needs any more: sent PAGE_KEEP_DAYS ago without a reply, or
+    passed more than PASSED_LOOKBACK_DAYS ago (until then 'Passed recently -> it was
+    sent' can still bring a pitch back). Only pages named on a record are touched."""
+    if not clip_pages.configured():
+        return 0
+    now = now or datetime.now(timezone.utc)
+    with _worker_lock():
+        pending, skipped = _pending_records(), _skipped_records()
+    due: dict[str, str] = {}  # record_id -> page name
+    for record in pending:
+        if (record.get("status") == "sent" and record.get("page_name") and not record.get("page_removed_at")
+                and not record.get("replied_at") and _older_than(record.get("sent_at"), PAGE_KEEP_DAYS, now)):
+            due[str(record.get("record_id"))] = str(record["page_name"])
+    for record in skipped:
+        if (record.get("page_name") and not record.get("page_removed_at")
+                and _older_than(record.get("skipped_at"), PASSED_LOOKBACK_DAYS, now)):
+            due[str(record.get("record_id"))] = str(record["page_name"])
+    removed: set[str] = set()
+    for record_id, name in due.items():
+        try:
+            clip_pages.delete_page(name)
+            removed.add(record_id)
+        except Exception:
+            logger.warning("Couldn't remove the old clip page %s.", name, exc_info=True)
+    if removed:
+        stamp = now.isoformat()
+        with _worker_lock():
+            for path, records in ((PENDING_OUTREACH_PATH, _pending_records()), (SKIPPED_LEADS_PATH, _skipped_records())):
+                changed = False
+                for record in records:
+                    if str(record.get("record_id")) in removed and not record.get("page_removed_at"):
+                        record["page_removed_at"] = stamp
+                        changed = True
+                if changed:
+                    _write_json_atomic(path, records)
+    return len(removed)
 
 
 def _setup_logging() -> None:
@@ -1384,11 +1481,7 @@ def run_worker(batch: int = 3) -> int:
             state = _processed_state()
             _update_lead_status(state, channel_id, "completed")
         processed_count += 1
-        logger.info(
-            "Prepared outreach for %s; Drive folder: %s",
-            pending_record["channel_title"],
-            pending_record["drive_link"],
-        )
+        logger.info("Prepared outreach for %s; clips: %s", pending_record["channel_title"], clip_link(pending_record))
 
     logger.info(
         "Worker finished: %d completed, %d failed, batch limit %d.",
@@ -1516,11 +1609,7 @@ def run_continuous_queue(
         with _worker_lock():
             state = _processed_state()
             _update_lead_status(state, channel_id, "completed")
-        logger.info(
-            "Queued outreach for %s; Drive folder: %s",
-            pending_record["channel_title"],
-            pending_record["drive_link"],
-        )
+        logger.info("Queued outreach for %s; clips: %s", pending_record["channel_title"], clip_link(pending_record))
 
 
 def main() -> int:

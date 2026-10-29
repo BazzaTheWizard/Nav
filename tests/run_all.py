@@ -3,6 +3,7 @@
 From the project root:  .venv/bin/python tests/run_all.py
 Tell Antigravity/Copilot: "run tests/run_all.py after every change".
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,9 @@ from pathlib import Path
 root = Path(__file__).resolve().parent.parent
 failed = []
 for test in sorted(Path(__file__).parent.glob("test_*.py")):
-    result = subprocess.run([sys.executable, str(test), str(root)], cwd=root, capture_output=True, text=True)
+    # Tests never upload to your real clip-page bucket (test_round16 uses a fake one).
+    env = {**os.environ, "NAV_NO_CLIP_PAGES": "1"}
+    result = subprocess.run([sys.executable, str(test), str(root)], cwd=root, capture_output=True, text=True, env=env)
     lines = (result.stdout + result.stderr).splitlines()
     passes = sum(line.startswith("[PASS]") for line in lines)
     fails = [line for line in lines if line.startswith("[FAIL]")]

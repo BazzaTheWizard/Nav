@@ -2,6 +2,7 @@
 import json, os, sys, tempfile, time
 from pathlib import Path
 root = Path(sys.argv[1]).resolve(); sys.path.insert(0, str(root))
+import os as _os; _os.environ["NAV_NO_CLIP_PAGES"] = "1"  # never touch the real clip-page bucket
 os.environ["OPENAI_API_KEY"] = "test"; os.environ.pop("GEMINI_API_KEY", None)
 import core.agent_brain as A
 fails = 0

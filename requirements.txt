@@ -17,3 +17,4 @@ streamlit
 pillow
 requests
 certifi
+boto3  # clip pages (Cloudflare R2)

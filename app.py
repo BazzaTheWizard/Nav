@@ -29,6 +29,7 @@ from autonomous_worker import (
     mark_follow_up,
     prioritize_queued_lead,
     record_clip_trim,
+    drive_backup_on,
     restore_passed_as_sent,
     update_pending_draft,
     get_lead_queue,
@@ -66,6 +67,7 @@ from core.pipeline import (
     render_selected_clip,
     video_info_and_peaks,
 )
+from core import clip_pages
 from core.pitch_files import (
     accept_trim,
     discard_trim,
@@ -808,8 +810,13 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
         with links:
             _render_contact(record)
             drive_link = str(record.get("drive_link") or "")
+            page_url = str(record.get("page_url") or "")
+            if page_url:
+                st.link_button("🌐 Open their page (what they'll see)", page_url, use_container_width=True)
             if drive_link:
-                st.link_button("📁 Open the clips (Drive)", drive_link, use_container_width=True)
+                st.link_button(
+                    "📁 Drive backup" if page_url else "📁 Open the clips (Drive)", drive_link, use_container_width=True
+                )
 
         _render_pitch_clips(record)
 
@@ -916,20 +923,16 @@ def _render_pitch_clip(record: dict[str, Any], item: dict[str, Any]) -> None:
         st.markdown(f":orange-badge[New cut, not used yet] {_clock(new['start'])}–{_clock(new['end'])} ({new['end'] - new['start']:.1f} s)")
         use_column, keep_column = st.columns(2)
         if use_column.button("✅ Use this cut", key=f"trim_use_{record_id}_{index}", type="primary", use_container_width=True):
-            link = str(record.get("drive_link") or "")
-            with st.spinner("Replacing the clip in Drive…"):
+            with st.spinner("Replacing the clip on their page and in Drive…"):
                 try:
-                    times = accept_trim(
-                        record_id, index,
-                        (lambda path, name: replace_clip_in_drive(link, name, path)) if link else None,
-                    )
+                    times = accept_trim(record_id, index, _clip_replacer(record, new["start"], new["end"]))
                     record_clip_trim(record_id, index, times["start"], times["end"])
                 except Exception as exc:
                     logging.exception("Could not use the trimmed clip")
                     st.error(f"Couldn't use the new cut: {exc}")
                     return
             st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
-            st.session_state[f"trim_flash_{record_id}"] = f"Clip {index} updated. The Drive link in the email stays the same."
+            st.session_state[f"trim_flash_{record_id}"] = f"Clip {index} updated. The link in the email stays the same."
             st.rerun()
         if keep_column.button("↩️ Keep the old cut", key=f"trim_keep_{record_id}_{index}", use_container_width=True):
             discard_trim(record_id, index)
@@ -964,6 +967,22 @@ def _render_pitch_clip(record: dict[str, Any], item: dict[str, Any]) -> None:
                     st.error(f"Couldn't re-render: {exc}")
                     return
             st.rerun()
+
+
+def _clip_replacer(record: dict[str, Any], start: float, end: float):
+    """Swap a trimmed clip wherever the prospect can see it (their page, the Drive folder)."""
+    page_name = str(record.get("page_name") or "")
+    drive_link = str(record.get("drive_link") or "")
+    if not page_name and not drive_link:
+        return None
+
+    def replace(path: Path, file_name: str) -> None:
+        if page_name:
+            clip_pages.replace_clip(page_name, file_name, path, start, end)
+        if drive_link:
+            replace_clip_in_drive(drive_link, file_name, path)
+
+    return replace
 
 
 def _render_pitch_badges(record: dict[str, Any]) -> None:
@@ -1333,6 +1352,10 @@ def _render_system() -> None:
             {"Setting": "ALLOW_LOCAL_WHISPER", "Now": "on" if local_whisper_allowed() else "off (waits for Groq)"},
             {"Setting": "Clip quality bar", "Now": f"AI score {MIN_CLIP_SCORE}+ (MIN_CLIP_SCORE in autonomous_worker.py)"},
             {"Setting": "Title card", "Now": f"{settings.hook_title_seconds:g} s, {settings.hook_title_style} style"},
+            {"Setting": "Clip pages (R2_*, CLIP_PAGES_URL)", "Now": (
+                f"on: {clip_pages.page_settings().base_url}" if clip_pages.configured()
+                else "off: emails link to Drive (setup: claude_review/round16/README.md)")},
+            {"Setting": "DRIVE_BACKUP", "Now": "on" if drive_backup_on() or not clip_pages.configured() else "off"},
         ],
         hide_index=True,
     )
@@ -1472,6 +1495,18 @@ def _render_recently_passed() -> None:
                     st.rerun()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _page_activity() -> dict[str, dict[str, Any]] | None:
+    """Opens/plays/downloads on every clip page (one R2 listing, checked once a minute)."""
+    if not clip_pages.configured():
+        return {}
+    try:
+        return clip_pages.page_activity()
+    except Exception:
+        logging.exception("Could not read clip page activity")
+        return None
+
+
 def _render_sent_pitches() -> None:
     """Sent pitches waiting for a reply, with a short follow-up once due."""
     try:
@@ -1489,12 +1524,18 @@ def _render_sent_pitches() -> None:
         return
     if due_count:
         st.caption(f"{due_count} follow-up(s) due.")
+    activity = _page_activity() if any(record.get("page_name") for record in waiting) else {}
+    if activity is None:
+        st.caption("Couldn't check who opened their clip page just now.")
+        activity = {}
     for record in waiting:
         record_id = str(record["record_id"])
         title = str(record.get("channel_title") or "Creator")
         with st.container(border=True):
             label = " · follow-up due" if record.get("follow_up_due") else ""
             st.markdown(f"**{title}** · sent {str(record.get('sent_at', ''))[:10]}{label}")
+            if record.get("page_name"):
+                st.caption(clip_pages.describe_activity(activity.get(str(record["page_name"]))))
             if record.get("follow_up_due"):
                 st.text_input("Follow-up subject", value=record["follow_up_subject"], key=f"follow_subject_{record_id}")
                 st.text_area("Follow-up", value=record["follow_up_body"], height=180, key=f"follow_body_{record_id}")
