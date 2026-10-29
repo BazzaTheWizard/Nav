@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +37,8 @@ from autonomous_worker import (
     pass_summary,
     skip_lead,
     skip_queued_lead,
+    start_worker,
+    stop_worker,
 )
 from config import load_settings
 from core.downloader import (
@@ -100,7 +103,7 @@ WORKER_COMMAND = (
 _STATE_TEXT = {
     "starting": "starting up",
     "processing": "making clips for {detail}",
-    "outbox_full": "paused: the Outbox is full ({detail}). Send or pass a pitch in the 📬 Outbox",
+    "outbox_full": "waiting: the Outbox is full ({detail}). It makes the next pitch as soon as you send or pass one",
     "discovering": "looking for new creators",
     "idle": "waiting: {detail}",
     "quota_pause": "paused: {detail}",
@@ -115,7 +118,9 @@ def _render_worker_status() -> None:
     except Exception as exc:
         st.warning(f"Could not read the worker status: {exc}")
         return
-    if status["running"]:
+    if status["running"] and status.get("stopping"):
+        st.info(f"**Worker stopping:** it finishes {status['detail'] or 'the current creator'}, then stops.", icon="⏹️")
+    elif status["running"]:
         text = _STATE_TEXT.get(status["state"], status["state"] or "running").format(detail=status["detail"])
         try:
             updated = datetime.fromisoformat(status["updated_at"]).astimezone().strftime("%-I:%M %p")
@@ -128,11 +133,44 @@ def _render_worker_status() -> None:
             st.success(message, icon="🟢")
     else:
         st.warning(
-            "**The worker isn't running**, so the queue won't move and no new pitches are made. "
-            "Start it in Terminal:",
+            "**The worker isn't running**, so the queue won't move and no new pitches are made.",
             icon="🔴",
         )
+        _render_start_button("start_worker_header")
+        st.caption("Or start it in Terminal:")
         st.code(WORKER_COMMAND, language="bash")
+
+
+def _render_start_button(key: str) -> None:
+    if not st.button("▶ Start the worker", key=key, type="primary"):
+        return
+    try:
+        started = start_worker()
+    except Exception as exc:
+        logging.exception("Could not start the worker")
+        st.error(f"Could not start the worker: {exc}")
+        return
+    if started:
+        with st.spinner("Starting the worker…"):
+            for _ in range(30):  # it takes a few seconds to load
+                if get_worker_status()["running"]:
+                    break
+                time.sleep(0.5)
+    st.rerun()
+
+
+def _render_stop_button() -> None:
+    if not st.button("⏹ Stop the worker", key="stop_worker"):
+        return
+    try:
+        result = stop_worker()
+    except Exception as exc:
+        logging.exception("Could not stop the worker")
+        st.error(f"Could not stop the worker: {exc}")
+        return
+    if result == "stopped":
+        time.sleep(1.5)  # let it save its status
+    st.rerun()
 
 
 def _render_lead_queue() -> None:
@@ -1168,7 +1206,16 @@ LOG_LINES = 40
 
 def _render_system() -> None:
     st.subheader("Worker")
-    st.markdown("Start it in Terminal (stop it with **Ctrl+C**):")
+    st.caption(
+        "It keeps the Outbox filled: when it's full it waits, and it makes the next pitch as "
+        "soon as you send or pass one. Stopping never loses a creator: one that was half done "
+        "goes back in the queue."
+    )
+    if get_worker_status()["running"]:
+        _render_stop_button()
+    else:
+        _render_start_button("start_worker_system")
+    st.caption("Or in Terminal (stop it with **Ctrl+C**):")
     st.code(WORKER_COMMAND, language="bash")
 
     st.subheader("Settings in use")

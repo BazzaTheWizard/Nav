@@ -23,7 +23,8 @@ from core.transcriber import Word
 tmp = Path(tempfile.mkdtemp(prefix="r12-"))
 
 # ---------- Source: best VP9 up to 1440p ----------
-check("Default: up to 1440p, VP9 preferred", D.video_format_sort() == ["res:1440", "vcodec:vp9", "ext:mp4:m4a"])
+# Round 14: "proto" added (regular downloads before YouTube's chunked HLS streams).
+check("Default: up to 1440p, VP9 preferred", D.video_format_sort() == ["res:1440", "vcodec:vp9", "proto", "ext:mp4:m4a"])
 os.environ["SOURCE_MAX_HEIGHT"] = "2160"
 check("SOURCE_MAX_HEIGHT=2160 allows 4K", D.video_format_sort()[0] == "res:2160")
 os.environ["SOURCE_MAX_HEIGHT"] = "99999"

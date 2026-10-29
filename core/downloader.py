@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -13,6 +15,7 @@ from urllib.parse import urlparse
 from config import Settings, load_settings
 
 ProgressCallback = Callable[[float, str], None]
+logger = logging.getLogger(__name__)
 
 # Source quality. YouTube's H.264 1080p stream is its lowest-quality 1080p (the
 # downloads measured about 1.1-1.25 Mbps), and a 9:16 crop of it is only 608 px
@@ -20,10 +23,13 @@ ProgressCallback = Callable[[float, str], None]
 # enlarged 1.33x), falling back to H.264. AV1 stays last (slow to decode on a
 # MacBook; an earlier 4K AV1 pick was 587 MB for 14 minutes). Sorting never falls
 # through to "best". SOURCE_MAX_HEIGHT in .env: 1080, 1440 (default) or 2160.
+# "proto": regular downloads before YouTube's chunked HLS streams (616 "Premium"
+# 1080p, 620 at 1440p). Round 12 picked those because they are MP4: one 50-minute
+# video was 1.23 GB and took 7.5 minutes, in hundreds of small pieces.
 VIDEO_FORMAT = "bv*+ba/b"
 FFMPEG_TIMEOUT_SEC = 15 * 60  # audio extraction from a 90-min video takes about a minute
 DEFAULT_SOURCE_MAX_HEIGHT = 1440
-VIDEO_FORMAT_SORT = [f"res:{DEFAULT_SOURCE_MAX_HEIGHT}", "vcodec:vp9", "ext:mp4:m4a"]
+VIDEO_FORMAT_SORT = [f"res:{DEFAULT_SOURCE_MAX_HEIGHT}", "vcodec:vp9", "proto", "ext:mp4:m4a"]
 
 
 def video_format_sort() -> list[str]:
@@ -114,9 +120,10 @@ def _download_url(
         "ffmpeg_location": ffmpeg_path,
         "progress_hooks": [_yt_dlp_progress_hook(on_progress)],
     }
+    started = time.monotonic()
     try:
         with YoutubeDL(options) as downloader:
-            downloader.download([url])
+            info = downloader.extract_info(url, download=True)
     except DownloadError as exc:
         raise RuntimeError(f"yt-dlp could not download the input URL: {exc}") from exc
 
@@ -126,10 +133,27 @@ def _download_url(
             "yt-dlp completed, but did not produce exactly one MP4 file in "
             f"{settings.raw_dir}."
         )
+    logger.info(
+        "%s",
+        download_summary(
+            (info or {}).get("format_id") if isinstance(info, dict) else None,
+            downloaded_files[0].stat().st_size,
+            time.monotonic() - started,
+        ),
+    )
     if cached is not None:
         downloaded_files[0].replace(cached)
         return cached
     return downloaded_files[0]
+
+
+def download_summary(format_id: object, size_bytes: int, seconds: float) -> str:
+    """One log line per download, so slow or oversized downloads show up in the log."""
+    megabytes = size_bytes / 1_000_000
+    return (
+        f"Downloaded format {format_id or '?'}: {megabytes:,.0f} MB in {seconds:,.0f} s "
+        f"({megabytes / max(seconds, 0.001):.1f} MB/s)"
+    )
 
 
 def _youtube_id(url: str) -> str | None:

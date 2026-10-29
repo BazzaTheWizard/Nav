@@ -6,6 +6,10 @@ import logging
 import logging.handlers
 import re
 import os
+import shutil
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -153,7 +157,97 @@ def get_worker_status() -> dict[str, Any]:
         "state": str(raw.get("state") or ""),
         "detail": str(raw.get("detail") or ""),
         "updated_at": str(raw.get("updated_at") or ""),
+        "stopping": running and _stop_requested(),
     }
+
+
+# --- Start / stop from the app, and one worker at a time -----------------------------
+# Two workers at once would double Groq use and overfill the Outbox, so a worker
+# holds a lock for as long as it runs (the system releases it if it crashes).
+WAITING_STATES = frozenset({"starting", "outbox_full", "discovering", "idle", "quota_pause", "drive_sign_in"})
+
+
+def _instance_lock_path() -> Path:
+    return STORAGE_DIR / ".worker_running.lock"
+
+
+def _claim_single_instance() -> Any | None:
+    """Open file holding the lock, or None if another worker already runs."""
+    import fcntl
+
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = _instance_lock_path().open("a", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _stop_request_path() -> Path:
+    return STORAGE_DIR / "stop_worker.request"
+
+
+def _stop_requested() -> bool:
+    return _stop_request_path().exists()
+
+
+def _clear_stop_request() -> None:
+    try:
+        _stop_request_path().unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Could not clear the stop request.", exc_info=True)
+
+
+def _is_worker_process(pid: int) -> bool:
+    """Only ever signal the worker: the saved process id could belong to something
+    else by now if the worker closed without saying so."""
+    try:
+        command = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "autonomous_worker" in command
+
+
+def start_worker() -> bool:
+    """Start the worker in the background (keeps the Outbox filled). False if one runs."""
+    if get_worker_status()["running"]:
+        return False
+    _clear_stop_request()
+    root = Path(__file__).resolve().parent
+    venv_python = root / ".venv" / "bin" / "python"
+    command = [str(venv_python if venv_python.exists() else Path(sys.executable)), str(root / "autonomous_worker.py"), "--continuous"]
+    if shutil.which("caffeinate"):
+        command = ["caffeinate", "-i", *command]  # macOS: the Mac doesn't idle-sleep while it works
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with (LOG_PATH.parent / "worker_console.log").open("a", encoding="utf-8") as console:
+        subprocess.Popen(
+            command,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=console,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # keeps running if the app or Terminal closes
+        )
+    return True
+
+
+def stop_worker() -> str:
+    """Stop the worker without losing work. While it waits, it stops now (like Ctrl+C);
+    while it's making clips, it finishes that creator first."""
+    status = get_worker_status()
+    if not status["running"]:
+        return "not_running"
+    raw = _read_json(_worker_status_path(), {})
+    pid = raw.get("pid") if isinstance(raw, dict) else None
+    if status["state"] in WAITING_STATES and isinstance(pid, int) and _is_worker_process(pid):
+        os.kill(pid, signal.SIGINT)
+        return "stopped"
+    _stop_request_path().write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+    return "after_current"
 
 
 def is_youtube_quota_exhausted() -> bool:
@@ -987,6 +1081,15 @@ def _handle_lead_failure(
         return False
 
 
+def _requeue_interrupted(lead: dict[str, Any]) -> None:
+    """Stopped mid-creator (Ctrl+C or the app): put them back, so they aren't lost."""
+    try:
+        _handle_lead_failure(lead, RuntimeError("stopped before the clips were finished"), count_attempt=False)
+        logger.info("%s is back in the queue (stopped before finishing).", lead.get("channel_title"))
+    except Exception:
+        logger.exception("Could not put %s back in the queue", lead.get("channel_title"))
+
+
 def _skip_not_a_fit(lead: dict[str, Any], reason: NotAFit) -> None:
     """Record why, and never queue this creator again."""
     channel_id = str(lead.get("channel_id", ""))
@@ -1168,8 +1271,13 @@ def run_worker(batch: int = 3) -> int:
     failures = 0
     discovered = False
 
+    _clear_stop_request()
     _wait_for_pending_slot()
     while processed_count < batch:
+        if _stop_requested():
+            _clear_stop_request()
+            logger.info("Stopped from the app.")
+            break
         lead = _pop_fresh_lead()
         if lead is None:
             if discovered:
@@ -1191,6 +1299,9 @@ def run_worker(batch: int = 3) -> int:
         _set_status("processing", str(lead.get("channel_title") or channel_id))
         try:
             pending_record = _process_lead(lead, settings)
+        except KeyboardInterrupt:
+            _requeue_interrupted(lead)
+            raise
         except DriveAuthError as exc:
             _handle_lead_failure(lead, exc, count_attempt=False)
             logger.error("%s Stopping; the lead is back in the queue.", exc)
@@ -1245,10 +1356,15 @@ def run_continuous_queue(
     settings = load_settings()
     init_storage_files()
     _prune_leftovers(settings)
+    _clear_stop_request()  # an old request must not stop a fresh start
     _set_status("starting")
     discovery_backoff = DISCOVERY_BACKOFF_START_SEC
     logged_full_at: int | None = None
     while True:
+        if _stop_requested():
+            _clear_stop_request()
+            logger.info("Stopped from the app.")
+            return
         with _worker_lock():
             pending_count = sum(
                 record.get("status", "pending") == "pending"
@@ -1259,8 +1375,8 @@ def run_continuous_queue(
             if logged_full_at != pending_count:  # say it once, not every 5 seconds
                 _set_status("outbox_full", f"{pending_count}/{buffer_size} pitches waiting")
                 logger.info(
-                    "Outbox is full (%d/%d pitches waiting). Send or skip one in the "
-                    "app and the worker continues.",
+                    "Outbox is full (%d/%d pitches waiting). Leave this running: it makes "
+                    "the next pitch as soon as you send or pass one.",
                     pending_count,
                     buffer_size,
                 )
@@ -1310,6 +1426,9 @@ def run_continuous_queue(
         _set_status("processing", str(fresh_lead.get("channel_title") or channel_id))
         try:
             pending_record = _process_lead(fresh_lead, settings)
+        except KeyboardInterrupt:
+            _requeue_interrupted(fresh_lead)
+            raise
         except DriveAuthError as exc:
             _handle_lead_failure(fresh_lead, exc, count_attempt=False)
             _set_status("drive_sign_in", "Google Drive needs signing in again")
@@ -1355,15 +1474,15 @@ def main() -> int:
     parser.add_argument(
         "--batch",
         type=int,
-        default=3,
-        help="Maximum number of creators to process (default: 3).",
+        default=None,
+        help="One-off run: make pitches for this many creators, then stop.",
     )
     parser.add_argument(
         "--continuous",
         "--continuous-queue",
         dest="continuous_queue",
         action="store_true",
-        help="Keep the pending-outreach buffer filled as pitches are marked sent.",
+        help="Keep the Outbox filled as pitches are sent (the default without --batch).",
     )
     parser.add_argument(
         "--buffer-size",
@@ -1381,12 +1500,17 @@ def main() -> int:
         help="Seconds between outbox checks (default: 5).",
     )
     arguments = parser.parse_args()
-    if arguments.batch < 1:
+    if arguments.batch is not None and arguments.batch < 1:
         parser.error("--batch must be at least 1.")
+    continuous = arguments.continuous_queue or arguments.batch is None
     _setup_logging()
+    instance = _claim_single_instance()
+    if instance is None:
+        logger.info("Another worker is already running (see the app), so this one isn't starting.")
+        return 0
     init_storage_files()
     try:
-        if arguments.continuous_queue:
+        if continuous:
             try:
                 run_continuous_queue(
                     buffer_size=arguments.buffer_size,
@@ -1394,9 +1518,9 @@ def main() -> int:
                 )
             except KeyboardInterrupt:
                 logger.info("Continuous queue stopped.")
-                return 0
             except ValueError as exc:
                 parser.error(str(exc))
+            return 0
         try:
             return run_worker(arguments.batch)
         except KeyboardInterrupt:
@@ -1404,6 +1528,7 @@ def main() -> int:
             return 0
     finally:
         _set_status("stopped")
+        instance.close()
 
 
 if __name__ == "__main__":
