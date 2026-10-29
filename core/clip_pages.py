@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -297,6 +298,18 @@ def describe_activity(page: dict[str, Any] | None, now: datetime | None = None) 
 
 
 # ---------- Setup check: .venv/bin/python -m core.clip_pages --check ----------
+def _https_context() -> ssl.SSLContext:
+    """The certificate list the rest of the pipeline uses (certifi). Python from
+    python.org doesn't use the Mac's own list, so plain urllib fails with
+    CERTIFICATE_VERIFY_FAILED on every https address."""
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def check_setup(out: Any = print) -> bool:
     settings = page_settings()
     if settings is None:
@@ -333,9 +346,13 @@ def check_setup(out: Any = print) -> bool:
             beacon = urllib.request.Request(f"{settings.base_url}/e", method="POST",
                                             data=json.dumps({"s": name, "t": "play", "c": 1}).encode(),
                                             headers={"content-type": "text/plain", "user-agent": "nav-setup-check"})
-            urllib.request.urlopen(beacon, timeout=20).read()
-            seen = page_activity().get(name, {})
-            ok &= _report(out, 1 in seen.get("played", set()), "Plays are recorded")
+            try:
+                urllib.request.urlopen(beacon, timeout=20, context=_https_context()).read()
+                seen = page_activity().get(name, {})
+                ok &= _report(out, 1 in seen.get("played", set()), "Plays are recorded",
+                              "the Worker didn't save the play (is the R2 binding named CLIPS?)")
+            except Exception as exc:
+                ok &= _report(out, False, "Plays are recorded", f"{settings.base_url}/e: {exc}")
         finally:
             delete_page(name)
             out("✓ Test page deleted")
@@ -352,7 +369,7 @@ def _check_url(url: str, out: Any, label: str, *, expect_text: str | None = None
                expect_status: int = 200) -> bool:
     request = urllib.request.Request(url, headers={"user-agent": "nav-setup-check", **({"range": range_header} if range_header else {})})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30, context=_https_context()) as response:
             body = response.read(200_000)
             status = response.status
     except urllib.error.HTTPError as exc:

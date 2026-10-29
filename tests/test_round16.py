@@ -127,6 +127,30 @@ try:
 except ValueError:
     check("Delete refuses odd names", True)
 
+# ---------- Setup check: https certificates, and no crash when the site can't be reached ----------
+import ssl, urllib.error, urllib.request
+ctx = C._https_context()
+check("Setup check uses certifi's certificate list (python.org Python has none of its own)",
+      isinstance(ctx, ssl.SSLContext) and ctx.verify_mode == ssl.CERT_REQUIRED and ctx.cert_store_stats()["x509_ca"] > 50,
+      str(ctx.cert_store_stats()))
+contexts, lines = [], []
+real_urlopen = urllib.request.urlopen
+def failing_urlopen(request, timeout=None, context=None):
+    contexts.append(context)
+    raise urllib.error.URLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+urllib.request.urlopen = failing_urlopen
+try:
+    result = C.check_setup(out=lines.append)
+    crashed = False
+except Exception as exc:
+    result, crashed = None, exc
+urllib.request.urlopen = real_urlopen
+check("Unreachable page -> ✗ lines and a clear ending, not a crash", crashed is False and result is False
+      and any(l.startswith("✗ The page opens") for l in lines) and any(l.startswith("✗ Plays are recorded") for l in lines)
+      and lines[-1].startswith("Something above needs fixing"), str(crashed or lines))
+check("Every request used the certifi list", contexts and all(c is not None for c in contexts), str(contexts))
+check("The test page is still cleaned up", "✓ Test page deleted" in lines and not any(k.startswith("setup-check-") for k in r2.objects))
+
 # ---------- Worker ----------
 import autonomous_worker as W
 from core import outreach as O
