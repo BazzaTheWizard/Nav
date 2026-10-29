@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from pathlib import Path
 
@@ -149,6 +150,19 @@ CAPTION_MARGIN_H = 110
 HOOK_MARGIN_V = 300
 HOOK_MAX_CHARACTERS = 70
 HIGHLIGHT_COLOUR = "&H00FFFF&"  # yellow (ASS colours are BGR)
+# Caption look. "bold" (default): thick outline, soft drop shadow, and the spoken
+# word pops in (115% -> 100% over 0.11 s). "classic": the look before round 12.
+# Pick one with CAPTION_STYLE=classic in .env.
+CAPTION_STYLES = {
+    "bold": {"outline": 6, "shadow": 3, "shadow_colour": "&H64000000", "blur": 0.6, "pop": True},
+    "classic": {"outline": 3, "shadow": 1, "shadow_colour": "&H80000000", "blur": 0.0, "pop": False},
+}
+WORD_POP = r"\fscx115\fscy115\t(0,110,\fscx100\fscy100)"
+
+
+def caption_style(name: str | None = None) -> dict[str, float | str | bool]:
+    chosen = (name or os.getenv("CAPTION_STYLE") or "bold").strip().lower()
+    return CAPTION_STYLES.get(chosen, CAPTION_STYLES["bold"])
 GENERIC_HOOK_TITLES = frozenset({"key highlight", "clip", ""})
 
 
@@ -170,6 +184,7 @@ def create_ass_subtitles(
     hook_seconds: float = 0.0,
     seam_spans: list[tuple[float, float]] | tuple[tuple[float, float], ...] | None = None,
     seam_title: tuple[float, int] | None = None,
+    style: str | None = None,
 ) -> Path:
     """Write short, clip-relative ASS subtitle cards with non-overlapping timing.
 
@@ -180,6 +195,7 @@ def create_ass_subtitles(
     there sit on the seam between the two panels instead of over the lower face.
     seam_title: (seconds, bottom y) of a title card shown on the seam; captions
     in that time sit just under it instead.
+    style: "bold" or "classic" (default: CAPTION_STYLE in .env, else "bold").
     """
     if not words:
         raise ValueError("Cannot create subtitles without word timestamps.")
@@ -189,16 +205,18 @@ def create_ass_subtitles(
     if any(word.end <= word.start for word in ordered):
         raise ValueError("Every subtitle word must have an end time after its start time.")
 
+    look = caption_style(style)
     header = f"""[Script Info]
 ScriptType: v4.00+
 WrapStyle: 0
 ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
 PlayResX: 1080
 PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ShortForm,Arial Black,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,{CAPTION_MARGIN_H},{CAPTION_MARGIN_H},{CAPTION_MARGIN_V},1
+Style: ShortForm,Arial Black,72,&H00FFFFFF,&H0000FFFF,&H00000000,{look["shadow_colour"]},-1,0,0,0,100,100,0,0,1,{look["outline"]},{look["shadow"]},2,{CAPTION_MARGIN_H},{CAPTION_MARGIN_H},{CAPTION_MARGIN_V},1
 Style: Hook,Arial Black,58,&H00FFFFFF,&H00FFFFFF,&H50000000,&H00000000,-1,0,0,0,100,100,0,0,3,18,0,8,120,120,{HOOK_MARGIN_V},1
 
 [Events]
@@ -214,10 +232,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     title_until_cs = _centiseconds(seam_title[0]) if seam_title else 0
     under_title = f"{{\\an8\\pos(540,{seam_title[1] + 14})}}" if seam_title else ""
 
+    blur = f"\\blur{look['blur']}" if look["blur"] else ""
+    soften = f"{{{blur}}}" if blur else ""
+    pop = WORD_POP if look["pop"] else ""
+    # After the spoken word: back to the plain style (keeping the soft edge).
+    restore = f"{{\\r{blur}}}"
+
     def add_event(start_cs: int, end_cs: int, text: str, style: str = "ShortForm", layer: int = 0) -> None:
         middle = (start_cs + end_cs) / 2
-        if style == "ShortForm" and any(a <= middle < b for a, b in seams):
-            text = (under_title if start_cs < title_until_cs else SEAM_POSITION) + text
+        if style == "ShortForm":
+            text = soften + text
+            if any(a <= middle < b for a, b in seams):
+                text = (under_title if start_cs < title_until_cs else SEAM_POSITION) + text
         if end_cs > start_cs:
             events.append(
                 f"Dialogue: {layer},{_ass_time(start_cs / 100)},"
@@ -245,8 +271,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             continue
 
         tokens = [_safe_ass_text(word.text.upper()) for word in group]
-        if not highlight_active_word or len(group) == 1:
+        if not highlight_active_word:
             add_event(event_start_cs, event_end_cs, " ".join(tokens))
+        elif len(group) == 1:
+            # A one-word card: the word itself is the spoken word.
+            add_event(event_start_cs, event_end_cs, f"{{{pop}}}{tokens[0]}" if pop else tokens[0])
         else:
             # One event per word: same card text, the spoken word in yellow.
             boundaries = [event_start_cs]
@@ -257,7 +286,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             boundaries.append(event_end_cs)
             for word_index in range(len(group)):
                 text = " ".join(
-                    f"{{\\c{HIGHLIGHT_COLOUR}}}{token}{{\\r}}" if i == word_index else token
+                    f"{{\\c{HIGHLIGHT_COLOUR}{pop}}}{token}{restore}" if i == word_index else token
                     for i, token in enumerate(tokens)
                 )
                 add_event(boundaries[word_index], boundaries[word_index + 1], text)

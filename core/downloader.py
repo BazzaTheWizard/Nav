@@ -14,12 +14,26 @@ from config import Settings, load_settings
 
 ProgressCallback = Callable[[float, str], None]
 
-# Pick the closest match to 1080p H.264 + M4A audio. Sorting (instead of the old
-# filter chain) never falls through to "best": the old chain sometimes ended at
-# 4K AV1 (587 MB for 14 minutes), which is far slower to decode on a MacBook.
+# Source quality. YouTube's H.264 1080p stream is its lowest-quality 1080p (the
+# downloads measured about 1.1-1.25 Mbps), and a 9:16 crop of it is only 608 px
+# wide, enlarged 1.78x. So: the best VP9 stream up to 1440p (a 810 px wide crop,
+# enlarged 1.33x), falling back to H.264. AV1 stays last (slow to decode on a
+# MacBook; an earlier 4K AV1 pick was 587 MB for 14 minutes). Sorting never falls
+# through to "best". SOURCE_MAX_HEIGHT in .env: 1080, 1440 (default) or 2160.
 VIDEO_FORMAT = "bv*+ba/b"
 FFMPEG_TIMEOUT_SEC = 15 * 60  # audio extraction from a 90-min video takes about a minute
-VIDEO_FORMAT_SORT = ["res:1080", "vcodec:h264", "ext:mp4:m4a"]
+DEFAULT_SOURCE_MAX_HEIGHT = 1440
+VIDEO_FORMAT_SORT = [f"res:{DEFAULT_SOURCE_MAX_HEIGHT}", "vcodec:vp9", "ext:mp4:m4a"]
+
+
+def video_format_sort() -> list[str]:
+    """VIDEO_FORMAT_SORT with SOURCE_MAX_HEIGHT from .env (720-2160) applied."""
+    try:
+        height = int(os.getenv("SOURCE_MAX_HEIGHT", "") or DEFAULT_SOURCE_MAX_HEIGHT)
+    except ValueError:
+        height = DEFAULT_SOURCE_MAX_HEIGHT
+    height = min(2160, max(720, height))
+    return [f"res:{height}", *VIDEO_FORMAT_SORT[1:]]
 
 __all__ = [
     "fetch_video_info",
@@ -85,7 +99,7 @@ def _download_url(
     )
     options = {
         "format": VIDEO_FORMAT,
-        "format_sort": VIDEO_FORMAT_SORT,
+        "format_sort": video_format_sort(),
         "outtmpl": output_template,
         "noplaylist": True,
         "merge_output_format": "mp4",
