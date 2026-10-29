@@ -28,6 +28,7 @@ from autonomous_worker import (
     get_worker_status,
     mark_follow_up,
     prioritize_queued_lead,
+    record_clip_trim,
     restore_passed_as_sent,
     update_pending_draft,
     get_lead_queue,
@@ -47,9 +48,9 @@ from core.downloader import (
     extract_audio_only,
     video_format_sort,
 )
-from core.clipper import rerender_clip, rerender_output_path
+from core.clipper import MIN_CLIP_DURATION, rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
-from core.drive_uploader import upload_clips_to_drive
+from core.drive_uploader import replace_clip_in_drive, upload_clips_to_drive
 from core.outreach import (
     SUBJECT,
     build_outreach_email,
@@ -64,6 +65,14 @@ from core.pipeline import (
     pick_clips_with_agent,
     render_selected_clip,
     video_info_and_peaks,
+)
+from core.pitch_files import (
+    accept_trim,
+    discard_trim,
+    load_pitch,
+    pitch_files_bytes,
+    rerender_trim,
+    trim_limits,
 )
 from core.storage_manager import (
     prune_output_folder,
@@ -802,6 +811,8 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
             if drive_link:
                 st.link_button("📁 Open the clips (Drive)", drive_link, use_container_width=True)
 
+        _render_pitch_clips(record)
+
         subject_key = f"pending_subject_{record_id}"
         body_key = f"pending_pitch_{record_id}"
         name_key = f"pending_name_{record_id}"
@@ -863,6 +874,96 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
                         st.warning("This pitch is no longer pending. Refresh the page.")
         with pass_column:
             _render_pass_menu(channel_id, f"skip_lead_{record_id}")
+
+
+def _render_pitch_clips(record: dict[str, Any]) -> None:
+    """The pitch's clips, playable here, each with a quick trim."""
+    record_id = str(record["record_id"])
+    pitch = load_pitch(record_id)
+    if pitch is None or not pitch.get("clips"):
+        st.caption("No preview on this Mac for this pitch (it was made before previews existed). Use the Drive link.")
+        return
+    flash = st.session_state.pop(f"trim_flash_{record_id}", None)
+    if flash:
+        st.success(flash)
+    columns = st.columns(3)
+    for column, item in zip(columns, pitch["clips"]):
+        with column:
+            _render_pitch_clip(record, item)
+
+
+def _render_pitch_clip(record: dict[str, Any], item: dict[str, Any]) -> None:
+    record_id = str(record["record_id"])
+    index = int(item["index"])
+    start_key, end_key = f"trim_start_{record_id}_{index}", f"trim_end_{record_id}_{index}"
+    for key in st.session_state.pop(f"trim_reset_{record_id}_{index}", []):  # before the inputs exist
+        st.session_state.pop(key, None)
+    waiting = bool(item.get("trim_waiting")) and "trim" in item
+    preview = Path(item["trim_preview_path"] if waiting else item["preview_path"])
+    if preview.is_file():
+        st.video(str(preview), width=PREVIEW_PLAYER_WIDTH)
+    else:
+        st.caption("Preview file missing. Use the Drive link.")
+    start, end = float(item["start"]), float(item["end"])
+    saved = [clip for clip in record.get("clips") or [] if isinstance(clip, dict)]
+    score = saved[index - 1].get("judge") if len(saved) >= index else None
+    st.markdown(
+        f"**Clip {index}** · {_clock(start)}–{_clock(end)} · {end - start:.0f} s"
+        + (f" · AI {int(score)}" if isinstance(score, (int, float)) else "")
+    )
+    if waiting:
+        new = item["trim"]
+        st.markdown(f":orange-badge[New cut, not used yet] {_clock(new['start'])}–{_clock(new['end'])} ({new['end'] - new['start']:.1f} s)")
+        use_column, keep_column = st.columns(2)
+        if use_column.button("✅ Use this cut", key=f"trim_use_{record_id}_{index}", type="primary", use_container_width=True):
+            link = str(record.get("drive_link") or "")
+            with st.spinner("Replacing the clip in Drive…"):
+                try:
+                    times = accept_trim(
+                        record_id, index,
+                        (lambda path, name: replace_clip_in_drive(link, name, path)) if link else None,
+                    )
+                    record_clip_trim(record_id, index, times["start"], times["end"])
+                except Exception as exc:
+                    logging.exception("Could not use the trimmed clip")
+                    st.error(f"Couldn't use the new cut: {exc}")
+                    return
+            st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
+            st.session_state[f"trim_flash_{record_id}"] = f"Clip {index} updated. The Drive link in the email stays the same."
+            st.rerun()
+        if keep_column.button("↩️ Keep the old cut", key=f"trim_keep_{record_id}_{index}", use_container_width=True):
+            discard_trim(record_id, index)
+            st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
+            st.rerun()
+    with st.expander("✂️ Trim"):
+        earliest, latest = trim_limits(item)
+        st.number_input(
+            "Start: move by (seconds)", key=start_key, value=0.0, step=0.5, format="%.1f",
+            min_value=min(0.0, round(earliest - start, 1)),
+            max_value=max(0.0, round(end - MIN_CLIP_DURATION - start, 1)),
+            help="Negative starts earlier. − / + nudge by half a second.",
+        )
+        st.number_input(
+            "End: move by (seconds)", key=end_key, value=0.0, step=0.5, format="%.1f",
+            min_value=min(0.0, round(start + MIN_CLIP_DURATION - end, 1)),
+            max_value=max(0.0, round(latest - end, 1)),
+            help="Positive ends later. − / + nudge by half a second.",
+        )
+        new_start = start + float(st.session_state.get(start_key) or 0.0)
+        new_end = end + float(st.session_state.get(end_key) or 0.0)
+        st.caption(f"New cut: {_clock(new_start)}–{_clock(new_end)} ({new_end - new_start:.1f} s)")
+        if st.button(
+            "🔄 Re-render", key=f"trim_go_{record_id}_{index}", use_container_width=True,
+            disabled=new_start == start and new_end == end,
+        ):
+            with st.spinner("Re-rendering this clip (about 10–30 s)…"):
+                try:
+                    rerender_trim(record_id, index, new_start, new_end, load_settings())
+                except Exception as exc:
+                    logging.exception("Could not re-render the trimmed clip")
+                    st.error(f"Couldn't re-render: {exc}")
+                    return
+            st.rerun()
 
 
 def _render_pitch_badges(record: dict[str, Any]) -> None:
@@ -1202,6 +1303,7 @@ def _upload_generated_clips(generated_clips: list[tuple[Path, ClipResult]]) -> N
 
 # --- 🩺 System: health, settings, storage, log -------------------------------------------
 LOG_LINES = 40
+PREVIEW_PLAYER_WIDTH = 240  # vertical clips: ~430 px tall, so the email stays in view
 
 
 def _render_system() -> None:
@@ -1239,6 +1341,10 @@ def _render_system() -> None:
     output_dir = render_output_dir()
     storage_bytes = storage_usage_bytes(settings.raw_dir, settings.temp_dir, settings.output_dir, output_dir)
     st.metric("Downloads, temp files and clips on this Mac", f"{storage_bytes / (1024 * 1024):,.0f} MB")
+    st.caption(
+        f"Outbox previews and trim files: {pitch_files_bytes() / (1024 * 1024):,.0f} MB "
+        "(kept apart; each pitch's are deleted when you send or pass it)."
+    )
     if st.button("Clear downloads, temp files and made clips"):
         try:
             # Files the background worker is using right now are kept.

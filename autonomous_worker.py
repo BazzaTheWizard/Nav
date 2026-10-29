@@ -48,6 +48,7 @@ from core.pipeline import (
     render_selected_clip,
     video_info_and_peaks,
 )
+from core.pitch_files import prune_pitch_files, remove_pitch_files, save_pitch_files
 from core.transcriber import TranscriptionLimitReached, Word, transcribe_audio
 from main import _video_duration
 
@@ -111,6 +112,11 @@ def _groq_pause_text(error: TranscriptionLimitReached) -> str:
 # id to tell "running" from "stopped" (or closed without saying so).
 def _worker_status_path() -> Path:
     return STORAGE_DIR / "worker_status.json"
+
+
+def _pitches_dir() -> Path:
+    """Outbox preview/trim files (core.pitch_files); the app reads the same folder."""
+    return STORAGE_DIR / "pitches"
 
 
 def _set_status(state: str, detail: str = "") -> None:
@@ -755,7 +761,29 @@ def mark_outreach_sent(record_id: str, *, subject: str | None = None, body: str 
                 channel_id = record.get("channel_id")
                 if isinstance(channel_id, str):
                     _update_lead_status(state, channel_id, "sent")
+                remove_pitch_files(record_id, _pitches_dir())  # previews are only for the Outbox
                 return True
+    return False
+
+
+def record_clip_trim(record_id: str, index: int, start: float, end: float) -> bool:
+    """Save a trim on the pitch record (clip ``index`` from 1), keeping the AI's
+    original times, so how often and how far cuts get moved can be tuned later."""
+    with _worker_lock():
+        pending = _pending_records()
+        for record in pending:
+            clips = record.get("clips")
+            if record.get("record_id") != record_id or not isinstance(clips, list):
+                continue
+            if not 1 <= index <= len(clips) or not isinstance(clips[index - 1], dict):
+                return False
+            clip = clips[index - 1]
+            clip.setdefault("ai_start", clip.get("start"))
+            clip.setdefault("ai_end", clip.get("end"))
+            clip["start"], clip["end"] = round(start, 1), round(end, 1)
+            clip["trimmed_at"] = datetime.now(timezone.utc).isoformat()
+            _write_json_atomic(PENDING_OUTREACH_PATH, pending)
+            return True
     return False
 
 
@@ -847,7 +875,9 @@ def skip_lead(channel_id: str, reason: str = "user_skipped", pass_reason: str | 
             actual_channel_id,
             sum(r.get("status", "pending") == "pending" for r in pending),
         )
-        return True
+    if skipped_record.get("record_id"):
+        remove_pitch_files(str(skipped_record["record_id"]), _pitches_dir())
+    return True
 
 
 def _lead_queue() -> list[dict[str, Any]]:
@@ -1015,9 +1045,11 @@ def _render_selected_clips(
     settings: Any,
     words: list[Word],
     layouts_out: list[str] | None = None,
+    rendered_out: list[Any] | None = None,
 ) -> list[Path]:
     """Render each clip (2 or 3 after the quality gate). ``layouts_out`` receives
-    each clip's layout, for the Outbox record."""
+    each clip's layout, for the Outbox record; ``rendered_out`` the full results
+    (for the Outbox preview and trim files)."""
     rendered = [
         render_selected_clip(
             source_path,
@@ -1034,6 +1066,8 @@ def _render_selected_clips(
         raise RuntimeError(f"Expected {len(clips)} rendered clips; got {len(rendered)}.")
     if layouts_out is not None:
         layouts_out.extend(item.layout_mode for item in rendered)
+    if rendered_out is not None:
+        rendered_out.extend(rendered)
     return [item.path for item in rendered]
 
 
@@ -1117,6 +1151,8 @@ def _process_lead(
     job_dir = settings.temp_dir / f"worker_{uuid.uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=False)
     source_video: Path | None = None
+    record_id = uuid.uuid4().hex
+    queued = False
     try:
         source_video = Path(download_source_video(video_url))
         share = on_camera_share(source_video)
@@ -1145,6 +1181,7 @@ def _process_lead(
         except WeakMoments as exc:
             raise NotAFit(f"weak moments: {exc}") from exc
         layouts: list[str] = []
+        rendered_items: list[Any] = []
         rendered = _render_selected_clips(
             source_video,
             clips,
@@ -1152,7 +1189,14 @@ def _process_lead(
             settings,
             words,
             layouts,
+            rendered_items,
         )
+        if rendered_items:
+            try:
+                save_pitch_files(record_id, source_video, rendered_items, words, duration, _pitches_dir())
+            except Exception:
+                # The pitch is still good; it just can't be previewed or trimmed in the app.
+                logger.warning("Could not save the Outbox preview files for %s.", channel_title, exc_info=True)
         drive_link = upload_clips_to_drive(
             channel_title,
             video_title,
@@ -1165,7 +1209,7 @@ def _process_lead(
         )
         contact = lead.get("contact_email") or f"{channel_url}/about"
         pending_record = {
-            "record_id": uuid.uuid4().hex,
+            "record_id": record_id,
             "channel_title": channel_title,
             "contact_email": contact,
             "drive_link": drive_link,
@@ -1206,6 +1250,7 @@ def _process_lead(
                 if pending_count < MAX_PENDING_LEADS:
                     pending.append(pending_record)
                     _write_json_atomic(PENDING_OUTREACH_PATH, pending)
+                    queued = True
                     break
             logger.info(
                 "Pending outreach buffer reached its %d-lead cap; waiting for a "
@@ -1215,6 +1260,8 @@ def _process_lead(
             time.sleep(PENDING_SLOT_POLL_INTERVAL_SEC)
         return pending_record
     finally:
+        if not queued:
+            remove_pitch_files(record_id, _pitches_dir())
         if source_video is not None:
             source_video.unlink(missing_ok=True)
             for path in settings.raw_dir.glob(f"{source_video.stem}*"):
@@ -1236,6 +1283,15 @@ def _prune_leftovers(settings: Any) -> None:
         return
     if removed:
         logger.info("Removed %d leftover download/temp file(s) older than a day.", removed)
+    try:
+        with _worker_lock():
+            keep = {str(r.get("record_id")) for r in _pending_records() if r.get("status", "pending") == "pending"}
+        pruned = prune_pitch_files(keep, _pitches_dir())
+    except (OSError, RuntimeError):
+        logger.debug("Skipped preview cleanup.", exc_info=True)
+        return
+    if pruned:
+        logger.info("Removed preview files of %d pitch(es) that left the Outbox.", pruned)
 
 
 def _setup_logging() -> None:

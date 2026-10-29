@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from google.auth.exceptions import RefreshError
@@ -147,3 +148,40 @@ def upload_clips_to_drive(
     if not isinstance(folder_link, str) or not folder_link:
         raise RuntimeError("Google Drive did not return a link for the client folder.")
     return folder_link
+
+
+_FOLDER_ID = re.compile(r"/folders/([A-Za-z0-9_-]+)")
+_CLIP_NAME = re.compile(r"[A-Za-z0-9_.-]{1,80}")
+
+
+def replace_clip_in_drive(folder_link: str, file_name: str, new_clip: str | Path) -> None:
+    """Swap one clip in a pitch's Drive folder for a new version (after a trim).
+    The file keeps its ID, so the folder link in the email still works."""
+    match = _FOLDER_ID.search(folder_link or "")
+    if match is None:
+        raise ValueError(f"Not a Google Drive folder link: {folder_link!r}")
+    if not _CLIP_NAME.fullmatch(file_name):
+        raise ValueError(f"Unexpected clip file name: {file_name!r}")
+    clip = Path(new_clip).expanduser().resolve(strict=True)
+    drive = build("drive", "v3", credentials=_get_user_credentials(), cache_discovery=False)
+    found = (
+        drive.files()
+        .list(
+            q=f"'{match.group(1)}' in parents and name = '{file_name}' and trashed = false",
+            fields="files(id,name)",
+            pageSize=5,
+        )
+        .execute(num_retries=UPLOAD_RETRIES)
+        .get("files", [])
+    )
+    if not found:
+        raise RuntimeError(f"{file_name} isn't in the pitch's Drive folder any more.")
+    (
+        drive.files()
+        .update(
+            fileId=found[0]["id"],
+            media_body=MediaFileUpload(str(clip), mimetype="video/mp4", resumable=True),
+            fields="id",
+        )
+        .execute(num_retries=UPLOAD_RETRIES)
+    )
