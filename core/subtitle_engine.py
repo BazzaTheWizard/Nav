@@ -150,19 +150,53 @@ CAPTION_MARGIN_H = 110
 HOOK_MARGIN_V = 300
 HOOK_MAX_CHARACTERS = 70
 HIGHLIGHT_COLOUR = "&H00FFFF&"  # yellow (ASS colours are BGR)
-# Caption look. "bold" (default): thick outline, soft drop shadow, and the spoken
-# word pops in (115% -> 100% over 0.11 s). "classic": the look before round 12.
-# Pick one with CAPTION_STYLE=classic in .env.
+# Caption look. "bold" (default): thick outline and a soft drop shadow.
+# "classic": the look before round 12. Pick one with CAPTION_STYLE=classic in .env.
 CAPTION_STYLES = {
-    "bold": {"outline": 6, "shadow": 3, "shadow_colour": "&H64000000", "blur": 0.6, "pop": True},
-    "classic": {"outline": 3, "shadow": 1, "shadow_colour": "&H80000000", "blur": 0.0, "pop": False},
+    "bold": {"outline": 6, "shadow": 3, "shadow_colour": "&H64000000", "blur": 0.6, "emphasis": "balanced"},
+    "classic": {"outline": 3, "shadow": 1, "shadow_colour": "&H80000000", "blur": 0.0, "emphasis": "off"},
 }
-WORD_POP = r"\fscx115\fscy115\t(0,110,\fscx100\fscy100)"
+
+# Active-word emphasis: the spoken word turns yellow and briefly pulses, then
+# settles. Every preset keeps the caption line still: the word grows in height
+# (not width) and its outline thickens for a moment. Growing the width too, as
+# round 12 did (115%), pushed the whole line 24 px sideways on every new word:
+# the "shake". Pick one with EMPHASIS_INTENSITY=off|subtle|balanced|punchy in .env.
+EMPHASIS_PRESETS: dict[str, dict[str, int] | None] = {
+    "off": None,  # colour change only
+    "subtle": {"height": 105, "outline_boost": 2, "max_ms": 90},
+    "balanced": {"height": 108, "outline_boost": 3, "max_ms": 110},
+    "punchy": {"height": 112, "outline_boost": 4, "max_ms": 130},
+}
+# Pacing: the pulse takes at most this share of the word's time on screen, and
+# words shorter than MIN_PULSE_WORD_MS (fast speech) only change colour, so quick
+# runs of words don't flicker.
+PULSE_SHARE = 0.4
+MIN_PULSE_WORD_MS = 120
 
 
-def caption_style(name: str | None = None) -> dict[str, float | str | bool]:
+def caption_style(name: str | None = None) -> dict[str, float | str]:
     chosen = (name or os.getenv("CAPTION_STYLE") or "bold").strip().lower()
     return CAPTION_STYLES.get(chosen, CAPTION_STYLES["bold"])
+
+
+def emphasis_preset(name: str | None = None, style: dict[str, float | str] | None = None) -> dict[str, int] | None:
+    """The emphasis preset: ``name``, else EMPHASIS_INTENSITY in .env, else the
+    caption style's own default (bold: balanced, classic: off)."""
+    chosen = (name or os.getenv("EMPHASIS_INTENSITY") or str((style or caption_style())["emphasis"])).strip().lower()
+    return EMPHASIS_PRESETS.get(chosen, EMPHASIS_PRESETS["balanced"])
+
+
+def _pulse(preset: dict[str, int] | None, outline: float, word_ms: int) -> str:
+    """ASS tags for the spoken word's pulse ('' for none), scaled to its length."""
+    if preset is None or word_ms < MIN_PULSE_WORD_MS:
+        return ""
+    duration = int(min(preset["max_ms"], word_ms * PULSE_SHARE))
+    base = int(outline)
+    return (
+        f"\\fscy{preset['height']}\\bord{base + preset['outline_boost']}"
+        f"\\t(0,{duration},\\fscy100\\bord{base})"
+    )
 GENERIC_HOOK_TITLES = frozenset({"key highlight", "clip", ""})
 
 
@@ -185,6 +219,7 @@ def create_ass_subtitles(
     seam_spans: list[tuple[float, float]] | tuple[tuple[float, float], ...] | None = None,
     seam_title: tuple[float, int] | None = None,
     style: str | None = None,
+    emphasis: str | None = None,
 ) -> Path:
     """Write short, clip-relative ASS subtitle cards with non-overlapping timing.
 
@@ -196,6 +231,8 @@ def create_ass_subtitles(
     seam_title: (seconds, bottom y) of a title card shown on the seam; captions
     in that time sit just under it instead.
     style: "bold" or "classic" (default: CAPTION_STYLE in .env, else "bold").
+    emphasis: "off", "subtle", "balanced" or "punchy" (default: EMPHASIS_INTENSITY
+    in .env, else the style's own default).
     """
     if not words:
         raise ValueError("Cannot create subtitles without word timestamps.")
@@ -234,7 +271,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     blur = f"\\blur{look['blur']}" if look["blur"] else ""
     soften = f"{{{blur}}}" if blur else ""
-    pop = WORD_POP if look["pop"] else ""
+    preset = emphasis_preset(emphasis, look)
     # After the spoken word: back to the plain style (keeping the soft edge).
     restore = f"{{\\r{blur}}}"
 
@@ -275,7 +312,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             add_event(event_start_cs, event_end_cs, " ".join(tokens))
         elif len(group) == 1:
             # A one-word card: the word itself is the spoken word.
-            add_event(event_start_cs, event_end_cs, f"{{{pop}}}{tokens[0]}" if pop else tokens[0])
+            pulse = _pulse(preset, look["outline"], (event_end_cs - event_start_cs) * 10)
+            add_event(event_start_cs, event_end_cs, f"{{{pulse}}}{tokens[0]}" if pulse else tokens[0])
         else:
             # One event per word: same card text, the spoken word in yellow.
             boundaries = [event_start_cs]
@@ -285,8 +323,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 )
             boundaries.append(event_end_cs)
             for word_index in range(len(group)):
+                pulse = _pulse(
+                    preset, look["outline"], (boundaries[word_index + 1] - boundaries[word_index]) * 10
+                )
                 text = " ".join(
-                    f"{{\\c{HIGHLIGHT_COLOUR}{pop}}}{token}{restore}" if i == word_index else token
+                    f"{{\\c{HIGHLIGHT_COLOUR}{pulse}}}{token}{restore}" if i == word_index else token
                     for i, token in enumerate(tokens)
                 )
                 add_event(boundaries[word_index], boundaries[word_index + 1], text)

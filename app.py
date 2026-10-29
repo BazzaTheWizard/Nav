@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import functools
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -16,6 +17,9 @@ import streamlit as st
 from pydantic import BaseModel
 
 from autonomous_worker import (
+    LOG_PATH as WORKER_LOG_PATH,
+    MAX_PENDING_LEADS,
+    MIN_CLIP_SCORE,
     PASS_REASONS,
     get_awaiting_reply,
     get_cached_leads,
@@ -38,6 +42,7 @@ from core.downloader import (
     download_audio_only,
     download_source_video,
     extract_audio_only,
+    video_format_sort,
 )
 from core.clipper import rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
@@ -65,9 +70,12 @@ from core.storage_manager import (
     storage_usage_bytes,
 )
 from core.transcriber import (
+    local_whisper_allowed,
     transcribe_audio,
     youtube_video_id,
 )
+from core.subtitle_engine import caption_style
+from core.video_renderer import loudness_target
 from main import _audio_duration, _video_duration
 
 
@@ -92,7 +100,7 @@ WORKER_COMMAND = (
 _STATE_TEXT = {
     "starting": "starting up",
     "processing": "making clips for {detail}",
-    "outbox_full": "paused: the Outbox is full ({detail}). Send or pass a pitch in 📬 Outbox / Approval",
+    "outbox_full": "paused: the Outbox is full ({detail}). Send or pass a pitch in the 📬 Outbox",
     "discovering": "looking for new creators",
     "idle": "waiting: {detail}",
     "quota_pause": "paused: {detail}",
@@ -201,11 +209,11 @@ def _active_cached_leads() -> list[dict[str, Any]]:
 
 
 LAYOUT_LABELS = {
-    "Auto (face crop when faces are clear)": "auto",
-    "Blurred Background (Best for Sports)": "blurred_background",
-    "Automotive / Wide Video (Blurred Background)": "wide_blurred_background",
-    "Stacked Split-Screen": "stacked",
-    "Face Crop (follows camera cuts)": "smart_crop",
+    "Auto (recommended): face-tracked, split view for two people": "auto",
+    "Face-tracked crop": "smart_crop",
+    "Full frame over a blurred background": "blurred_background",
+    "Wide video, letterboxed": "wide_blurred_background",
+    "Wide shot on top, face below": "stacked",
 }
 
 
@@ -280,15 +288,16 @@ def _render_copy_email_button(email_body: str) -> None:
     encoded_email = base64.b64encode(email_body.encode("utf-8")).decode("ascii")
     st.iframe(
         f"""
-        <button id="copy-email" style="padding: 0.45rem 0.8rem; cursor: pointer;">
-          Copy email
+        <style>html, body {{ margin: 0; padding: 0; }}</style>
+        <button id="copy-email" aria-live="polite" style="width: 100%; height: 40px; cursor: pointer;
+          border: 1px solid rgba(49, 51, 63, 0.2); border-radius: 8px; background: #fff;
+          color: #31333f; font: 400 14px 'Source Sans Pro', 'Source Sans 3', sans-serif;">
+          📋 Copy email
         </button>
-        <span id="copy-status" aria-live="polite"></span>
         <script>
           const bytes = Uint8Array.from(atob("{encoded_email}"), c => c.charCodeAt(0));
           const email = new TextDecoder().decode(bytes);
           const button = document.getElementById("copy-email");
-          const status = document.getElementById("copy-status");
           button.addEventListener("click", async () => {{
             try {{
               if (navigator.clipboard && window.isSecureContext) {{
@@ -304,10 +313,11 @@ def _render_copy_email_button(email_body: str) -> None:
                   throw new Error("Clipboard copy was rejected.");
                 }}
               }}
-              status.textContent = " Copied";
+              button.textContent = "✓ Copied";
             }} catch (error) {{
-              status.textContent = " Copy failed; select and copy the email.";
+              button.textContent = "Copy failed: select the text";
             }}
+            setTimeout(() => {{ button.textContent = "📋 Copy email"; }}, 2500);
           }});
         </script>
         """,
@@ -649,709 +659,566 @@ def _generate_clips(
         audio_path.unlink(missing_ok=True)
 
 
+TAB_LABELS = ("📬 Outbox", "📨 Sent", "🧭 Pipeline", "🎬 Make clips", "🩺 System")
+LAYOUT_NAMES = {
+    "smart_crop": "face-tracked",
+    "blurred_background": "full frame",
+    "wide_blurred_background": "full frame",
+    "stacked": "stacked",
+}
+
+
 def main() -> None:
-    st.set_page_config(page_title="AI Short-Form Video Generator", page_icon="🎬", layout="wide")
+    st.set_page_config(page_title="Nav Studios", page_icon="🎬", layout="wide")
     if st.session_state.pop("_reset_clip_inputs_pending", False):
         st.session_state["video_url_input"] = ""
         st.session_state["channel_name_input"] = ""
         st.session_state["video_upload_epoch"] = (
             int(st.session_state.get("video_upload_epoch", 0)) + 1
         )
-    st.title("AI Short-Form Video Generator")
 
-    quota_exhausted = is_youtube_quota_exhausted()
     try:
-        initial_pending = get_pending_outreach()
-    except Exception:
-        initial_pending = []
+        pending = get_pending_outreach()
+    except Exception as exc:
+        logging.exception("Could not load pending outreach")
+        st.error(f"Could not load the Outbox: {exc}")
+        pending = []
+    _render_header(pending)
 
-    if not initial_pending and quota_exhausted:
-        st.warning(
-            "Autonomous harvester paused due to YouTube quota; manual URL processing remains available",
-            icon="⚠️",
-        )
-
-    with st.sidebar:
-        settings = load_settings()
-        output_dir = render_output_dir()
-        storage_bytes = storage_usage_bytes(
-            settings.raw_dir,
-            settings.temp_dir,
-            settings.output_dir,
-            output_dir,
-        )
-        storage_status = st.empty()
-        storage_status.caption(f"Storage Used: {storage_bytes / (1024 * 1024):.1f} MB")
-        if st.button("Clear Temp & Render Cache", use_container_width=True):
-            try:
-                # Files the background worker is using right now are kept.
-                kept = purge_storage(settings.raw_dir, settings.temp_dir, keep_recent_minutes=20)
-                purge_storage(settings.output_dir, output_dir)
-            except OSError as exc:
-                logging.exception("Could not clear temporary and rendered storage")
-                st.error(f"Could not clear all temporary files or rendered clips: {exc}")
-            except ValueError as exc:
-                logging.exception("Refused unsafe storage cleanup")
-                st.error(f"Storage cleanup was refused: {exc}")
-            else:
-                st.session_state.pop("generated_clips", None)
-                st.session_state.pop("clip_paths", None)
-                st.session_state.pop("clip_render_contexts", None)
-                st.session_state.pop("clip_source_path", None)
-                st.session_state.pop("active_clip_run_id", None)
-                st.session_state.pop("ai_clip_selection_error", None)
-                st.session_state.pop("ai_outreach_email", None)
-                st.session_state.pop("ai_outreach_subject", None)
-                st.session_state.pop("outreach_email_body", None)
-                storage_status.caption("Storage cleared")
-                st.success(
-                    "Temporary files and rendered clips were cleared."
-                    + (f" {kept} item(s) the background worker is using were kept." if kept else "")
-                )
-
-    target_url = st.session_state.get("target_url")
-    if target_url:
-        st.session_state["app_tabs"] = "🎬 Clip Generator"
-        st.session_state["auto_process_video"] = True
-        st.session_state["auto_process_url"] = target_url
-        target_channel_name = st.session_state.pop("target_channel_name", "")
-        if target_channel_name:
-            st.session_state["channel_name_input"] = target_channel_name
-        st.session_state["_auto_process_title_override"] = st.session_state.pop(
-            "target_video_title",
-            "",
-        )
-        st.session_state.pop("target_url")
-
-    clip_tab, lead_tab, scout_tab, outbox_tab = st.tabs(
-        [
-            "🎬 Clip Generator",
-            "🎯 Creator Lead Finder",
-            "🧭 Autonomous Lead Scout",
-            "📬 Outbox / Approval",
-        ],
-        key="app_tabs",
-        on_change="rerun",
-    )
-
-    with clip_tab:
-        st.write("Turn a YouTube video into engaging, subtitled 9:16 clips.")
-        with st.form("clip_generator_form"):
-            video_url = st.text_input(
-                "YouTube URL",
-                placeholder="https://www.youtube.com/watch?v=...",
-                autocomplete="off",
-                key="video_url_input",
-            )
-            uploaded_video = st.file_uploader(
-                "Or upload a video file",
-                type=["mp4", "mov"],
-                key=f"video_upload_{st.session_state.get('video_upload_epoch', 0)}",
-            )
-            channel_name = st.text_input(
-                "Creator / channel name (optional)",
-                placeholder="Auto-detected for YouTube links",
-                key="channel_name_input",
-            )
-            clip_count = 3
-            st.caption("The AI agent selects and renders exactly three clips.")
-            if st.session_state.get("crop_mode") not in LAYOUT_LABELS:
-                st.session_state["crop_mode"] = next(iter(LAYOUT_LABELS))
-            layout_label = st.selectbox(
-                "Layout mode",
-                list(LAYOUT_LABELS),
-                index=0,
-                key="crop_mode",
-            )
-            generate_clicked = st.form_submit_button(
-                "Generate Vertical Clips",
-                type="primary",
-            )
-        auto_process = st.session_state.pop("auto_process_video", False)
-
-        if generate_clicked or auto_process:
-            try:
-                _delete_previous_source_video()
-            except OSError:
-                logging.warning("Could not delete the previous source video", exc_info=True)
-            for key in (
-                "generated_clips",
-                "clip_paths",
-                "active_clip_run_id",
-                "clip_render_contexts",
-                "clip_source_path",
-                "drive_folder_link",
-                "outreach_pitch",
-                "outreach_email_subject",
-                "outreach_email_body",
-                "outreach_video_title",
-                "outreach_channel_name",
-                "outreach_input_path",
-                "outreach_channel_override",
-                "outreach_title_override",
-                "ai_clip_selection_error",
-                "ai_outreach_email",
-                "ai_outreach_subject",
-                "agent_video_title",
-                "agent_channel_name",
-            ):
-                st.session_state.pop(key, None)
-            if auto_process:
-                input_value = st.session_state.pop("auto_process_url", "").strip()
-            elif bool(video_url.strip()) == (uploaded_video is not None):
-                st.error("Provide either a YouTube URL or upload one video file, not both.")
-                input_value = ""
-            elif uploaded_video is not None:
-                input_value = ""
-            else:
-                input_value = video_url.strip()
-
-            uploaded_input: Path | None = None
-            video_title_override = (
-                st.session_state.pop("_auto_process_title_override", "")
-                if auto_process
-                else ""
-            )
-            try:
-                if not auto_process and uploaded_video is not None:
-                    settings = load_settings()
-                    suffix = Path(uploaded_video.name).suffix.lower()
-                    if suffix not in {".mp4", ".mov"}:
-                        raise ValueError("Uploaded files must be MP4 or MOV.")
-                    settings.temp_dir.mkdir(parents=True, exist_ok=True)
-                    video_title_override = Path(uploaded_video.name).stem
-                    uploaded_input = (
-                        settings.temp_dir / f"upload_{uuid.uuid4().hex}{suffix}"
-                    )
-                    uploaded_input.write_bytes(uploaded_video.getbuffer())
-                    input_path: str | Path = uploaded_input
-                else:
-                    if not input_value.startswith(("http://", "https://")):
-                        raise ValueError(
-                            "Enter a YouTube URL starting with http:// or https://."
-                        )
-                    input_path = input_value
-
-                st.session_state["outreach_channel_override"] = channel_name
-                st.session_state["outreach_title_override"] = video_title_override
-                generated = _generate_clips(
-                    input_path,
-                    clip_count,
-                    LAYOUT_LABELS[layout_label],
-                )
-                st.session_state["generated_clips"] = generated
-                st.session_state["clip_paths"] = [
-                    str(item[0].expanduser().resolve()) for item in generated
-                ]
-                if generated:
-                    st.session_state["outreach_input_path"] = str(input_path)
-                    st.session_state["outreach_channel_override"] = channel_name
-                    st.session_state["outreach_title_override"] = video_title_override
-                if len(generated) == clip_count:
-                    st.success(
-                        "All clips ready! Saved to ~/Desktop/ShortFormClips/",
-                        icon="✅",
-                    )
-                elif generated:
-                    st.warning(
-                        f"Rendered {len(generated)} of {clip_count} clips. "
-                        "Successful clips are available below."
-                    )
-                else:
-                    st.warning("No clips could be rendered. Check the errors above.")
-            except Exception as exc:
-                logging.exception("Video generation failed")
-                st.session_state.pop("generated_clips", None)
-                st.error(f"Video generation failed: {exc}")
-            finally:
-                if uploaded_input is not None:
-                    uploaded_input.unlink(missing_ok=True)
-
-        generated_clips = st.session_state.get("generated_clips", [])
-        if generated_clips:
-            st.subheader("Your vertical clips")
-            columns = st.columns(2)
-            for index, (clip_path, clip) in enumerate(generated_clips):
-                with columns[index % len(columns)]:
-                    st.markdown(f"**{clip.viral_title or f'Clip {index + 1}'}**")
-                    st.caption(
-                        f"Selected timestamps: {clip.start_time:.1f}s–"
-                        f"{clip.end_time:.1f}s"
-                    )
-                    clip_path = Path(clip_path).expanduser().resolve()
-                    clip_path.parent.mkdir(parents=True, exist_ok=True)
-                    if clip_path.is_file() and clip_path.stat().st_size > 0:
-                        st.video(str(clip_path))
-                    else:
-                        st.warning(
-                            f"Clip file not found: {clip_path.name}. "
-                            "Re-render may be required."
-                        )
-                    with st.expander("✂️ Adjust Clip Boundaries"):
-                        with st.form(key=f"trim_form_{clip_path.stem}"):
-                            start_shift = st.slider(
-                                "Adjust Start (seconds)",
-                                min_value=-15.0,
-                                max_value=15.0,
-                                value=0.0,
-                                step=0.5,
-                                key=f"start_shift_{index}_{clip_path.stem}",
-                            )
-                            end_shift = st.slider(
-                                "Adjust End (seconds)",
-                                min_value=-15.0,
-                                max_value=15.0,
-                                value=0.0,
-                                step=0.5,
-                                key=f"end_shift_{index}_{clip_path.stem}",
-                            )
-                            rerender_clicked = st.form_submit_button(
-                                "🔄 Apply Trim & Re-render",
-                                use_container_width=True,
-                            )
-                        if rerender_clicked:
-                            contexts = st.session_state.get(
-                                "clip_render_contexts", {}
-                            )
-                            context = contexts.get(str(clip_path))
-                            if context is None:
-                                st.error(
-                                    "Cached source/transcript data for this clip is "
-                                    "unavailable. Generate clips again before adjusting."
-                                )
-                            else:
-                                original_start = float(context["start_time"])
-                                original_end = float(context["end_time"])
-                                cached_crop = context.get("crop")
-                                if not isinstance(cached_crop, CropBox):
-                                    st.error(
-                                        "Cached crop framing for this clip is unavailable. "
-                                        "Generate clips again before adjusting."
-                                    )
-                                    continue
-                                adjusted_start = max(0.0, original_start + start_shift)
-                                adjusted_end = original_end + end_shift
-                                replacement_path = rerender_output_path(clip_path)
-                                try:
-                                    updated_path = rerender_clip(
-                                        source_path=str(context["source_path"]),
-                                        new_start=adjusted_start,
-                                        new_end=adjusted_end,
-                                        transcript_words=context["words"],
-                                        output_path=replacement_path,
-                                        cached_crop_x=cached_crop.x,
-                                        cached_crop=cached_crop,
-                                        layout_mode=str(context["layout_mode"]),
-                                        source_duration=float(context["source_duration"]),
-                                        crop_plan=context.get("crop_plan"),
-                                        hook_title=clip.viral_title,
-                                        hook_seconds=settings.hook_title_seconds,
-                                        highlight_active_word=settings.caption_highlight,
-                                    )
-                                except Exception as exc:
-                                    logging.exception(
-                                        "Could not re-render clip %d", index + 1
-                                    )
-                                    st.error(f"Could not re-render this clip: {exc}")
-                                else:
-                                    updated_clip = clip.model_copy(
-                                        update={
-                                            "start_time": adjusted_start,
-                                            "end_time": adjusted_end,
-                                        }
-                                    )
-                                    updated_clips = list(generated_clips)
-                                    updated_clips[index] = (updated_path, updated_clip)
-                                    st.session_state["generated_clips"] = updated_clips
-                                    updated_clip_paths = list(
-                                        st.session_state.get("clip_paths", [])
-                                    )
-                                    if len(updated_clip_paths) != len(updated_clips):
-                                        updated_clip_paths = [
-                                            str(item[0].resolve())
-                                            for item in updated_clips
-                                        ]
-                                    updated_clip_paths[index] = str(
-                                        updated_path.expanduser().resolve()
-                                    )
-                                    st.session_state["clip_paths"] = updated_clip_paths
-                                    contexts.pop(str(clip_path), None)
-                                    contexts[str(updated_path)] = {
-                                        **context,
-                                        "start_time": adjusted_start,
-                                        "end_time": adjusted_end,
-                                    }
-                                    st.session_state["clip_render_contexts"] = contexts
-                                    clip_path.unlink(missing_ok=True)
-                                    st.rerun()
-                    st.markdown(
-                        "**Why this moment works**"
-                        if not st.session_state.get("ai_clip_selection_error")
-                        else "**Post caption**"
-                    )
-                    st.code(clip.caption, language=None)
-                    if clip.hashtags:
-                        st.markdown(" ".join(f"#{tag.lstrip('#')}" for tag in clip.hashtags))
-                    if clip_path.is_file() and clip_path.stat().st_size > 0:
-                        # Read the file only when the button is clicked, not on
-                        # every rerun of the page.
-                        st.download_button(
-                            "Download clip",
-                            data=functools.partial(clip_path.read_bytes),
-                            file_name=clip_path.name,
-                            mime="video/mp4",
-                            key=f"download_{clip_path.name}",
-                            on_click="ignore",
-                        )
-
-            if st.session_state.get("drive_folder_link"):
-                st.info(
-                    "The clips are uploaded to Google Drive. Discarding here removes "
-                    "only the local clips; it does not delete the Drive folder."
-                )
-            else:
-                st.write("Review the clips above, then choose what to do next.")
-            st.caption(
-                "This page doesn't track pitches. Discard / Reset only clears these clips. "
-                "Creators the worker found are sent and tracked in 📬 Outbox / Approval (✅ Mark as Sent)."
-            )
-
-            approve_column, discard_column = st.columns(2)
-            with approve_column:
-                approve_upload = st.button(
-                    "✅ Approve & Upload to Google Drive",
-                    disabled=bool(st.session_state.get("drive_folder_link")),
-                    use_container_width=True,
-                )
-            with discard_column:
-                discard_clips = st.button(
-                    "🗑️ Discard / Reset",
-                    use_container_width=True,
-                )
-
-            if discard_clips:
-                try:
-                    _discard_generated_clips()
-                except (OSError, ValueError) as exc:
-                    logging.exception("Could not discard generated clips")
-                    st.error(f"Could not discard the clips: {exc}")
-                else:
-                    st.success("The current clips were discarded.")
-                    st.rerun()
-
-            if approve_upload:
-                try:
-                    video_title = st.session_state["agent_video_title"]
-                    resolved_channel_name = st.session_state["agent_channel_name"]
-                    drive_link = upload_clips_to_drive(
-                        resolved_channel_name,
-                        video_title,
-                        [str(item[0]) for item in generated_clips],
-                    )
-                except Exception as exc:
-                    logging.exception("Google Drive clip upload failed")
-                    st.error(f"Could not upload clips to Google Drive: {exc}")
-                else:
-                    st.session_state["outreach_video_title"] = video_title
-                    st.session_state["outreach_channel_name"] = resolved_channel_name
-                    st.session_state["drive_folder_link"] = drive_link
-                    ai_email = st.session_state.get("ai_outreach_email", "")
-                    if ai_email:
-                        completed_email = fill_drive_link(ai_email, drive_link)
-                        st.session_state["ai_outreach_email"] = completed_email
-                        st.session_state["outreach_email_body"] = completed_email
-                    else:
-                        try:
-                            pitch = _generate_outreach_pitch(
-                                video_title,
-                                drive_link,
-                                len(generated_clips),
-                                resolved_channel_name,
-                            )
-                        except Exception as exc:
-                            logging.exception("Fallback outreach email generation failed")
-                            st.warning(
-                                "Your clips were uploaded, but the fallback outreach "
-                                f"email could not be generated: {exc}"
-                            )
-                        else:
-                            st.session_state["outreach_pitch"] = {
-                                "subject": pitch.subject,
-                                "body": pitch.body,
-                            }
-                            st.session_state["outreach_email_subject"] = pitch.subject
-                            st.session_state["outreach_email_body"] = pitch.body
-
-            drive_folder_link = st.session_state.get("drive_folder_link")
-            if drive_folder_link:
-                st.link_button(
-                    "📁 Open Client Google Drive Folder",
-                    drive_folder_link,
-                )
-
-            pitch_data = st.session_state.get("outreach_pitch")
-            ai_email = st.session_state.get("ai_outreach_email")
-            if ai_email or pitch_data:
-                with st.expander(
-                    "📬 AI Creator Outreach Email Draft",
-                    expanded=True,
-                ):
-                    if st.session_state.get("outreach_email_subject"):
-                        st.text_input(
-                            "Subject",
-                            key="outreach_email_subject",
-                        )
-                    st.text_area(
-                        "Email body",
-                        height=320,
-                        key="outreach_email_body",
-                    )
-                    _render_copy_email_button(
-                        st.session_state.get("outreach_email_body", "")
-                    )
-                    if not st.session_state.get("drive_folder_link"):
-                        st.caption(
-                            "The Drive link will be inserted after you approve and "
-                            "upload the clips."
-                        )
-
-    with lead_tab:
-        st.write("Review creators discovered for short-form video repurposing.")
-        quota_exhausted = is_youtube_quota_exhausted()
-        try:
-            background_pending = get_pending_outreach()
-        except Exception as exc:
-            logging.exception("Could not load background worker leads")
-            st.error(f"Could not load background worker leads: {exc}")
-            background_pending = []
-
-        cached_leads = _active_cached_leads()
-        all_leads = background_pending or cached_leads
-
-        if not background_pending and quota_exhausted:
-            st.warning(
-                "Autonomous harvester paused due to YouTube quota; manual URL processing remains available"
-            )
-
-        if all_leads:
-            st.subheader("Discovered creator leads")
-            for index, lead in enumerate(background_pending):
-                with st.container(border=True):
-                    channel_title = lead.get("channel_title") or "Unknown channel"
-                    channel_id = lead.get("channel_id", index)
-                    channel_url = lead.get("channel_url") or f"https://www.youtube.com/channel/{channel_id}"
-                    st.markdown(f"### [{channel_title}]({channel_url})")
-                    contact_info = lead.get("contact_email") or lead.get("contact_info")
-                    if contact_info:
-                        if str(contact_info).startswith(("http://", "https://")):
-                            st.markdown(f"Contact: [Channel About]({contact_info})")
-                        elif "@" in str(contact_info):
-                            st.markdown(f"Contact: [{contact_info}](mailto:{contact_info})")
-                        else:
-                            st.write(f"Contact: **{contact_info}**")
-                    target_vid = lead.get("target_video_id")
-                    if target_vid:
-                        video_url = f"https://www.youtube.com/watch?v={target_vid}"
-                        st.markdown(f"Target video: [{video_url}]({video_url})")
-                    else:
-                        video_url = lead.get("latest_video_url") or ""
-                        video_title = lead.get("latest_video_title") or "Recent video"
-                        if video_url:
-                            st.markdown(f"Target video: [{video_title}]({video_url})")
-                    drive_link = lead.get("drive_link")
-                    if drive_link:
-                        st.link_button("Open Google Drive clips", drive_link)
-                    st.caption(
-                        "Pitch is ready: review and copy it in 📬 Outbox / Approval, send it from Gmail, "
-                        "then click ✅ Mark as Sent there."
-                    )
-                    col_proc, col_skip = st.columns([1, 1])
-                    with col_proc:
-                        if video_url and st.button(
-                            "Process & Generate 3 Clips",
-                            key=f"process_pending_lead_{channel_id}_{index}",
-                            use_container_width=True,
-                        ):
-                            st.session_state["target_url"] = video_url
-                            st.session_state["target_channel_name"] = channel_title
-                            st.session_state["target_video_title"] = lead.get("latest_video_title", "")
-                            st.rerun()
-                    with col_skip:
-                        _render_pass_menu(str(channel_id), f"skip_lead_tab_{channel_id}_{index}")
-
-            for index, r in enumerate(cached_leads):
-                if any(p.get("channel_id") == r.get("channel_id") for p in background_pending):
-                    continue
-                with st.container(border=True):
-                    channel_title = r.get("channel_title") or r.get("channel_id", "Creator")
-                    channel_id = r.get("channel_id", index)
-                    channel_url = f"https://www.youtube.com/channel/{channel_id}"
-                    st.markdown(f"**[{channel_title}]({channel_url})**")
-                    vid_id = r.get("video_id")
-                    if vid_id:
-                        vid_url = f"https://www.youtube.com/watch?v={vid_id}"
-                        st.markdown(f"Latest video: [{vid_url}]({vid_url})")
-                        if st.button(
-                            "Process & Generate 3 Clips",
-                            key=f"process_cached_lead_{channel_id}_{index}",
-                        ):
-                            st.session_state["target_url"] = vid_url
-                            st.session_state["target_channel_name"] = channel_title
-                            st.rerun()
-                    st.caption(f"Status: {r.get('status', 'recorded')}")
-        else:
-            if not quota_exhausted:
-                st.info(
-                    "No leads remaining in queue. Background worker will scavenge new creators shortly."
-                )
-
-        st.info(
-            "💡 **Autonomous Discovery**: Channel discovery is managed exclusively by the autonomous background worker. "
-            "Run `python autonomous_worker.py --continuous-queue` in a terminal to scout creators without blocking the UI."
-        )
-
-    with scout_tab:
-        st.write(
-            "Autonomous scout status and background harvesting controls."
-        )
-        quota_exhausted = is_youtube_quota_exhausted()
-        try:
-            pending_outreach = get_pending_outreach()
-        except Exception:
-            pending_outreach = []
-
-        if not pending_outreach and quota_exhausted:
-            st.warning(
-                "Autonomous harvester paused due to YouTube quota; manual URL processing remains available"
-            )
-        elif quota_exhausted:
-            st.warning(
-                "YouTube API quota limit reached. Harvester is on cooldown. "
-                "Existing pending leads remain available for review and manual URL processing is fully operational."
-            )
-
-        _render_worker_status()
-        _render_lead_queue()
-
-        with st.container(border=True):
-            st.subheader("Autonomous Worker Architecture")
-            st.markdown(
-                "To eliminate runtime blocking and preserve YouTube API quota, channel discovery runs "
-                "decoupled as a standalone background worker process:\n\n"
-                "```bash\n"
-                "python autonomous_worker.py --continuous-queue\n"
-                "```\n\n"
-                "The worker queries YouTube, screens channels with repurposing deficits, renders clips, "
-                "uploads to Google Drive, and queues pitches directly into **📬 Outbox / Approval**."
-            )
-            lead_records = _latest_lead_records()
-            finished_count = sum(_is_finished(record) for record in lead_records)
-            st.caption(
-                f"Active leads: {len(lead_records) - finished_count} | "
-                f"Finished (hidden): {finished_count} | "
-                f"Pending in outbox: {len(pending_outreach)}"
-            )
-
+    outbox_tab, sent_tab, pipeline_tab, clips_tab, system_tab = st.tabs(TAB_LABELS)
     with outbox_tab:
-        if st.session_state.pop("outreach_marked_sent", False):
-            st.success("Marked as sent. It's under 'Sent: waiting for a reply' below, and the worker will fill the free spot.")
-        if st.session_state.pop("lead_skipped", False):
-            st.info("Passed. If you actually sent it, use 'Passed recently' at the bottom to move it to Sent.")
-        st.markdown(
-            "**For each pitch:** set the first name → review the email → **Copy email** → paste into "
-            "Gmail and send → **✅ Mark as Sent**. Not pitching someone? **❌ Pass**. "
-            "Either way the worker fills the free spot with the next creator."
-        )
-        _render_worker_status()
-        try:
-            pending_outreach = get_pending_outreach()
-        except Exception as exc:
-            logging.exception("Could not load pending outreach")
-            st.error(f"Could not load pending outreach: {exc}")
-            pending_outreach = []
-
-        quota_exhausted = is_youtube_quota_exhausted()
-        if not pending_outreach:
-            if quota_exhausted:
-                st.warning(
-                    "Autonomous harvester paused due to YouTube quota; manual URL processing remains available"
-                )
-            else:
-                st.info(
-                    "No leads remaining in queue. Background worker will scavenge new creators shortly."
-                )
-        for record in pending_outreach:
-            record_id = str(record["record_id"])
-            channel_id = str(record.get("channel_id") or record_id)
-            channel_title = str(record.get("channel_title") or "Unknown creator")
-            with st.container(border=True):
-                st.subheader(channel_title)
-                st.write(f"Contact: {record.get('contact_email') or 'Check About page'}")
-                drive_link = str(record.get("drive_link") or "")
-                if drive_link:
-                    st.link_button("Open Google Drive clips", drive_link)
-                subject_key = f"pending_subject_{record_id}"
-                body_key = f"pending_pitch_{record_id}"
-                name_key = f"pending_name_{record_id}"
-                email_body = str(record.get("full_email_body") or "")
-                # Widgets start from the saved draft; edits are saved as you make them.
-                st.session_state.setdefault(subject_key, str(record.get("subject") or SUBJECT))
-                st.session_state.setdefault(body_key, email_body)
-                st.session_state.setdefault(
-                    name_key, str(record.get("greeting_name") or greeting_name_of(email_body))
-                )
-                st.text_input(
-                    "First name for the greeting",
-                    key=name_key,
-                    on_change=_on_greeting_change,
-                    args=(record_id, name_key, body_key),
-                    help="Who you're writing to, e.g. Marcela. Updates the 'Hi ___,' line.",
-                )
-                st.text_input(
-                    "Subject",
-                    key=subject_key,
-                    on_change=_on_draft_edit,
-                    args=(record_id, subject_key, "subject"),
-                )
-                st.text_area(
-                    "Barry Navan outreach pitch",
-                    height=320,
-                    key=body_key,
-                    on_change=_on_draft_edit,
-                    args=(record_id, body_key, "body"),
-                )
-                _render_copy_email_button(st.session_state[body_key])
-                col_send, col_skip = st.columns([1, 1])
-                with col_send:
-                    if st.button(
-                        "✅ Mark as Sent",
-                        type="primary",
-                        key=f"mark_sent_{record_id}",
-                        use_container_width=True,
-                        help="Click after you've sent it from Gmail. It moves to 'Sent: waiting for a reply'.",
-                    ):
-                        try:
-                            marked = mark_outreach_sent(
-                                record_id,
-                                subject=st.session_state.get(subject_key),
-                                body=st.session_state.get(body_key),
-                            )
-                        except Exception as exc:
-                            logging.exception("Could not mark outreach as sent")
-                            st.error(f"Could not update this pitch: {exc}")
-                        else:
-                            if marked:
-                                st.session_state["outreach_marked_sent"] = True
-                                st.rerun()
-                            else:
-                                st.warning(
-                                    "This pitch is no longer pending. Refresh the outbox."
-                                )
-                with col_skip:
-                    _render_pass_menu(channel_id, f"skip_lead_{record_id}")
-
+        _render_outbox(pending)
+    with sent_tab:
         _render_sent_pitches()
         _render_recently_passed()
+    with pipeline_tab:
+        _render_pipeline(pending)
+    with clips_tab:
+        _render_clip_generator()
+    with system_tab:
+        _render_system()
+
+
+# --- Header: worker status and the four numbers that matter -------------------------
+def _render_header(pending: list[dict[str, Any]]) -> None:
+    st.title("Nav Studios")
+    _render_worker_status()
+    if is_youtube_quota_exhausted():
+        st.warning(
+            "YouTube's daily search quota is used up, so the worker isn't finding new creators "
+            "right now. Pitches already in the Outbox and the queue are unaffected.",
+            icon="⚠️",
+        )
+    try:
+        waiting = get_awaiting_reply()
+        queue = get_lead_queue()
+        passed = pass_summary()
+    except Exception:
+        logging.exception("Could not load the status numbers")
+        waiting, queue, passed = [], [], {}
+    due = sum(1 for record in waiting if record.get("follow_up_due"))
+    you_passed = sum(count for code, count in passed.items() if code in PASS_REASONS)
+    outbox, sent, up_next, passes = st.columns(4)
+    outbox.metric(
+        "Ready to send", f"{len(pending)} / {MAX_PENDING_LEADS}", border=True,
+        help="Pitches in the Outbox. The worker stops making new ones when it's full.",
+    )
+    sent.metric(
+        "Waiting for a reply", len(waiting), border=True,
+        delta=f"{due} follow-up{'s' if due != 1 else ''} due" if due else None,
+        delta_color="off", delta_arrow="off",
+    )
+    up_next.metric("Up next", len(queue), border=True, help="Creators the worker will make clips for next.")
+    passes.metric("Passed (14 days)", you_passed, border=True, help="Reasons are in the 📨 Sent tab.")
+
+
+# --- 📬 Outbox: review and send ---------------------------------------------------------
+def _render_outbox(pending: list[dict[str, Any]]) -> None:
+    if st.session_state.pop("outreach_marked_sent", False):
+        st.success("Marked as sent. It's in the 📨 Sent tab, and the worker will fill the free spot.")
+    if st.session_state.pop("lead_skipped", False):
+        st.info("Passed. If you actually sent it, use 'Passed recently' in the 📨 Sent tab.")
+    if not pending:
+        st.info("Nothing to send right now. New pitches appear here as the worker makes them.")
+        return
+    st.caption(
+        "For each pitch: check the name and email → **Copy email** → send it from Gmail → "
+        "**✅ Mark as Sent**. Not pitching someone? **❌ Pass** and pick why."
+    )
+    for record in pending:
+        _render_pitch_card(record)
+
+
+def _render_pitch_card(record: dict[str, Any]) -> None:
+    record_id = str(record["record_id"])
+    channel_id = str(record.get("channel_id") or record_id)
+    channel_title = str(record.get("channel_title") or "Unknown creator")
+    with st.container(border=True):
+        heading, links = st.columns([3, 2], vertical_alignment="center")
+        with heading:
+            st.subheader(channel_title)
+            _render_pitch_badges(record)
+        with links:
+            _render_contact(record)
+            drive_link = str(record.get("drive_link") or "")
+            if drive_link:
+                st.link_button("📁 Open the clips (Drive)", drive_link, use_container_width=True)
+
+        subject_key = f"pending_subject_{record_id}"
+        body_key = f"pending_pitch_{record_id}"
+        name_key = f"pending_name_{record_id}"
+        email_body = str(record.get("full_email_body") or "")
+        # Widgets start from the saved draft; edits are saved as you make them.
+        st.session_state.setdefault(subject_key, str(record.get("subject") or SUBJECT))
+        st.session_state.setdefault(body_key, email_body)
+        st.session_state.setdefault(
+            name_key, str(record.get("greeting_name") or greeting_name_of(email_body))
+        )
+        name_column, subject_column = st.columns([1, 2])
+        with name_column:
+            st.text_input(
+                "First name",
+                key=name_key,
+                on_change=_on_greeting_change,
+                args=(record_id, name_key, body_key),
+                help="Who you're writing to, e.g. Marcela. Updates the 'Hi ___,' line.",
+            )
+        with subject_column:
+            st.text_input(
+                "Subject",
+                key=subject_key,
+                on_change=_on_draft_edit,
+                args=(record_id, subject_key, "subject"),
+            )
+        st.text_area(
+            "Email",
+            height=300,
+            key=body_key,
+            on_change=_on_draft_edit,
+            args=(record_id, body_key, "body"),
+        )
+        copy_column, send_column, pass_column = st.columns(3, vertical_alignment="center")
+        with copy_column:
+            _render_copy_email_button(st.session_state[body_key])
+        with send_column:
+            if st.button(
+                "✅ Mark as Sent",
+                type="primary",
+                key=f"mark_sent_{record_id}",
+                use_container_width=True,
+                help="Click after you've sent it from Gmail. It moves to the 📨 Sent tab.",
+            ):
+                try:
+                    marked = mark_outreach_sent(
+                        record_id,
+                        subject=st.session_state.get(subject_key),
+                        body=st.session_state.get(body_key),
+                    )
+                except Exception as exc:
+                    logging.exception("Could not mark outreach as sent")
+                    st.error(f"Could not update this pitch: {exc}")
+                else:
+                    if marked:
+                        st.session_state["outreach_marked_sent"] = True
+                        st.rerun()
+                    else:
+                        st.warning("This pitch is no longer pending. Refresh the page.")
+        with pass_column:
+            _render_pass_menu(channel_id, f"skip_lead_{record_id}")
+
+
+def _render_pitch_badges(record: dict[str, Any]) -> None:
+    """Clip count, the AI's clip scores, framing, channel size, video length."""
+    clips = [clip for clip in record.get("clips") or [] if isinstance(clip, dict)]
+    badges: list[tuple[str, str]] = []
+    if clips:
+        badges.append((f"{len(clips)} clip{'s' if len(clips) != 1 else ''}", "blue"))
+        scores = [clip.get("judge") for clip in clips if isinstance(clip.get("judge"), (int, float))]
+        if scores:
+            badges.append((
+                "AI scores " + " · ".join(str(int(score)) for score in scores),
+                "green" if min(scores) >= 70 else "orange",
+            ))
+        layouts = sorted({LAYOUT_NAMES.get(str(clip.get("layout")), str(clip.get("layout"))) for clip in clips if clip.get("layout")})
+        if layouts:
+            badges.append((", ".join(layouts), "gray"))
+    subscribers = record.get("subscriber_count")
+    if isinstance(subscribers, int):
+        badges.append((f"{subscribers:,} subs", "gray"))
+    seconds = record.get("video_seconds")
+    if isinstance(seconds, (int, float)) and seconds > 0:
+        badges.append((f"{int(seconds) // 60} min video", "gray"))
+    if badges:
+        # Streamlit's inline badge syntax: one row, no layout columns.
+        st.markdown(" ".join(f":{color}-badge[{label.replace(']', ')')}]" for label, color in badges))
+
+
+def _render_contact(record: dict[str, Any]) -> None:
+    contact = str(record.get("contact_email") or "")
+    if "@" in contact and not contact.startswith(("http://", "https://")):
+        st.markdown(f"✉️ [{contact}](mailto:{contact})")
+    elif contact.startswith(("http://", "https://")):
+        st.markdown(f"No email found: check their [About page]({contact})")
+    else:
+        st.caption("No email found: check their YouTube About page")
+
+
+# --- 🧭 Pipeline: what the worker does next ---------------------------------------------
+def _render_pipeline(pending: list[dict[str, Any]]) -> None:
+    _render_lead_queue()
+    pending_ids = {record.get("channel_id") for record in pending}
+    unfinished = [record for record in _active_cached_leads() if record.get("channel_id") not in pending_ids]
+    lead_records = _latest_lead_records()
+    finished_count = sum(_is_finished(record) for record in lead_records)
+    if unfinished:
+        with st.expander(f"Unfinished leads ({len(unfinished)}): failed or still being retried"):
+            for record in unfinished:
+                channel_id = record.get("channel_id", "")
+                title = record.get("channel_title") or channel_id or "Creator"
+                st.markdown(f"**[{title}](https://www.youtube.com/channel/{channel_id})**")
+                st.caption(f"Status: {record.get('status', 'recorded')}")
+    st.caption(
+        f"Active leads: {len(lead_records) - finished_count} | "
+        f"Finished (hidden): {finished_count} | "
+        f"Pending in outbox: {len(pending)}"
+    )
+
+
+# --- 🎬 Make clips: any video, by hand ---------------------------------------------------
+def _render_clip_generator() -> None:
+    st.caption(
+        "Make clips from any YouTube link or video file, outside the worker. Nothing here is "
+        "tracked as a pitch: the worker's pitches are in the 📬 Outbox."
+    )
+    with st.form("clip_generator_form"):
+        video_url = st.text_input(
+            "YouTube link",
+            placeholder="https://www.youtube.com/watch?v=...",
+            autocomplete="off",
+            key="video_url_input",
+        )
+        uploaded_video = st.file_uploader(
+            "Or upload a video file",
+            type=["mp4", "mov"],
+            key=f"video_upload_{st.session_state.get('video_upload_epoch', 0)}",
+        )
+        channel_name = st.text_input(
+            "Creator / channel name (optional)",
+            placeholder="Found automatically for YouTube links",
+            key="channel_name_input",
+        )
+        if st.session_state.get("crop_mode") not in LAYOUT_LABELS:
+            st.session_state["crop_mode"] = next(iter(LAYOUT_LABELS))
+        with st.expander("Framing (optional)"):
+            layout_label = st.selectbox("Layout", list(LAYOUT_LABELS), key="crop_mode")
+        generate_clicked = st.form_submit_button("Make 3 vertical clips", type="primary")
+
+    if generate_clicked:
+        _make_clips(video_url, uploaded_video, channel_name, layout_label)
+    _render_generated_clips()
+
+
+def _make_clips(video_url: str, uploaded_video: Any, channel_name: str, layout_label: str) -> None:
+    clip_count = 3
+    try:
+        _delete_previous_source_video()
+    except OSError:
+        logging.warning("Could not delete the previous source video", exc_info=True)
+    for key in (
+        "generated_clips",
+        "clip_paths",
+        "active_clip_run_id",
+        "clip_render_contexts",
+        "clip_source_path",
+        "drive_folder_link",
+        "outreach_pitch",
+        "outreach_email_subject",
+        "outreach_email_body",
+        "outreach_video_title",
+        "outreach_channel_name",
+        "outreach_input_path",
+        "outreach_channel_override",
+        "outreach_title_override",
+        "ai_clip_selection_error",
+        "ai_outreach_email",
+        "ai_outreach_subject",
+        "agent_video_title",
+        "agent_channel_name",
+    ):
+        st.session_state.pop(key, None)
+    if bool(video_url.strip()) == (uploaded_video is not None):
+        st.error("Give either a YouTube link or one video file, not both.")
+        return
+
+    uploaded_input: Path | None = None
+    video_title_override = ""
+    try:
+        if uploaded_video is not None:
+            settings = load_settings()
+            suffix = Path(uploaded_video.name).suffix.lower()
+            if suffix not in {".mp4", ".mov"}:
+                raise ValueError("Uploaded files must be MP4 or MOV.")
+            settings.temp_dir.mkdir(parents=True, exist_ok=True)
+            video_title_override = Path(uploaded_video.name).stem
+            uploaded_input = settings.temp_dir / f"upload_{uuid.uuid4().hex}{suffix}"
+            uploaded_input.write_bytes(uploaded_video.getbuffer())
+            input_path: str | Path = uploaded_input
+        else:
+            input_value = video_url.strip()
+            if not input_value.startswith(("http://", "https://")):
+                raise ValueError("Enter a YouTube link starting with http:// or https://.")
+            input_path = input_value
+
+        st.session_state["outreach_channel_override"] = channel_name
+        st.session_state["outreach_title_override"] = video_title_override
+        generated = _generate_clips(input_path, clip_count, LAYOUT_LABELS[layout_label])
+        st.session_state["generated_clips"] = generated
+        st.session_state["clip_paths"] = [str(item[0].expanduser().resolve()) for item in generated]
+        if generated:
+            st.session_state["outreach_input_path"] = str(input_path)
+        if len(generated) == clip_count:
+            st.success(f"All clips ready. Saved to {render_output_dir()}", icon="✅")
+        elif generated:
+            st.warning(f"Rendered {len(generated)} of {clip_count} clips. The ones that worked are below.")
+        else:
+            st.warning("No clips could be rendered. Check the errors above.")
+    except Exception as exc:
+        logging.exception("Video generation failed")
+        st.session_state.pop("generated_clips", None)
+        st.error(f"Making the clips failed: {exc}")
+    finally:
+        if uploaded_input is not None:
+            uploaded_input.unlink(missing_ok=True)
+
+
+def _clock(seconds: float) -> str:
+    total = max(0, int(seconds))
+    return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}" if total >= 3600 else f"{total // 60}:{total % 60:02d}"
+
+
+def _render_generated_clips() -> None:
+    generated_clips = st.session_state.get("generated_clips", [])
+    if not generated_clips:
+        return
+    settings = load_settings()
+    st.subheader("Your vertical clips")
+    columns = st.columns(len(generated_clips))
+    for index, (clip_path, clip) in enumerate(generated_clips):
+        with columns[index]:
+            st.markdown(f"**{clip.viral_title or f'Clip {index + 1}'}**")
+            st.caption(f"{_clock(clip.start_time)}–{_clock(clip.end_time)} in the video")
+            clip_path = Path(clip_path).expanduser().resolve()
+            if clip_path.is_file() and clip_path.stat().st_size > 0:
+                st.video(str(clip_path))
+                # Read the file only when the button is clicked, not on every rerun.
+                st.download_button(
+                    "Download clip",
+                    data=functools.partial(clip_path.read_bytes),
+                    file_name=clip_path.name,
+                    mime="video/mp4",
+                    key=f"download_{clip_path.name}",
+                    on_click="ignore",
+                    use_container_width=True,
+                )
+            else:
+                st.warning(f"Clip file not found: {clip_path.name}. Make the clips again.")
+            if clip.caption:
+                with st.expander("Why this moment"):
+                    st.write(clip.caption)
+                    if clip.hashtags:
+                        st.markdown(" ".join(f"#{tag.lstrip('#')}" for tag in clip.hashtags))
+            _render_trim_form(index, clip_path, clip, generated_clips, settings)
+
+    if st.session_state.get("drive_folder_link"):
+        st.info("These clips are in Google Drive. Discarding only removes the copies on this Mac.")
+    approve_column, discard_column = st.columns(2)
+    with approve_column:
+        approve_upload = st.button(
+            "✅ Upload to Google Drive",
+            disabled=bool(st.session_state.get("drive_folder_link")),
+            use_container_width=True,
+        )
+    with discard_column:
+        discard_clips = st.button("🗑️ Discard these clips", use_container_width=True)
+
+    if discard_clips:
+        try:
+            _discard_generated_clips()
+        except (OSError, ValueError) as exc:
+            logging.exception("Could not discard generated clips")
+            st.error(f"Could not discard the clips: {exc}")
+        else:
+            st.success("The clips were discarded.")
+            st.rerun()
+
+    if approve_upload:
+        _upload_generated_clips(generated_clips)
+
+    drive_folder_link = st.session_state.get("drive_folder_link")
+    if drive_folder_link:
+        st.link_button("📁 Open the Google Drive folder", drive_folder_link)
+
+    if st.session_state.get("ai_outreach_email") or st.session_state.get("outreach_pitch"):
+        with st.expander("Email draft for this creator", expanded=bool(drive_folder_link)):
+            if st.session_state.get("outreach_email_subject"):
+                st.text_input("Subject", key="outreach_email_subject")
+            st.text_area("Email", height=300, key="outreach_email_body")
+            _render_copy_email_button(st.session_state.get("outreach_email_body", ""))
+            if not drive_folder_link:
+                st.caption("The Drive link is added after you upload the clips.")
+
+
+def _render_trim_form(
+    index: int,
+    clip_path: Path,
+    clip: ClipResult,
+    generated_clips: list[tuple[Path, ClipResult]],
+    settings: Any,
+) -> None:
+    with st.expander("✂️ Trim"):
+        with st.form(key=f"trim_form_{clip_path.stem}"):
+            start_shift = st.slider(
+                "Move the start (seconds)", min_value=-15.0, max_value=15.0, value=0.0, step=0.5,
+                key=f"start_shift_{index}_{clip_path.stem}",
+            )
+            end_shift = st.slider(
+                "Move the end (seconds)", min_value=-15.0, max_value=15.0, value=0.0, step=0.5,
+                key=f"end_shift_{index}_{clip_path.stem}",
+            )
+            rerender_clicked = st.form_submit_button("🔄 Apply Trim & Re-render", use_container_width=True)
+    if not rerender_clicked:
+        return
+    contexts = st.session_state.get("clip_render_contexts", {})
+    context = contexts.get(str(clip_path))
+    cached_crop = context.get("crop") if context else None
+    if context is None or not isinstance(cached_crop, CropBox):
+        st.error("This clip's saved framing is gone. Make the clips again before trimming.")
+        return
+    adjusted_start = max(0.0, float(context["start_time"]) + start_shift)
+    adjusted_end = float(context["end_time"]) + end_shift
+    replacement_path = rerender_output_path(clip_path)
+    try:
+        updated_path = rerender_clip(
+            source_path=str(context["source_path"]),
+            new_start=adjusted_start,
+            new_end=adjusted_end,
+            transcript_words=context["words"],
+            output_path=replacement_path,
+            cached_crop_x=cached_crop.x,
+            cached_crop=cached_crop,
+            layout_mode=str(context["layout_mode"]),
+            source_duration=float(context["source_duration"]),
+            crop_plan=context.get("crop_plan"),
+            hook_title=clip.viral_title,
+            hook_seconds=settings.hook_title_seconds,
+            highlight_active_word=settings.caption_highlight,
+        )
+    except Exception as exc:
+        logging.exception("Could not re-render clip %d", index + 1)
+        st.error(f"Could not re-render this clip: {exc}")
+        return
+    updated_clip = clip.model_copy(update={"start_time": adjusted_start, "end_time": adjusted_end})
+    updated_clips = list(generated_clips)
+    updated_clips[index] = (updated_path, updated_clip)
+    st.session_state["generated_clips"] = updated_clips
+    st.session_state["clip_paths"] = [str(Path(item[0]).expanduser().resolve()) for item in updated_clips]
+    contexts.pop(str(clip_path), None)
+    contexts[str(updated_path)] = {**context, "start_time": adjusted_start, "end_time": adjusted_end}
+    st.session_state["clip_render_contexts"] = contexts
+    clip_path.unlink(missing_ok=True)
+    st.rerun()
+
+
+def _upload_generated_clips(generated_clips: list[tuple[Path, ClipResult]]) -> None:
+    try:
+        video_title = st.session_state["agent_video_title"]
+        resolved_channel_name = st.session_state["agent_channel_name"]
+        drive_link = upload_clips_to_drive(
+            resolved_channel_name,
+            video_title,
+            [str(item[0]) for item in generated_clips],
+        )
+    except Exception as exc:
+        logging.exception("Google Drive clip upload failed")
+        st.error(f"Could not upload clips to Google Drive: {exc}")
+        return
+    st.session_state["outreach_video_title"] = video_title
+    st.session_state["outreach_channel_name"] = resolved_channel_name
+    st.session_state["drive_folder_link"] = drive_link
+    ai_email = st.session_state.get("ai_outreach_email", "")
+    if ai_email:
+        completed_email = fill_drive_link(ai_email, drive_link)
+        st.session_state["ai_outreach_email"] = completed_email
+        st.session_state["outreach_email_body"] = completed_email
+        return
+    try:
+        pitch = _generate_outreach_pitch(video_title, drive_link, len(generated_clips), resolved_channel_name)
+    except Exception as exc:
+        logging.exception("Fallback outreach email generation failed")
+        st.warning(f"The clips were uploaded, but the email draft could not be written: {exc}")
+        return
+    st.session_state["outreach_pitch"] = {"subject": pitch.subject, "body": pitch.body}
+    st.session_state["outreach_email_subject"] = pitch.subject
+    st.session_state["outreach_email_body"] = pitch.body
+
+
+# --- 🩺 System: health, settings, storage, log -------------------------------------------
+LOG_LINES = 40
+
+
+def _render_system() -> None:
+    st.subheader("Worker")
+    st.markdown("Start it in Terminal (stop it with **Ctrl+C**):")
+    st.code(WORKER_COMMAND, language="bash")
+
+    st.subheader("Settings in use")
+    st.caption("Change these in `.env`, then restart the app and the worker.")
+    settings = load_settings()
+    loudness = loudness_target()
+    st.table(
+        [
+            {"Setting": "CAPTION_STYLE", "Now": os.getenv("CAPTION_STYLE") or "bold"},
+            {"Setting": "EMPHASIS_INTENSITY", "Now": os.getenv("EMPHASIS_INTENSITY") or f"{caption_style()['emphasis']} (the caption style's default)"},
+            {"Setting": "SOURCE_MAX_HEIGHT", "Now": video_format_sort()[0].removeprefix("res:") + "p"},
+            {"Setting": "AUDIO_TARGET_LUFS", "Now": "off" if loudness is None else f"{loudness:g} LUFS"},
+            {"Setting": "ALLOW_LOCAL_WHISPER", "Now": "on" if local_whisper_allowed() else "off (waits for Groq)"},
+            {"Setting": "Clip quality bar", "Now": f"AI score {MIN_CLIP_SCORE}+ (MIN_CLIP_SCORE in autonomous_worker.py)"},
+            {"Setting": "Title card", "Now": f"{settings.hook_title_seconds:g} s, {settings.hook_title_style} style"},
+        ],
+        hide_index=True,
+    )
+
+    st.subheader("Storage")
+    output_dir = render_output_dir()
+    storage_bytes = storage_usage_bytes(settings.raw_dir, settings.temp_dir, settings.output_dir, output_dir)
+    st.metric("Downloads, temp files and clips on this Mac", f"{storage_bytes / (1024 * 1024):,.0f} MB")
+    if st.button("Clear downloads, temp files and made clips"):
+        try:
+            # Files the background worker is using right now are kept.
+            kept = purge_storage(settings.raw_dir, settings.temp_dir, keep_recent_minutes=20)
+            purge_storage(settings.output_dir, output_dir)
+        except OSError as exc:
+            logging.exception("Could not clear temporary and rendered storage")
+            st.error(f"Could not clear everything: {exc}")
+        except ValueError as exc:
+            logging.exception("Refused unsafe storage cleanup")
+            st.error(f"Cleanup was refused: {exc}")
+        else:
+            for key in (
+                "generated_clips", "clip_paths", "clip_render_contexts", "clip_source_path",
+                "active_clip_run_id", "ai_clip_selection_error", "ai_outreach_email",
+                "ai_outreach_subject", "outreach_email_body",
+            ):
+                st.session_state.pop(key, None)
+            st.success("Cleared." + (f" {kept} file(s) the worker is using were kept." if kept else ""))
+
+    st.subheader("Worker log")
+    with st.expander(f"Last {LOG_LINES} lines of storage/logs/worker.log"):
+        try:
+            lines = WORKER_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-LOG_LINES:]
+        except OSError:
+            lines = []
+        st.code("\n".join(lines) or "No log yet.", language=None)
 
 
 def _on_draft_edit(record_id: str, key: str, field: str) -> None:

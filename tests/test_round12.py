@@ -130,10 +130,11 @@ bold = S.create_ass_subtitles(words, tmp / "bold.ass", clip_duration=3).read_tex
 style_line = next(l for l in bold.splitlines() if l.startswith("Style: ShortForm"))
 fields = style_line.split(",")
 check("Bold captions by default: thicker outline (6) and drop shadow (3)", fields[16] == "6" and fields[17] == "3", style_line)
-check("Spoken word pops in (115% -> 100%) and stays yellow",
-      r"\c&H00FFFF&\fscx115\fscy115\t(0,110,\fscx100\fscy100)}QUESTION" in bold)
+# Round 13: the pulse grows the word's height and outline only (the line stays still).
+check("Spoken word pulses (height and outline) and stays yellow",
+      r"\c&H00FFFF&\fscy108\bord9\t(0,110,\fscy100\bord6)}QUESTION" in bold)
 check("Soft edge kept after the spoken word", r"QUESTION{\r\blur0.6}" in bold)
-check("One-word card pops too", r"{\fscx115\fscy115\t(0,110,\fscx100\fscy100)}GROWTH." in bold)
+check("One-word card pulses too", r"{\fscy108\bord9\t(0,110,\fscy100\bord6)}GROWTH." in bold)
 check("Colors use the Rec. 709 matrix", "YCbCr Matrix: TV.709" in bold)
 os.environ["CAPTION_STYLE"] = "classic"
 classic = S.create_ass_subtitles(words, tmp / "classic.ass", clip_duration=3).read_text()
