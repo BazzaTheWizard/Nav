@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import base64
 import functools
-import io
 import logging
 import os
 import re
 import shutil
 import time
 import uuid
-import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -55,6 +53,7 @@ from core.downloader import (
     download_source_video,
     extract_audio_only,
     fetch_video_info,
+    sign_in_summary,
     video_format_sort,
 )
 from core import series
@@ -326,7 +325,22 @@ LAYOUT_LABELS = {
     "Full frame over a blurred background": "blurred_background",
     "Wide video, letterboxed": "wide_blurred_background",
     "Wide shot on top, face below": "stacked",
+    "Webinar / screen + speaker: webcam on top, slides below": "webinar",
 }
+# Webinar layout: where the speaker's webcam is ("auto" finds the window by itself).
+WEBCAM_CORNERS = {
+    "Find it automatically": "auto",
+    "Top right": "top-right",
+    "Top left": "top-left",
+    "Bottom right": "bottom-right",
+    "Bottom left": "bottom-left",
+}
+PIN_TITLE_LABEL = "📌 Pin title card for full video duration"
+PIN_TITLE_HELP = "Off: the title card shows for the first few seconds. On: it stays on screen until the clip's last frame."
+WEBINAR_HELP = (
+    "For slides, webinars and tutorials with a small webcam in a corner: the webcam goes on top "
+    "(about a quarter of the screen), the whole slide under it, then the title and captions."
+)
 
 
 def _get_video_metadata(
@@ -552,6 +566,9 @@ def _generate_clips(
     input_path: str | Path,
     clip_count: int,
     layout_mode: str,
+    *,
+    webcam_corner: str = "auto",
+    pin_title: bool = False,
 ) -> list[tuple[Path, ClipResult]]:
     settings = load_settings()
     output_dir = render_output_dir()
@@ -714,6 +731,8 @@ def _generate_clips(
                     settings,
                     output_path,
                     layout_mode=layout_mode,
+                    pin_title=pin_title,
+                    webinar_corner=webcam_corner,
                 )
             except Exception:
                 output_path.unlink(missing_ok=True)
@@ -724,6 +743,8 @@ def _generate_clips(
                 "layout_mode": result.layout_mode,
                 "crop": result.crop,
                 "crop_plan": result.crop_plan,
+                "webinar": result.webinar,
+                "pin_title": pin_title,
                 "start_time": clip.start_time,
                 "end_time": clip.end_time,
                 "source_duration": duration,
@@ -1272,16 +1293,35 @@ def _render_clip_generator() -> None:
         )
         if st.session_state.get("crop_mode") not in LAYOUT_LABELS:
             st.session_state["crop_mode"] = next(iter(LAYOUT_LABELS))
+        if st.session_state.get("webcam_corner") not in WEBCAM_CORNERS:
+            st.session_state["webcam_corner"] = next(iter(WEBCAM_CORNERS))
         with st.expander("Framing (optional)"):
-            layout_label = st.selectbox("Layout", list(LAYOUT_LABELS), key="crop_mode")
+            layout_label = st.selectbox("Layout", list(LAYOUT_LABELS), key="crop_mode", help=WEBINAR_HELP)
+            # Inside a form the box can't appear only for the webinar layout, so it's always here.
+            corner_label = st.selectbox(
+                "Webcam corner (webinar layout only)", list(WEBCAM_CORNERS), key="webcam_corner",
+                help="Where the speaker's webcam is. Automatic finds the live webcam window next to the slides.",
+            )
+        pin_title = st.checkbox(PIN_TITLE_LABEL, key="pin_title", help=PIN_TITLE_HELP)
         generate_clicked = st.form_submit_button("Make 3 vertical clips", type="primary")
 
     if generate_clicked:
-        _make_clips(video_url, uploaded_video, channel_name, layout_label)
+        _make_clips(
+            video_url, uploaded_video, channel_name, layout_label,
+            webcam_corner=WEBCAM_CORNERS[corner_label], pin_title=pin_title,
+        )
     _render_generated_clips()
 
 
-def _make_clips(video_url: str, uploaded_video: Any, channel_name: str, layout_label: str) -> None:
+def _make_clips(
+    video_url: str,
+    uploaded_video: Any,
+    channel_name: str,
+    layout_label: str,
+    *,
+    webcam_corner: str = "auto",
+    pin_title: bool = False,
+) -> None:
     clip_count = 3
     try:
         _delete_previous_source_video()
@@ -1334,7 +1374,9 @@ def _make_clips(video_url: str, uploaded_video: Any, channel_name: str, layout_l
 
         st.session_state["outreach_channel_override"] = channel_name
         st.session_state["outreach_title_override"] = video_title_override
-        generated = _generate_clips(input_path, clip_count, LAYOUT_LABELS[layout_label])
+        generated = _generate_clips(
+            input_path, clip_count, LAYOUT_LABELS[layout_label], webcam_corner=webcam_corner, pin_title=pin_title
+        )
         st.session_state["generated_clips"] = generated
         st.session_state["clip_paths"] = [str(item[0].expanduser().resolve()) for item in generated]
         if generated:
@@ -1348,7 +1390,7 @@ def _make_clips(video_url: str, uploaded_video: Any, channel_name: str, layout_l
     except Exception as exc:
         logging.exception("Video generation failed")
         st.session_state.pop("generated_clips", None)
-        st.error(f"Making the clips failed: {exc}")
+        st.error(f"Making the clips failed: {exc}" + (f"\n\n{exc.hint}" if getattr(exc, "hint", "") else ""))
     finally:
         if uploaded_input is not None:
             uploaded_input.unlink(missing_ok=True)
@@ -1431,10 +1473,20 @@ def _render_series_maker() -> None:
         st.caption(f"Batch {batch} = Parts {first}–{last}. The whole video is transcribed once, on the first batch.")
     if st.session_state.get("series_layout") not in LAYOUT_LABELS:
         st.session_state["series_layout"] = next(iter(LAYOUT_LABELS))
+    corner = "auto"
     with st.expander("Framing (optional)"):
-        layout_label = st.selectbox("Layout", list(LAYOUT_LABELS), key="series_layout")
+        layout_label = st.selectbox("Layout", list(LAYOUT_LABELS), key="series_layout", help=WEBINAR_HELP)
+        if LAYOUT_LABELS[layout_label] == "webinar":
+            corner = WEBCAM_CORNERS[st.selectbox(
+                "Webcam corner", list(WEBCAM_CORNERS), key="series_webcam_corner",
+                help="Where the speaker's webcam is. Automatic finds the live webcam window next to the slides.",
+            )]
+    pin_title = st.checkbox(PIN_TITLE_LABEL, key="series_pin_title", help=PIN_TITLE_HELP)
     if st.button(f"Make parts {first}–{last}", type="primary", disabled=not can_make):
-        _make_series_batch(key, url, upload, st.session_state.get("series_title", ""), shortest, longest, batch, LAYOUT_LABELS[layout_label])
+        _make_series_batch(
+            key, url, upload, st.session_state.get("series_title", ""), shortest, longest, batch,
+            LAYOUT_LABELS[layout_label], webcam_corner=corner, pin_title=pin_title,
+        )
     _render_series_results()
 
 
@@ -1454,7 +1506,8 @@ def _slug(text: str) -> str:
 
 
 def _make_series_batch(
-    key: str, url: str, upload: Any, title_input: str, shortest: int, longest: int, batch: int, layout_mode: str
+    key: str, url: str, upload: Any, title_input: str, shortest: int, longest: int, batch: int, layout_mode: str,
+    *, webcam_corner: str = "auto", pin_title: bool = False,
 ) -> None:
     """Transcribe once (saved per video), plan the parts, render this batch's 3 locally."""
     settings = load_settings()
@@ -1511,7 +1564,10 @@ def _make_series_batch(
             clip = ClipResult(start_time=start, end_time=end, viral_title=series.part_title(number, title),
                               caption="", hashtags=[], virality_score=0)
             output = folder / f"part_{number:02d}.mp4"
-            render_selected_clip(source_video, clip, words, settings, output, layout_mode=layout_mode)
+            render_selected_clip(
+                source_video, clip, words, settings, output,
+                layout_mode=layout_mode, pin_title=pin_title, webinar_corner=webcam_corner,
+            )
             preview = settings.temp_dir / f"series_{key}_part_{number:02d}.preview.mp4"
             make_preview(output, preview)  # small copy for the player (the full file is ~10 MB a minute)
             return {"path": str(output), "preview": str(preview), "number": number, "start": start, "end": end}
@@ -1539,19 +1595,11 @@ def _make_series_batch(
             st.session_state["series_toast"] = f"Parts {chosen[0][0]}–{chosen[-1][0]} are ready (of {len(parts)})."
     except Exception as exc:
         logging.exception("Series batch failed")
-        st.error(f"Making the parts failed: {exc}")
+        st.error(f"Making the parts failed: {exc}" + (f"\n\n{exc.hint}" if getattr(exc, "hint", "") else ""))
     finally:
         audio_path.unlink(missing_ok=True)
     if all_made:
         st.rerun()  # the form now shows the real part times and suggests the next batch
-
-
-def _zip_parts(paths: list[str], names: list[str]) -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:  # MP4s don't compress further
-        for path, name in zip(paths, names):
-            archive.write(path, arcname=name)
-    return buffer.getvalue()
 
 
 def _render_series_results() -> None:
@@ -1574,12 +1622,6 @@ def _render_series_results() -> None:
                 f"⬇ Download Part {item['number']}", data=functools.partial(Path(item["path"]).read_bytes),
                 file_name=name, mime="video/mp4", key=f"series_download_{item['number']}", width="stretch",
             )
-    st.download_button(
-        f"⬇ Download all {len(items)} (zip)",
-        data=functools.partial(_zip_parts, [item["path"] for item in items], names),
-        file_name=f"{slug}_parts_{items[0]['number']:02d}-{items[-1]['number']:02d}.zip",
-        mime="application/zip", key="series_download_all", type="primary",
-    )
     st.caption(f"Also saved on this Mac: {result['folder']}")
 
 
@@ -1704,6 +1746,8 @@ def _render_trim_form(
             hook_title=clip.viral_title,
             hook_seconds=settings.hook_title_seconds,
             highlight_active_word=settings.caption_highlight,
+            pin_title=bool(context.get("pin_title")),
+            webinar=context.get("webinar"),
         )
     except Exception as exc:
         logging.exception("Could not re-render clip %d", index + 1)
@@ -1782,6 +1826,7 @@ def _render_system() -> None:
             {"Setting": "CAPTION_STYLE", "Now": os.getenv("CAPTION_STYLE") or "bold"},
             {"Setting": "EMPHASIS_INTENSITY", "Now": os.getenv("EMPHASIS_INTENSITY") or f"{caption_style()['emphasis']} (the caption style's default)"},
             {"Setting": "SOURCE_MAX_HEIGHT", "Now": video_format_sort()[0].removeprefix("res:") + "p"},
+            {"Setting": "YouTube sign-in (YTDLP_COOKIES_*)", "Now": sign_in_summary()},
             {"Setting": "AUDIO_TARGET_LUFS", "Now": "off" if loudness is None else f"{loudness:g} LUFS"},
             {"Setting": "ALLOW_LOCAL_WHISPER", "Now": "on" if local_whisper_allowed() else "off (waits for Groq)"},
             {"Setting": "Clip quality bar", "Now": f"AI score {MIN_CLIP_SCORE}+ (MIN_CLIP_SCORE in autonomous_worker.py)"},
@@ -1880,6 +1925,7 @@ _AUTO_SKIP_LABELS = {
     "auto_weak": "no clip strong enough",
     "auto_faceless": "nobody on camera",
     "auto_screen_share": "screen share with a corner webcam",
+    "auto_age": "age-restricted video",
 }
 
 

@@ -19,7 +19,7 @@ from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_cand
 from core.subtitle_engine import create_ass_subtitles
 from core.outreach import build_outreach_email, build_subject, clean_format
 from core.service_pause import ServicePause
-from core.title_card import SEAM_PLACEMENT, TitleOverlay, prepare_title_overlay
+from core.title_card import TitleOverlay, prepare_title_overlay, title_above_captions
 from core.transcriber import (
     Word,
     clip_words_from_transcript,
@@ -27,6 +27,7 @@ from core.transcriber import (
     transcript_segments,
 )
 from core.video_renderer import CROP_LAYOUTS, LAYOUT_MODES, render_clip
+from core.webinar import WebinarLayout, plan_webinar
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class RenderedClip:
     layout_mode: str
     crop: CropBox
     crop_plan: CropPlan | None
+    webinar: WebinarLayout | None = None  # layout "webinar": reused when the clip is trimmed
 
 
 def choose_layout(requested: str, plan: CropPlan | None) -> str:
@@ -76,8 +78,14 @@ def render_selected_clip(
     *,
     layout_mode: str = "auto",
     work_dir: Path | None = None,
+    pin_title: bool = False,
+    webinar_corner: str = "auto",
 ) -> RenderedClip:
-    """Subtitles, framing and render for one selected clip."""
+    """Subtitles, framing and render for one selected clip.
+
+    ``pin_title``: the title card stays on for the whole clip (Make clips tab).
+    ``webinar_corner``: layout "webinar" only, where the speaker's webcam is
+    ("auto" finds it)."""
     work_dir = work_dir or settings.temp_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     subtitle_path = work_dir / f"{output_path.stem}.ass"
@@ -97,6 +105,7 @@ def render_selected_clip(
             except Exception:
                 logger.warning("Framing analysis failed; using a fallback layout.", exc_info=True)
         layout = choose_layout(layout_mode, plan)
+        webinar = plan_webinar(source_video, start, end, webinar_corner) if layout == "webinar" else None
 
         full_frame: list[tuple[float, float]] = []
         split = None
@@ -122,6 +131,8 @@ def render_selected_clip(
                 work_dir=work_dir,
                 name=output_path.stem,
                 style=settings.hook_title_style,
+                pinned=pin_title,
+                webinar=webinar,
             )
         except Exception:
             logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
@@ -132,9 +143,10 @@ def render_selected_clip(
             highlight_active_word=settings.caption_highlight,
             # The card replaces the old subtitle-style title; that one is only a fallback.
             hook_title=None if title else clip.viral_title,
-            hook_seconds=settings.hook_title_seconds,
+            hook_seconds=end - start if pin_title else settings.hook_title_seconds,
             seam_spans=split.spans if split else None,
             seam_title=_seam_title(title),
+            caption_top=webinar.caption_top if webinar else None,
         )
         rendered = render_clip(
             source_video,
@@ -148,6 +160,7 @@ def render_selected_clip(
             title=title,
             full_frame_ranges=full_frame or None,
             split_view=split,
+            webinar=webinar,
         )
         logger.info(
             "Rendered %s (%s, %d shot(s), %d shown full-frame, %d as two-speaker split)",
@@ -163,6 +176,7 @@ def render_selected_clip(
             layout_mode=layout,
             crop=crop,
             crop_plan=plan if layout in CROP_LAYOUTS else None,
+            webinar=webinar,
         )
     finally:
         subtitle_path.unlink(missing_ok=True)
@@ -272,10 +286,9 @@ def _ai_pick_for(clip: ClipResult, picks: list[dict[str, Any]]) -> dict[str, Any
 
 
 def _seam_title(title: TitleOverlay | None) -> tuple[float, int] | None:
-    """(seconds, bottom y) when the title sits on the split view's seam."""
-    if title is None or title.placement != SEAM_PLACEMENT:
-        return None
-    return title.seconds, title.card_top + title.card_height
+    """(seconds, bottom y) when the captions go just under the title card: on the
+    split view's seam, or under the slides (webinar layout)."""
+    return title_above_captions(title)
 
 
 class JudgeUnavailable(ServicePause):

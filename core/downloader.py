@@ -9,12 +9,13 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 from urllib.parse import urlparse
 
 from config import Settings, load_settings
 
 ProgressCallback = Callable[[float, str], None]
+T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 # Source quality. YouTube's H.264 1080p stream is its lowest-quality 1080p (the
@@ -51,6 +52,130 @@ UPDATE_HINT = "If it keeps happening, update yt-dlp: .venv/bin/pip install -U yt
 
 class DownloadForbidden(RuntimeError):
     """YouTube answered HTTP 403. Two in a row and the worker pauses (see the worker)."""
+
+
+# --- Signed-in downloads (age-restricted videos, "confirm you're not a bot") -----------
+# Every download first runs without cookies. Only when YouTube asks to sign in does it
+# run once more with your YouTube session: the cookies.txt file in YTDLP_COOKIES_PATH,
+# then the cookies of the browser in YTDLP_COOKIES_BROWSER (default chrome; "off" to
+# turn it off). On a Mac, reading Chrome's or Brave's cookies asks once for your login
+# keychain password ("Always Allow"); Safari needs Full Disk Access for the Terminal.
+_SIGN_IN_NEEDED = re.compile(
+    r"sign in to confirm|confirm your age|age[- ]restricted|inappropriate for some users|"
+    r"not a bot|--cookies",
+    re.IGNORECASE,
+)
+_AGE_GATE = re.compile(r"confirm your age|age[- ]restricted|inappropriate for some users", re.IGNORECASE)
+COOKIE_BROWSERS = ("chrome", "brave", "safari", "firefox", "edge", "chromium", "opera", "vivaldi", "whale")
+DEFAULT_COOKIE_BROWSER = "chrome"
+SIGN_IN_HELP = (
+    "Sign in to YouTube in Chrome (an account that is 18+), or set YTDLP_COOKIES_PATH in .env "
+    "to a cookies.txt file. YTDLP_COOKIES_BROWSER picks another browser (brave, safari, firefox)."
+)
+# The background worker reads browser cookies only with YTDLP_COOKIES_IN_WORKER=1 in
+# .env: a 24/7 downloader on your own account's cookies is the kind of use YouTube
+# limits. A cookies.txt file (YTDLP_COOKIES_PATH) is used everywhere.
+_browser_cookies_allowed = True
+
+
+def allow_browser_cookies(allowed: bool) -> None:
+    """Turn the browser-cookie fallback on or off for this process."""
+    global _browser_cookies_allowed
+    _browser_cookies_allowed = bool(allowed)
+
+
+class SignInRequired(RuntimeError):
+    """YouTube wants a signed-in session (an age-restricted video, or its bot check)
+    and no cookies got past it. The message says what was tried and how to fix it."""
+
+    def __init__(self, message: str, *, age_restricted: bool) -> None:
+        super().__init__(message)
+        self.age_restricted = age_restricted
+
+
+def _browser_spec(value: str) -> tuple[str, ...] | None:
+    """'chrome' or 'chrome:Profile 1' -> yt-dlp's cookiesfrombrowser tuple."""
+    name, _, profile = value.strip().partition(":")
+    name = name.strip().lower()
+    if name not in COOKIE_BROWSERS:
+        return None
+    return (name, profile.strip()) if profile.strip() else (name,)
+
+
+def cookie_sources() -> list[tuple[str, dict[str, object]]]:
+    """(label, extra yt-dlp options) to try, in order, after YouTube asks to sign in."""
+    load_settings()  # reads .env, in case nothing has yet
+    sources: list[tuple[str, dict[str, object]]] = []
+    path = os.getenv("YTDLP_COOKIES_PATH", "").strip()
+    if path:
+        cookie_file = Path(path).expanduser()
+        if cookie_file.is_file():
+            sources.append((f"the cookies file {cookie_file.name}", {"cookiefile": str(cookie_file)}))
+        else:
+            logger.warning("YTDLP_COOKIES_PATH is set, but %s doesn't exist.", cookie_file)
+    browser = (os.getenv("YTDLP_COOKIES_BROWSER") or DEFAULT_COOKIE_BROWSER).strip()
+    if _browser_cookies_allowed and browser.lower() not in {"off", "none", "no", "0", "false"}:
+        spec = _browser_spec(browser)
+        if spec is None:
+            logger.warning("YTDLP_COOKIES_BROWSER=%s isn't one of %s.", browser, ", ".join(COOKIE_BROWSERS))
+        else:
+            sources.append((f"{spec[0].title()}'s YouTube sign-in", {"cookiesfrombrowser": spec}))
+    return sources
+
+
+def sign_in_summary() -> str:
+    """One line for the app's System tab: which YouTube sign-in the fallback would use."""
+    sources = [label for label, _options in cookie_sources()]
+    path = os.getenv("YTDLP_COOKIES_PATH", "").strip()
+    missing = f" (YTDLP_COOKIES_PATH {Path(path).expanduser().name} not found)" if path and not Path(path).expanduser().is_file() else ""
+    worker = "on" if os.getenv("YTDLP_COOKIES_IN_WORKER", "").strip().lower() in {"1", "true", "yes", "on"} else "off"
+    used = ", then ".join(sources) if sources else "none"
+    return f"only when YouTube asks: {used}{missing}. Browser cookies in the worker: {worker}"
+
+
+def _first_line(error: Exception) -> str:
+    text = re.sub(r"^ERROR:\s*", "", str(error).strip())
+    return text.splitlines()[0][:300] if text else type(error).__name__
+
+
+def _with_sign_in(run: Callable[[dict[str, object]], T], options: dict[str, object], what: str) -> T:
+    """``run(options)`` once; if YouTube asks to sign in, again with each cookie
+    source in turn. Raises what _download_error maps the error to, or SignInRequired."""
+    from yt_dlp import DownloadError
+
+    try:
+        return run(options)
+    except DownloadError as exc:
+        if not _SIGN_IN_NEEDED.search(str(exc)):
+            raise _download_error(exc, what) from exc
+        first = exc
+    age_restricted = bool(_AGE_GATE.search(str(first)))
+    reason = "the video is age-restricted" if age_restricted else "YouTube's bot check"
+    tried: list[str] = []
+    last: Exception = first
+    for label, extra in cookie_sources():
+        logger.info("YouTube asked to sign in (%s); trying again with %s.", reason, label)
+        try:
+            result = run({**options, **extra})
+        except Exception as exc:  # DownloadError, or the cookies couldn't be read
+            tried.append(f"{label}: {_first_line(exc)}")
+            last = exc
+            continue
+        logger.info("Downloaded %s with %s.", what, label)
+        return result
+    detail = f" Tried: {'; '.join(tried)}." if tried else " No YouTube sign-in is set up."
+    if not age_restricted:
+        # Still the bot check: the worker pauses as before; the app shows how to sign in.
+        from core.service_pause import ServicePause
+
+        raise ServicePause(
+            f"YouTube is blocking downloads for now (its \"not a bot\" check).{detail}",
+            YOUTUBE_PAUSE_SEC, service="youtube", hint=SIGN_IN_HELP,
+        ) from last
+    raise SignInRequired(
+        f"YouTube needs a signed-in account for {what} ({reason}): {_first_line(first).rstrip('.')}.{detail} {SIGN_IN_HELP}",
+        age_restricted=age_restricted,
+    ) from last
 
 
 # What yt-dlp learned while downloading (title, heatmap, ...), so the worker doesn't
@@ -135,7 +260,7 @@ def _download_url(
     on_progress: ProgressCallback | None = None,
 ) -> Path:
     try:
-        from yt_dlp import DownloadError, YoutubeDL
+        from yt_dlp import YoutubeDL
     except ImportError as exc:
         raise RuntimeError(
             "URL downloads require yt-dlp. Install dependencies with "
@@ -178,11 +303,12 @@ def _download_url(
         "progress_hooks": [_yt_dlp_progress_hook(on_progress)],
     }
     started = time.monotonic()
-    try:
-        with YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, download=True)
-    except DownloadError as exc:
-        raise _download_error(exc, "the input URL") from exc
+
+    def run(run_options: dict[str, object]) -> object:
+        with YoutubeDL(run_options) as downloader:
+            return downloader.extract_info(url, download=True)
+
+    info = _with_sign_in(run, options, "the input URL")
 
     if isinstance(info, dict):
         _DOWNLOAD_INFO[url] = {
@@ -260,10 +386,13 @@ def fetch_video_info(url: str) -> dict[str, object]:
     """
     from yt_dlp import YoutubeDL
 
-    with YoutubeDL(
-        {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
-    ) as downloader:
-        info = downloader.extract_info(url, download=False)
+    def run(options: dict[str, object]) -> object:
+        with YoutubeDL(options) as downloader:
+            return downloader.extract_info(url, download=False)
+
+    info = _with_sign_in(
+        run, {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}, "the video's details"
+    )
     if not isinstance(info, dict):
         raise RuntimeError(f"Could not read video metadata for {url}")
     heatmap = info.get("heatmap")
@@ -298,7 +427,7 @@ def download_audio_only(
         raise ValueError("A valid http:// or https:// video URL is required.")
 
     try:
-        from yt_dlp import DownloadError, YoutubeDL
+        from yt_dlp import YoutubeDL
     except ImportError as exc:
         raise RuntimeError(
             "URL downloads require yt-dlp. Install dependencies with "
@@ -336,9 +465,12 @@ def download_audio_only(
     }
     temporary_files: list[Path] = []
     final_audio: Path | None = None
-    try:
-        with YoutubeDL(options) as downloader:
+    def run(run_options: dict[str, object]) -> None:
+        with YoutubeDL(run_options) as downloader:
             downloader.download([url])
+
+    try:
+        _with_sign_in(run, options, "audio from the URL")
         temporary_files = list(destination_dir.glob(f"{download_id}.*"))
         source_audio = next(
             (
@@ -390,8 +522,6 @@ def download_audio_only(
             raise RuntimeError(
                 "Audio download completed, but the expected output file is missing."
             )
-    except DownloadError as exc:
-        raise _download_error(exc, "audio from the URL") from exc
     finally:
         for temporary_file in set(temporary_files) | set(destination_dir.glob(f"{download_id}.*")):
             if temporary_file.is_file() or temporary_file.is_symlink():

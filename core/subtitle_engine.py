@@ -220,6 +220,7 @@ def create_ass_subtitles(
     seam_title: tuple[float, int] | None = None,
     style: str | None = None,
     emphasis: str | None = None,
+    caption_top: int | None = None,
 ) -> Path:
     """Write short, clip-relative ASS subtitle cards with non-overlapping timing.
 
@@ -228,8 +229,10 @@ def create_ass_subtitles(
     ``hook_seconds`` (0 turns it off).
     seam_spans: clip-relative spans shown as the two-speaker split view; captions
     there sit on the seam between the two panels instead of over the lower face.
-    seam_title: (seconds, bottom y) of a title card shown on the seam; captions
-    in that time sit just under it instead.
+    seam_title: (seconds, bottom y) of a title card shown on the seam (or, with
+    ``caption_top``, under the slides); captions in that time sit just under it.
+    caption_top: every caption's top edge at this y instead of the usual height
+    (the webinar layout puts them under the slides).
     style: "bold" or "classic" (default: CAPTION_STYLE in .env, else "bold").
     emphasis: "off", "subtle", "balanced" or "punchy" (default: EMPHASIS_INTENSITY
     in .env, else the style's own default).
@@ -279,7 +282,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         middle = (start_cs + end_cs) / 2
         if style == "ShortForm":
             text = soften + text
-            if any(a <= middle < b for a, b in seams):
+            if caption_top is not None:
+                text = (under_title if start_cs < title_until_cs else f"{{\\an8\\pos(540,{caption_top})}}") + text
+            elif any(a <= middle < b for a, b in seams):
                 text = (under_title if start_cs < title_until_cs else SEAM_POSITION) + text
         if end_cs > start_cs:
             events.append(

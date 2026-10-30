@@ -1,7 +1,7 @@
 """Checks for round 20: ⏩ Force to queue (Pipeline tab) and 🎞️ Series mode (Make clips).
 Temp folders and fakes only: nothing is downloaded, transcribed, uploaded or sent.
 Run all tests: .venv/bin/python tests/run_all.py"""
-import json, os, random, sys, tempfile, textwrap, zipfile, io
+import json, os, random, sys, tempfile, textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -275,7 +275,7 @@ check("Batch 1: Parts 1–3 with 'Part N: title' on the title card",
 folder = next((out / "Series").iterdir())
 check("Saved on this Mac (no Drive, no clip page)", sorted(p.name for p in folder.iterdir()) == ["part_01.mp4", "part_02.mp4", "part_03.mp4"])
 downloads = [b.label for b in at.get("download_button")]
-check("A Download button per part, plus Download all", downloads == ["⬇ Download Part 1", "⬇ Download Part 2", "⬇ Download Part 3", "⬇ Download all 3 (zip)"], str(downloads))
+check("A Download button per part (round 21: no zip)", downloads == ["⬇ Download Part 1", "⬇ Download Part 2", "⬇ Download Part 3"], str(downloads))
 check("After batch 1: the next batch and the found title are filled in",
       at.number_input(key="series_batch").value == 2 and at.text_input(key="series_title").value == "The British Are Coming")
 next(b for b in at.button if b.label.startswith("Make parts 4")).click().run()
@@ -290,8 +290,6 @@ ends = [float(line.rsplit(" ", 1)[1].split("-")[1]) for line in ordered]
 check("Parts 1–5 follow on from each other across the two batches", all(abs(starts[i + 1] - ends[i]) <= 2.5 for i in range(4)), f"{starts} {ends}")
 
 import app as A  # noqa: E402
-archive = zipfile.ZipFile(io.BytesIO(A._zip_parts([str(folder / "part_01.mp4"), str(folder / "part_02.mp4")], ["x_part_01.mp4", "x_part_02.mp4"])))
-check("Download all: one zip with every part", archive.namelist() == ["x_part_01.mp4", "x_part_02.mp4"])
 check("Made-so-far text", A._part_ranges([1, 2, 3, 4, 5, 6, 10, 11, 12]) == "Parts 1–6, 10–12")
 
 W._write_json_atomic(W.LEAD_QUEUE_PATH, [{"channel_id": "UCf", "channel_title": "Forced Pod", "forced": True, "priority": 0,

@@ -10,9 +10,10 @@ from typing import Any
 from config import PROJECT_ROOT
 from core.face_tracker import CropBox, CropPlan
 from core.subtitle_engine import create_ass_subtitles
-from core.title_card import SEAM_PLACEMENT, TitleOverlay, prepare_title_overlay
+from core.title_card import TitleOverlay, prepare_title_overlay, title_above_captions
 from core.transcriber import Word
 from core.video_renderer import CROP_LAYOUTS, render_clip
+from core.webinar import WebinarLayout, plan_webinar
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,11 @@ def rerender_clip(
     hook_seconds: float = 0.0,
     highlight_active_word: bool = True,
     hook_style: str | None = None,
+    pin_title: bool = False,
+    webinar: WebinarLayout | None = None,
 ) -> Path:
+    """``pin_title``: keep the title card on for the whole clip. ``webinar``: the
+    first render's webinar layout (layout "webinar"; found again if missing)."""
     duration = new_end - new_start
     if not MIN_CLIP_DURATION <= duration <= MAX_CLIP_DURATION:
         raise ValueError("Adjusted clip duration must remain between 15 and 90 seconds.")
@@ -162,6 +167,8 @@ def rerender_clip(
                 # two-person shots the two-speaker split view.
                 full_frame = crop_plan.full_frame_ranges(new_start, new_end)
                 split = crop_plan.split_view(new_start, new_end)
+        if layout_mode == "webinar" and webinar is None:
+            webinar = plan_webinar(source, new_start, new_end)
 
         try:
             title = prepare_title_overlay(
@@ -176,6 +183,8 @@ def rerender_clip(
                 work_dir=temp_dir,
                 name=subtitle_path.stem,
                 style=hook_style,
+                pinned=pin_title,
+                webinar=webinar,
             )
         except Exception:
             logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
@@ -186,11 +195,10 @@ def rerender_clip(
             highlight_active_word=highlight_active_word,
             # The card replaces the old subtitle-style title; that one is only a fallback.
             hook_title=None if title else hook_title,
-            hook_seconds=hook_seconds,
+            hook_seconds=duration if pin_title else hook_seconds,
             seam_spans=split.spans if split else None,
-            seam_title=(title.seconds, title.card_top + title.card_height)
-            if title is not None and title.placement == SEAM_PLACEMENT
-            else None,
+            seam_title=title_above_captions(title),
+            caption_top=webinar.caption_top if layout_mode == "webinar" and webinar else None,
         )
         render_clip(
             source,
@@ -204,6 +212,7 @@ def rerender_clip(
             title=title,
             full_frame_ranges=full_frame or None,
             split_view=split,
+            webinar=webinar if layout_mode == "webinar" else None,
         )
         temporary_output.replace(destination)
     finally:

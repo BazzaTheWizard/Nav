@@ -12,6 +12,7 @@ from pathlib import Path
 
 from core.face_tracker import CropBox, SplitView
 from core.title_card import TitleOverlay, overlay_filter
+from core.webinar import WebinarLayout
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ LAYOUT_MODES = (
     "blurred_background",
     "smart_crop",
     "wide_blurred_background",
+    "webinar",  # speaker's webcam on top, slides below (core.webinar)
 )
 # "auto" is resolved to one of LAYOUT_MODES by core.pipeline before rendering.
 SELECTABLE_LAYOUTS = ("auto", *LAYOUT_MODES)
@@ -171,6 +173,7 @@ def render_clip(
     title: TitleOverlay | None = None,
     full_frame_ranges: list[tuple[float, float]] | None = None,
     split_view: SplitView | None = None,
+    webinar: WebinarLayout | None = None,
 ) -> Path:
     """Render one vertical clip.
 
@@ -181,6 +184,8 @@ def render_clip(
     where the whole frame is shown over a blurred background instead of the crop.
     ``split_view`` (smart_crop only, from CropPlan.split_view): two-person shots
     shown as two stacked panels, one speaker each.
+    ``webinar`` (layout "webinar", from core.webinar.plan_webinar): where the webcam
+    and the slides are.
     """
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -193,6 +198,8 @@ def render_clip(
         raise ValueError(
             f"Unsupported layout mode {layout_mode!r}; choose one of {LAYOUT_MODES}."
         )
+    if layout_mode == "webinar" and webinar is None:
+        raise ValueError("The webinar layout needs the webcam and slide positions (core.webinar.plan_webinar).")
 
     subtitle_file = Path(subtitle_path).expanduser().resolve(strict=True)
     if not subtitle_file.is_file():
@@ -219,7 +226,9 @@ def render_clip(
         f"crop=w='trunc(min(iw,{crop.height}*9/8)/2)*2':h={crop.height}:"
         f"x='max(0,min(iw-ow,{face_center}-ow/2))':y={crop.y}"
     )
-    if layout_mode in {"blurred_background", "wide_blurred_background"}:
+    if layout_mode == "webinar" and webinar is not None:
+        filter_complex = webinar.filter_graph(_sharpen(webinar.camera_scale))
+    elif layout_mode in {"blurred_background", "wide_blurred_background"}:
         foreground_filter = (
             "[0:v]scale=1080:608:force_original_aspect_ratio=decrease,"
             "pad=1080:608:(ow-iw)/2:(oh-ih)/2[fg];"

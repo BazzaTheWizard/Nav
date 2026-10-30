@@ -21,7 +21,9 @@ from typing import Any, Generator
 from config import PROJECT_ROOT, load_settings
 from core.downloader import (
     DownloadForbidden,
+    SignInRequired,
     UPDATE_HINT,
+    allow_browser_cookies,
     download_source_video,
     downloaded_video_info,
     extract_audio_only,
@@ -110,6 +112,9 @@ LEAD_KEYS = (
 # Slides, tutorials or gameplay with a small webcam in a corner (core.face_tracker
 # camera_check): skipped as not a fit, with this code at the start of the reason.
 SCREEN_SHARE_PIP = "screen_share_pip"
+# Age-restricted videos need a signed-in 18+ YouTube account (core.downloader). Without
+# one that works they're skipped as not a fit, so ⏩ Force to queue can retry them later.
+AGE_RESTRICTED = "age_restricted"
 LOG_PATH = STORAGE_DIR / "logs" / "worker.log"
 
 # yt-dlp/YouTube errors that will fail the same way every time: fail the lead now
@@ -749,7 +754,8 @@ def get_recently_passed(now: datetime | None = None) -> list[dict[str, Any]]:
 def pass_summary(now: datetime | None = None) -> dict[str, int]:
     """Last PASSED_LOOKBACK_DAYS: how often each pass reason was used, plus leads
     the worker skipped by itself ("auto_weak": no clip good enough, "auto_faceless":
-    nobody on camera, "auto_screen_share": a screen share with a corner webcam)."""
+    nobody on camera, "auto_screen_share": a screen share with a corner webcam,
+    "auto_age": an age-restricted video that needs a signed-in account)."""
     now = now or datetime.now(timezone.utc)
     cutoff = timedelta(days=PASSED_LOOKBACK_DAYS)
     counts: dict[str, int] = {}
@@ -772,6 +778,7 @@ def pass_summary(now: datetime | None = None) -> dict[str, int]:
             key = (
                 "auto_weak" if error.startswith("weak moments")
                 else "auto_screen_share" if error.startswith(SCREEN_SHARE_PIP)
+                else "auto_age" if error.startswith(AGE_RESTRICTED)
                 else "auto_faceless"
             )
             counts[key] = counts.get(key, 0) + 1
@@ -1456,7 +1463,12 @@ def _process_lead(
     queued = False
     page_name: str | None = None
     try:
-        source_video = Path(download_source_video(video_url))
+        try:
+            source_video = Path(download_source_video(video_url))
+        except SignInRequired as exc:
+            if exc.age_restricted:
+                raise NotAFit(f"{AGE_RESTRICTED}: YouTube needs a signed-in 18+ account for this video") from exc
+            raise
         # Right after the download, before any transcribing, AI, rendering or upload.
         # A creator you forced into the queue skips these checks: you decided.
         camera = camera_check(source_video) if not forced else None
@@ -2079,6 +2091,9 @@ def main() -> int:
     continuous = arguments.continuous_queue or arguments.batch is None
     _setup_logging()
     logger.info("Worker starting (yt-dlp %s).", yt_dlp_version())  # most YouTube 403 waves are fixed by an update
+    # Browser cookies only if you opt in (core.downloader); a cookies.txt file is always used.
+    load_settings()  # reads .env
+    allow_browser_cookies(os.getenv("YTDLP_COOKIES_IN_WORKER", "").strip().lower() in {"1", "true", "yes", "on"})
     instance = _claim_single_instance()
     if instance is None:
         logger.info("Another worker is already running (see the app), so this one isn't starting.")

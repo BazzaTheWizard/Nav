@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from core.face_tracker import CropBox, CropPlan, SplitView, _face_detector, _probe_display_size
+from core.webinar import WebinarLayout
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ CAPTION_ZONE_BOTTOM = 1240
 SEAM_CAPTION_ZONE = (860, 1060)
 SEAM_Y = 960
 SEAM_PLACEMENT = "on the seam"
+# Webinar layout (core.webinar): the card sits under the slides, the captions under it.
+WEBINAR_PLACEMENT = "under the slides"
 # When the face fills the top of the frame, the title may go under the captions,
 # but no lower than this: TikTok/Reels/Shorts put the caption and buttons below.
 LOWEST_TITLE_BOTTOM = 1500
@@ -77,6 +80,8 @@ class TitleOverlay:
     card_top: int
     card_height: int
     placement: str
+    # 📌 Pinned: on screen for the whole clip, with no fade-out at the end.
+    pinned: bool = False
 
 
 def clean_title(title: str | None) -> str:
@@ -183,6 +188,12 @@ def render_title_card(
 
 FACE_SAMPLE_FPS = 3
 FACE_SAMPLE_WIDTH = 640
+# A pinned card is checked against the whole clip: at most this many frames (memory).
+MAX_FACE_SAMPLES = 90
+
+
+def _face_sample_fps(seconds: float) -> float:
+    return min(FACE_SAMPLE_FPS, MAX_FACE_SAMPLES / max(seconds, 0.1))
 
 
 def _sample_frames(
@@ -204,7 +215,7 @@ def _sample_frames(
             str(source),
             "-an",
             "-vf",
-            f"fps={FACE_SAMPLE_FPS},scale={FACE_SAMPLE_WIDTH}:{sample_height},format=bgr24",
+            f"fps={_face_sample_fps(seconds):.5f},scale={FACE_SAMPLE_WIDTH}:{sample_height},format=bgr24",
             "-f",
             "rawvideo",
             "pipe:1",
@@ -252,7 +263,7 @@ def _face_zones(
     full_scale = FRAME_WIDTH / width
     full_top = max(0, 1050 - round(height * full_scale))  # video_renderer.FULL_FRAME_BOTTOM_Y
     for index, frame in enumerate(_sample_frames(source, clip_start, seconds, frame_size)):
-        relative = index / FACE_SAMPLE_FPS
+        relative = index / _face_sample_fps(seconds)
         moment = clip_start + relative
         window = next((w for w in (split.windows if split else ()) if w[0] <= relative < w[1]), None)
         if window is not None:
@@ -378,10 +389,15 @@ def prepare_title_overlay(
     work_dir: Path,
     name: str,
     style: str | None = None,
+    pinned: bool = False,
+    webinar: WebinarLayout | None = None,
 ) -> TitleOverlay | None:
-    """Render the title card and decide where it goes. None means no title."""
+    """Render the title card and decide where it goes. None means no title.
+
+    ``pinned``: shown for the whole clip (``seconds`` is ignored, even 0).
+    ``webinar``: the webinar layout's geometry (layout "webinar")."""
     text = clean_title(title)
-    seconds = min(seconds, clip_duration)
+    seconds = clip_duration if pinned else min(seconds, clip_duration)
     if seconds <= 0 or text.casefold() in GENERIC_TITLES:
         return None
     if not FONT_PATH.is_file():
@@ -391,6 +407,23 @@ def prepare_title_overlay(
         frame_size = (plan.frame_width, plan.frame_height)
     else:
         frame_size = _probe_display_size(source_video)
+
+    if layout == "webinar" and webinar is not None:
+        # Under the slides, where it covers neither the speaker nor a slide.
+        image_path = work_dir / f"{name}_title_{FONT_SIZES[0]}.png"
+        _path, card_width, card_height = render_title_card(text, image_path, style=style, max_font_size=FONT_SIZES[0])
+        card_top = webinar.title_top
+        logger.info("Title card: under the slides at y=%d (%d px tall)%s", card_top, card_height, ", pinned" if pinned else "")
+        return TitleOverlay(
+            image_path=image_path,
+            x=(FRAME_WIDTH - card_width) // 2 - SHADOW_MARGIN,
+            y=card_top - SHADOW_MARGIN,
+            seconds=seconds,
+            card_top=card_top,
+            card_height=card_height,
+            placement=WEBINAR_PLACEMENT,
+            pinned=pinned,
+        )
 
     zones: list[list[tuple[float, float]]] = []
     blocked: list[tuple[float, float]] | None = None
@@ -423,6 +456,7 @@ def prepare_title_overlay(
                 card_top=card_top,
                 card_height=card_height,
                 placement=SEAM_PLACEMENT,
+                pinned=pinned,
             )
         blocked = []
         if split_time > 0:
@@ -454,12 +488,13 @@ def prepare_title_overlay(
         if candidate[1] != image_path:
             candidate[1].unlink(missing_ok=True)
     logger.info(
-        "Title card: %s at y=%d (%d px tall); covers a face in %d of %d sampled frames",
+        "Title card: %s at y=%d (%d px tall); covers a face in %d of %d sampled frames%s",
         label,
         card_top,
         card_height,
         covered,
         len(zones),
+        " (pinned for the whole clip)" if pinned else "",
     )
     return TitleOverlay(
         image_path=image_path,
@@ -469,18 +504,32 @@ def prepare_title_overlay(
         card_top=card_top,
         card_height=card_height,
         placement=label,
+        pinned=pinned,
     )
+
+
+def title_above_captions(title: TitleOverlay | None) -> tuple[float, int] | None:
+    """(seconds, bottom y) when the captions must sit just under the card while it
+    shows: a card on the split view's seam, or under the slides (webinar layout)."""
+    if title is None or title.placement not in {SEAM_PLACEMENT, WEBINAR_PLACEMENT}:
+        return None
+    return title.seconds, title.card_top + title.card_height
 
 
 def overlay_filter(
     base_label: str, input_index: int, overlay: TitleOverlay, output_label: str
 ) -> str:
-    """FFmpeg filter graph piece: fade the card in (rising slightly), then out."""
-    fade_out_start = max(0.0, overlay.seconds - FADE_OUT)
+    """FFmpeg filter graph piece: fade the card in (rising slightly), then out. A
+    pinned card has no fade-out: it stays to the clip's last frame."""
+    fade_out = (
+        ""
+        if overlay.pinned
+        else f",fade=t=out:st={max(0.0, overlay.seconds - FADE_OUT):.3f}:d={FADE_OUT}:alpha=1"
+    )
     return (
         f"[{input_index}:v]format=rgba,"
-        f"fade=t=in:st=0:d={FADE_IN}:alpha=1,"
-        f"fade=t=out:st={fade_out_start:.3f}:d={FADE_OUT}:alpha=1[title];"
+        f"fade=t=in:st=0:d={FADE_IN}:alpha=1{fade_out}[title];"
         f"[{base_label}][title]overlay=x={overlay.x}:"
-        f"y='{overlay.y}+{SLIDE_PX}*max(0,1-t/{FADE_IN})':eof_action=pass[{output_label}]"
+        f"y='{overlay.y}+{SLIDE_PX}*max(0,1-t/{FADE_IN})':"
+        f"eof_action={'repeat' if overlay.pinned else 'pass'}[{output_label}]"
     )
