@@ -169,6 +169,39 @@ def build_subject(short_topic: str = "", content_format: str = "", clip_count: i
     return f"{clip_count} {noun} from your recent {kind}"
 
 
+_CUT_COUNT = re.compile(r"I cut \d+ highlight moments?")
+_SUBJECT_COUNT = re.compile(r"^(\d+) ([Ss])horts?\b")
+_COUNT_WORDING = (  # (several clips, one clip) in the round 18 template
+    ("into vertical 9:16 clips with captions", "into a vertical 9:16 clip with captions"),
+    ("They’re completely yours", "It’s completely yours"),
+    ("how they perform", "how it performs"),
+)
+
+
+def set_clip_count(email: str, count: int) -> tuple[str, bool]:
+    """The draft after removing clips: '...I cut 2 highlight moments...' and the rest of
+    the wording to match. Returns (email, True), or (email unchanged, False) when the
+    email doesn't use the template's 'I cut N highlight moments' wording (you
+    rewrote it): then check the number yourself."""
+    if not _CUT_COUNT.search(email or ""):
+        return email, False
+    one = count == 1
+    email = _CUT_COUNT.sub(f"I cut {count} highlight moment{'' if one else 's'}", email, count=1)
+    for several, single in _COUNT_WORDING:
+        email = email.replace(several, single) if one else email.replace(single, several)
+    return email, True
+
+
+def set_subject_count(subject: str, count: int) -> str:
+    """'3 shorts from your knee pain video' -> '2 shorts from ...'. A subject that
+    doesn't start with the number is left alone."""
+    match = _SUBJECT_COUNT.match(subject or "")
+    if not match:
+        return subject
+    noun = f"{match.group(2)}hort{'' if count == 1 else 's'}"
+    return f"{count} {noun}{subject[match.end():]}"
+
+
 _OLD_SUBJECT = re.compile(r"^(\d+) Shorts? from your (?:latest )?")
 
 

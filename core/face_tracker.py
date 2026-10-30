@@ -264,26 +264,84 @@ def _face_detector() -> _FaceDetector:
 ON_CAMERA_SAMPLES = 16  # evenly spaced frames between 5% and 95% of the video
 MIN_FACE_WIDTH_RATIO = 0.025  # faces narrower than this share of the frame don't count
 
+# Screen share with a webcam overlay (slides, tutorial, gameplay + a small face cam in
+# a corner): those creators are skipped ("screen_share_pip"). Measured on real
+# podcasts: a close-up face box is 3-4% of the frame; a wide two-person shot's faces
+# are 0.3-0.5% each but at mid-height on both sides. A webcam face is under ~1.5%,
+# near a corner, and stays in the same spot. (A size limit alone, like "under 8-10%
+# of the frame", would also catch every normal talking-head video.)
+PIP_MAX_FACE_AREA = 0.015  # face box area / frame area
+PIP_CORNER_X = 0.25  # face center within this share of the width from the left or right edge
+PIP_CORNER_Y = 0.30  # ...and within this share of the height from the top or bottom edge
+PIP_MIN_SHARE = 0.7  # of the sampled frames that show a face
+PIP_MIN_FRAMES = 4
+PIP_SAME_SPOT = 0.06  # an overlay doesn't move: within this share of the width (and height)
 
-def on_camera_share(video_path: Path, samples: int = ON_CAMERA_SAMPLES) -> float | None:
-    """Share of sampled frames that show a face, from 0.0 to 1.0.
 
-    Returns None when it can't tell (no detector, unreadable video), so a
-    caller never skips a creator because of a broken check.
-    """
+@dataclass(frozen=True)
+class CameraCheck:
+    """``share``: share of sampled frames with a face (None: couldn't tell).
+    ``screen_share_pip``: the only face is a small webcam overlay in ``pip_corner``."""
+
+    share: float | None
+    screen_share_pip: bool = False
+    pip_corner: str = ""
+
+
+def pip_corner(cx: float, cy: float, area: float) -> str | None:
+    """'top-right' etc. for a face small enough and close enough to a corner to be a
+    webcam overlay; None otherwise. All values are shares of the frame (0-1)."""
+    if area > PIP_MAX_FACE_AREA:
+        return None
+    side = "left" if cx <= PIP_CORNER_X else "right" if cx >= 1 - PIP_CORNER_X else None
+    level = "top" if cy <= PIP_CORNER_Y else "bottom" if cy >= 1 - PIP_CORNER_Y else None
+    return f"{level}-{side}" if side and level else None
+
+
+def classify_camera(frames: list[list[tuple[float, float, float]]], checked: int) -> CameraCheck:
+    """``frames``: each sampled frame's faces as (center x, center y, area), shares of
+    the frame. A screen share with a webcam overlay: in at least PIP_MIN_SHARE of the
+    frames that show a face, the faces are all in one corner, small, and in the same
+    spot every time."""
+    if checked < 1:
+        return CameraCheck(None)
+    with_face = [faces for faces in frames if faces]
+    share = len(with_face) / checked
+    spots: list[tuple[str, float, float]] = []
+    for faces in with_face:
+        corners = {pip_corner(cx, cy, area) for cx, cy, area in faces}
+        if len(corners) == 1 and None not in corners:
+            spots.append((corners.pop(), statistics.median(f[0] for f in faces), statistics.median(f[1] for f in faces)))
+    needed = max(PIP_MIN_FRAMES, PIP_MIN_SHARE * len(with_face))
+    if len(spots) < needed:
+        return CameraCheck(share)
+    corner = statistics.mode(spot[0] for spot in spots)
+    same = [spot for spot in spots if spot[0] == corner]
+    x = statistics.median(spot[1] for spot in same)
+    y = statistics.median(spot[2] for spot in same)
+    steady = [spot for spot in same if abs(spot[1] - x) <= PIP_SAME_SPOT and abs(spot[2] - y) <= PIP_SAME_SPOT * 16 / 9]
+    if len(steady) < needed:
+        return CameraCheck(share)
+    return CameraCheck(share, True, corner)
+
+
+def camera_check(video_path: Path, samples: int = ON_CAMERA_SAMPLES) -> CameraCheck:
+    """One look at ``samples`` frames: is anyone on camera, and is it a screen share
+    with a corner webcam? CameraCheck(None) when it can't tell (no detector, unreadable
+    video), so a broken check never skips a creator."""
     detector = _face_detector()
     if not detector.available or samples < 1:
-        return None
+        return CameraCheck(None)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
-        return None
+        return CameraCheck(None)
     try:
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
         if fps <= 0 or frame_count <= 0:
-            return None
+            return CameraCheck(None)
         duration = frame_count / fps
-        checked = with_face = 0
+        frames: list[list[tuple[float, float, float]]] = []
         for index in range(samples):
             seconds = duration * (0.05 + 0.9 * (index + 0.5) / samples)
             capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.0)
@@ -293,15 +351,22 @@ def on_camera_share(video_path: Path, samples: int = ON_CAMERA_SAMPLES) -> float
             height, width = frame.shape[:2]
             if width > FACE_FRAME_WIDTH:
                 frame = cv2.resize(frame, (FACE_FRAME_WIDTH, max(1, round(height * FACE_FRAME_WIDTH / width))))
-            checked += 1
-            min_width = MIN_FACE_WIDTH_RATIO * frame.shape[1]
-            if any(face_width >= min_width for _x, _y, face_width, _h, _score in detector.detect(frame)):
-                with_face += 1
-        if checked < max(1, samples // 2):
-            return None
-        return with_face / checked
+            height, width = frame.shape[:2]
+            frames.append([
+                (cx / width, cy / height, w * h / (width * height))
+                for cx, cy, w, h, _score in detector.detect(frame)
+                if w >= MIN_FACE_WIDTH_RATIO * width
+            ])
+        if len(frames) < max(1, samples // 2):
+            return CameraCheck(None)
+        return classify_camera(frames, len(frames))
     finally:
         capture.release()
+
+
+def on_camera_share(video_path: Path, samples: int = ON_CAMERA_SAMPLES) -> float | None:
+    """Share of sampled frames that show a face, from 0.0 to 1.0 (None: can't tell)."""
+    return camera_check(video_path, samples).share
 
 
 # ---------------------------------------------------------------------------
@@ -725,13 +790,20 @@ def analyze_crop_plan(
     detector = _face_detector()
     scale = frame_width / FACE_FRAME_WIDTH
     samples: list[tuple[float, list[tuple[float, float]]]] = []
+    frame_area = float(FACE_FRAME_WIDTH * face_height)
     for index, frame in enumerate(face_frames):
         faces = detector.detect(frame) if detector.available else []
         samples.append(
             (
                 index / FACE_ANALYSIS_FPS,
-                # (center x, area, center y, width) in source pixels
-                [(cx * scale, w * h * scale * scale, cy * scale, w * scale) for cx, cy, w, h, _s in faces],
+                # (center x, area, center y, width) in source pixels. A small face in a
+                # corner is a webcam overlay on a screen share: it never steers the crop
+                # (that shot shows the whole frame instead, like a slide).
+                [
+                    (cx * scale, w * h * scale * scale, cy * scale, w * scale)
+                    for cx, cy, w, h, _s in faces
+                    if pip_corner(cx / FACE_FRAME_WIDTH, cy / face_height, w * h / frame_area) is None
+                ],
             )
         )
 

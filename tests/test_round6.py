@@ -53,6 +53,7 @@ check("Unreadable video -> None", F.on_camera_share(tmp / "missing.mp4") is None
 
 # ---------- Worker: faceless creator is skipped before any expensive step ----------
 import autonomous_worker as W
+from core.face_tracker import CameraCheck  # noqa: E402
 W.STORAGE_DIR = tmp
 for name, value in (("PENDING_OUTREACH_PATH", "pending.json"), ("SEEN_CHANNELS_PATH", "seen.json"),
                     ("PROCESSED_CREATORS_PATH", "processed.json"), ("LEAD_QUEUE_PATH", "queue.json"),
@@ -76,7 +77,7 @@ lead = {"channel_id": "UCx", "channel_title": "Slides Channel", "latest_video_ti
 settings = SimpleNamespace(temp_dir=tmp / "temp", raw_dir=src)
 (tmp / "temp").mkdir()
 
-W.on_camera_share = lambda path: 0.1
+W.camera_check = lambda path: CameraCheck(0.1)  # round 19: one check for camera and screen share
 try:
     W._process_lead(lead, settings)
     raised = None
@@ -93,7 +94,7 @@ check("Creator is never queued again (seen list)", "UCx" in json.loads(W.SEEN_CH
 check("Not requeued for a retry", json.loads(W.LEAD_QUEUE_PATH.read_text()) == [])
 
 calls.clear()
-W.on_camera_share = lambda path: None
+W.camera_check = lambda path: CameraCheck(None)  # round 19: one check for camera and screen share
 try:
     W._process_lead(lead, settings)
 except W.NotAFit:
@@ -102,7 +103,7 @@ except Exception:
     pass  # later steps are faked badly on purpose; we only care that it went past the check
 check("Check unsure (None) -> carries on to transcribing", "transcribe" in calls, str(calls))
 calls.clear()
-W.on_camera_share = lambda path: 0.8
+W.camera_check = lambda path: CameraCheck(0.8)  # round 19: one check for camera and screen share
 try:
     W._process_lead(lead, settings)
 except W.NotAFit:

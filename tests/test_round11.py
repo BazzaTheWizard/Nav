@@ -173,6 +173,7 @@ check("App (no gate): no judge answer -> nothing dropped", len(clips) == 3)
 
 # ---------- Worker: gate, record data, pass reasons ----------
 import autonomous_worker as W
+from core.face_tracker import CameraCheck  # noqa: E402
 W.STORAGE_DIR = tmp
 for name, file in (("PENDING_OUTREACH_PATH", "pending.json"), ("SEEN_CHANNELS_PATH", "seen.json"),
                    ("PROCESSED_CREATORS_PATH", "processed.json"), ("LEAD_QUEUE_PATH", "queue.json"),
@@ -182,7 +183,7 @@ from types import SimpleNamespace
 W.check_drive_access = lambda: None
 W.download_source_video = lambda url: str(tmp / "src.mp4")
 (tmp / "src.mp4").write_bytes(b"x")
-W.on_camera_share = lambda path: 0.9
+W.camera_check = lambda path: CameraCheck(0.9)  # round 19: one check for camera and screen share
 W.extract_audio_only = lambda src, dst: dst
 W.transcribe_audio = lambda audio, settings: words
 W._video_duration = lambda path: 1800.0

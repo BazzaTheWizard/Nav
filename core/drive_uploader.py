@@ -185,3 +185,45 @@ def replace_clip_in_drive(folder_link: str, file_name: str, new_clip: str | Path
         )
         .execute(num_retries=UPLOAD_RETRIES)
     )
+
+
+_FOLDER_COUNT = re.compile(r"\b\d+ sample Shorts?\b")
+
+
+def remove_clip_in_drive(folder_link: str, index: int, count: int) -> None:
+    """Take clip ``index`` (from 1) out of a pitch's Drive folder: its file goes to the
+    Drive trash, later clips move up one number (clip_03.mp4 -> clip_02.mp4), and the
+    folder name says one Short fewer. ``count``: how many clips the pitch has now;
+    running it again after a failure finishes the job instead of removing another."""
+    match = _FOLDER_ID.search(folder_link or "")
+    if match is None:
+        raise ValueError(f"Not a Google Drive folder link: {folder_link!r}")
+    folder_id = match.group(1)
+    drive = build("drive", "v3", credentials=_get_user_credentials(), cache_discovery=False)
+    listing = (
+        drive.files()
+        .list(
+            q=f"'{folder_id}' in parents and name contains 'clip_' and trashed = false",
+            fields="files(id,name)",
+            pageSize=50,
+        )
+        .execute(num_retries=UPLOAD_RETRIES)
+        .get("files", [])
+    )
+    files = {item["name"]: item["id"] for item in listing if re.fullmatch(r"clip_\d{2}\.mp4", item["name"])}
+
+    def clip_name(number: int) -> str:
+        return f"clip_{number:02d}.mp4"
+
+    if clip_name(index) in files and len(files) == count:  # nothing moved yet
+        drive.files().update(fileId=files.pop(clip_name(index)), body={"trashed": True}).execute(num_retries=UPLOAD_RETRIES)
+    for number in range(index + 1, count + 1):
+        if clip_name(number) in files and clip_name(number - 1) not in files:
+            file_id = files.pop(clip_name(number))
+            drive.files().update(fileId=file_id, body={"name": clip_name(number - 1)}).execute(num_retries=UPLOAD_RETRIES)
+            files[clip_name(number - 1)] = file_id
+    folder = drive.files().get(fileId=folder_id, fields="name").execute(num_retries=UPLOAD_RETRIES)
+    name = str(folder.get("name") or "")
+    renamed = _FOLDER_COUNT.sub(f"{count - 1} sample Short{'' if count - 1 == 1 else 's'}", name, count=1)
+    if renamed != name:
+        drive.files().update(fileId=folder_id, body={"name": renamed}).execute(num_retries=UPLOAD_RETRIES)

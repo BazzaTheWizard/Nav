@@ -207,6 +207,69 @@ def replace_clip(name: str, file_name: str, clip: Path, start: float | None = No
         )
 
 
+def remove_clip(name: str, index: int, expected_count: int) -> int:
+    """Take clip ``index`` (from 1) off a page: the later clips move up one number
+    (clip_03 -> clip_02, posters too, copied inside the bucket), page.json lists one
+    clip fewer, and the last number's files are deleted. Returns the new count.
+
+    Safe to run again after a failure (``expected_count``: how many clips the pitch
+    has now). The later clips are first copied aside, and page.json notes the move
+    before any original is overwritten, so a retry always copies from the right files
+    and never removes a second clip."""
+    settings, client = _require()
+    _check_name(name)
+    if not 1 <= index <= expected_count:
+        raise ValueError(f"No clip {index} on a page with {expected_count} clips.")
+    bucket = settings.bucket
+
+    def read_page() -> dict[str, Any]:
+        return json.loads(client.get_object(Bucket=bucket, Key=f"{name}/page.json")["Body"].read())
+
+    def write_page(info: dict[str, Any]) -> None:
+        client.put_object(
+            Bucket=bucket, Key=f"{name}/page.json", Body=json.dumps(info).encode(),
+            ContentType="application/json", CacheControl="no-cache",
+        )
+
+    files = [(number, kind, extension) for number in range(index + 1, expected_count + 1)
+             for kind, extension in (("clip", "mp4"), ("poster", "jpg"))]
+    info = read_page()
+    clips = list(info.get("clips") or [])
+    moving = info.get("moving")
+    if not moving and len(clips) == expected_count:
+        # 1. Copy the later clips aside (the originals are untouched until step 2).
+        moving = {"index": index, "count": expected_count, "run": secrets.token_hex(4)}
+        for number, kind, extension in files:
+            client.copy_object(
+                Bucket=bucket, Key=f"{name}/_moving/{moving['run']}/{kind}_{number:02d}.{extension}",
+                CopySource={"Bucket": bucket, "Key": f"{name}/{kind}_{number:02d}.{extension}"},
+            )
+        info["moving"] = moving
+        write_page(info)
+    if moving:
+        if (moving.get("index"), moving.get("count")) != (index, expected_count):
+            raise RuntimeError("Another clip removal on this page didn't finish. Refresh the app and try again.")
+        # 2. Put them under their new numbers (repeatable: always from the copies).
+        for number, kind, extension in files:
+            client.copy_object(
+                Bucket=bucket, Key=f"{name}/{kind}_{number - 1:02d}.{extension}",
+                CopySource={"Bucket": bucket, "Key": f"{name}/_moving/{moving['run']}/{kind}_{number:02d}.{extension}"},
+            )
+        info.pop("moving", None)
+        info["clips"] = clips[: index - 1] + clips[index:]
+        write_page(info)
+    elif len(clips) != expected_count - 1:  # not an earlier attempt that got this far either
+        raise RuntimeError(f"The page has {len(clips)} clips, not {expected_count}. Refresh the app and try again.")
+    # 3. The last number's files (now copies) and the set-aside copies go.
+    client.delete_objects(
+        Bucket=bucket,
+        Delete={"Objects": [{"Key": f"{name}/clip_{expected_count:02d}.mp4"},
+                            {"Key": f"{name}/poster_{expected_count:02d}.jpg"}], "Quiet": True},
+    )
+    _delete_prefixes(client, settings, [f"{name}/_moving/"])
+    return expected_count - 1
+
+
 def _delete_prefixes(client: Any, settings: PageSettings, prefixes: Iterable[str]) -> int:
     """Delete in rounds (list what's left, delete it) rather than paging through a
     listing while deleting from it, which can skip files."""

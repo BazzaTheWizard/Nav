@@ -303,6 +303,36 @@ def discard_trim(record_id: str, index: int) -> None:
     _write_manifest(record_id, manifest)
 
 
+def remove_clip_files(record_id: str, index: int, root: Path | None = None) -> int:
+    """Delete clip ``index`` (from 1) from the pitch's saved files (the clip, preview,
+    source slice and any waiting trim); later clips move up one number, files and
+    manifest both, a waiting trim moving with its clip. Returns the new count."""
+    directory = pitch_dir(record_id, root)
+    manifest = json.loads((directory / "pitch.json").read_text(encoding="utf-8"))
+    clips = manifest.get("clips", [])
+    removed = next((clip for clip in clips if clip["index"] == index), None)
+    if removed is None:
+        raise ValueError(f"No clip {index} in this pitch.")
+    for key in ("file", "preview", "source"):
+        (directory / removed[key]).unlink(missing_ok=True)
+        (directory / _trim_name(removed[key])).unlink(missing_ok=True)
+    remaining = sorted((clip for clip in clips if clip is not removed), key=lambda clip: clip["index"])
+    for number, clip in enumerate(remaining, start=1):
+        if clip["index"] == number:
+            continue
+        names = {"file": f"clip_{number:02d}.mp4", "preview": f"clip_{number:02d}.preview.mp4",
+                 "source": f"clip_{number:02d}.source.mp4"}
+        for key, new_name in names.items():
+            for old, new in ((clip[key], new_name), (_trim_name(clip[key]), _trim_name(new_name))):
+                if (directory / old).is_file():
+                    (directory / old).replace(directory / new)
+            clip[key] = new_name
+        clip["index"] = number
+    manifest["clips"] = remaining
+    _write_manifest(record_id, manifest, root)
+    return len(remaining)
+
+
 def remove_pitch_files(record_id: str, root: Path | None = None) -> None:
     """Best effort: called when a pitch is sent or passed."""
     try:

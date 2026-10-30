@@ -176,6 +176,7 @@ check("Worker starts without loading faster-whisper/PyAV (no objc duplicate-clas
 
 # ---------- Worker state: a damaged file stops it instead of starting over empty ----------
 import autonomous_worker as W  # noqa: E402
+from core.face_tracker import CameraCheck  # noqa: E402
 def use_storage(folder):
     W.STORAGE_DIR = folder; folder.mkdir(parents=True, exist_ok=True)
     for attr, file in (("PENDING_OUTREACH_PATH", "pending.json"), ("SEEN_CHANNELS_PATH", "seen.json"),
@@ -217,7 +218,7 @@ use_storage(tmp / "worker")
 W.init_storage_files()
 calls = []
 W.download_source_video = lambda url: calls.append("download") or str(tmp / "src.mp4")
-W.on_camera_share = lambda path: 1.0
+W.camera_check = lambda path: CameraCheck(1.0)  # round 19: one check for camera and screen share
 W.extract_audio_only = lambda src, dst: calls.append("audio") or dst
 W.transcribe_audio = lambda audio, settings: calls.append("groq") or [Word("Hello there.", 1.0, 1.6, 1.0, 1.6)]
 W._video_duration = lambda path: 1800.0
@@ -304,7 +305,7 @@ try:
     W._process_lead(dict(lead, channel_id="UC6"), settings)
 except RuntimeError:
     pass
-W.on_camera_share = lambda path: 0.05
+W.camera_check = lambda path: CameraCheck(0.05)  # round 19: one check for camera and screen share
 try:
     W._process_lead(dict(lead, channel_id="UC6"), settings)
 except W.NotAFit:

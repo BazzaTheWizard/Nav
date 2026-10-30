@@ -27,8 +27,8 @@ from core.downloader import (
     extract_audio_only,
     yt_dlp_version,
 )
-from core.drive_uploader import DriveAuthError, check_drive_access, upload_clips_to_drive
-from core.face_tracker import on_camera_share
+from core.drive_uploader import DriveAuthError, check_drive_access, remove_clip_in_drive, upload_clips_to_drive
+from core.face_tracker import camera_check
 from core.storage_manager import prune_stale_files
 from core.hook_selector import ClipResult
 from core.outreach import (
@@ -39,6 +39,8 @@ from core.outreach import (
     greeting_name_of,
     is_old_template,
     modern_subject,
+    set_clip_count,
+    set_subject_count,
     refresh_site_links,
     rewrite_old_draft,
     site_host,
@@ -52,6 +54,7 @@ from core.lead_harvester import (
 )
 from core.hook_selector import replay_peaks
 from core.pipeline import (
+    MIN_CLIPS,
     WeakMoments,
     pick_clips_with_agent,
     render_selected_clip,
@@ -59,7 +62,7 @@ from core.pipeline import (
 )
 from core.service_pause import ServicePause
 from core import clip_pages
-from core.pitch_files import prune_pitch_files, remove_pitch_files, save_pitch_files
+from core.pitch_files import pitch_dir, prune_pitch_files, remove_clip_files, remove_pitch_files, save_pitch_files
 from core.transcriber import TranscriptionLimitReached, Word, transcribe_audio
 from main import _video_duration
 
@@ -93,6 +96,9 @@ DRIVE_SIGN_IN_WAIT_SEC = 10 * 60
 # (narration, slides, animation): those creators aren't a fit, so they're
 # skipped right after download, before any transcribing, AI, rendering or upload.
 MIN_ON_CAMERA_SHARE = 0.25
+# Slides, tutorials or gameplay with a small webcam in a corner (core.face_tracker
+# camera_check): skipped as not a fit, with this code at the start of the reason.
+SCREEN_SHARE_PIP = "screen_share_pip"
 LOG_PATH = STORAGE_DIR / "logs" / "worker.log"
 
 # yt-dlp/YouTube errors that will fail the same way every time: fail the lead now
@@ -732,7 +738,7 @@ def get_recently_passed(now: datetime | None = None) -> list[dict[str, Any]]:
 def pass_summary(now: datetime | None = None) -> dict[str, int]:
     """Last PASSED_LOOKBACK_DAYS: how often each pass reason was used, plus leads
     the worker skipped by itself ("auto_weak": no clip good enough, "auto_faceless":
-    nobody on camera)."""
+    nobody on camera, "auto_screen_share": a screen share with a corner webcam)."""
     now = now or datetime.now(timezone.utc)
     cutoff = timedelta(days=PASSED_LOOKBACK_DAYS)
     counts: dict[str, int] = {}
@@ -751,7 +757,12 @@ def pass_summary(now: datetime | None = None) -> dict[str, int]:
             counts[record["pass_reason"]] = counts.get(record["pass_reason"], 0) + 1
     for record in state.get("records", []):
         if record.get("status") == "not a fit" and recent(record.get("updated_at")):
-            key = "auto_weak" if str(record.get("error", "")).startswith("weak moments") else "auto_faceless"
+            error = str(record.get("error", ""))
+            key = (
+                "auto_weak" if error.startswith("weak moments")
+                else "auto_screen_share" if error.startswith(SCREEN_SHARE_PIP)
+                else "auto_faceless"
+            )
             counts[key] = counts.get(key, 0) + 1
     return counts
 
@@ -843,6 +854,63 @@ def record_clip_trim(record_id: str, index: int, start: float, end: float) -> bo
             _write_json_atomic(PENDING_OUTREACH_PATH, pending)
             return True
     return False
+
+
+def remove_pitch_clip(record_id: str, index: int) -> dict[str, Any]:
+    """Drop clip ``index`` (from 1) from a pitch in the Outbox: off their clip page, out
+    of the Drive backup, this Mac's saved files and the record. Later clips move up one
+    number, and the email and subject say the new count. The page and Drive change
+    first, so if one fails, nothing on this Mac has changed yet and you can try again.
+    Returns {"count": clips left, "email_updated": bool, "drive_failed": bool}."""
+    with _worker_lock():
+        record = next(
+            (r for r in _pending_records() if r.get("record_id") == record_id and r.get("status", "pending") == "pending"),
+            None,
+        )
+    if record is None:
+        raise ValueError("This pitch isn't in the Outbox any more.")
+    manifest = pitch_dir(record_id, _pitches_dir()) / "pitch.json"
+    count = (
+        len(json.loads(manifest.read_text(encoding="utf-8")).get("clips", []))
+        if manifest.is_file()
+        else len(record.get("clips") or [])
+    )
+    if count <= MIN_CLIPS:
+        raise ValueError(f"A pitch keeps at least {MIN_CLIPS} clips. To send fewer, Pass this creator.")
+    if not 1 <= index <= count:
+        raise ValueError(f"There's no clip {index} in this pitch.")
+
+    page_name = str(record.get("page_name") or "")
+    if page_name and not record.get("page_removed_at"):
+        clip_pages.remove_clip(page_name, index, count)
+    drive_failed = False
+    drive_link = str(record.get("drive_link") or "")
+    if drive_link:
+        try:
+            remove_clip_in_drive(drive_link, index, count)
+        except Exception:
+            if not record.get("page_url"):
+                raise  # Drive is the link in the email: it has to match
+            drive_failed = True
+            logger.warning("Couldn't remove clip %d from the Drive backup of %s.", index, record.get("channel_title"), exc_info=True)
+    if manifest.is_file():
+        remove_clip_files(record_id, index, _pitches_dir())
+
+    with _worker_lock():
+        pending = _pending_records()
+        current = next((r for r in pending if r.get("record_id") == record_id), None)
+        if current is None:
+            raise ValueError("This pitch isn't in the Outbox any more.")
+        clips = current.get("clips")
+        if isinstance(clips, list) and len(clips) >= index:
+            # Kept for tuning: which clips you took out (their scores and framing).
+            current.setdefault("removed_clips", []).append(clips.pop(index - 1))
+        body, email_updated = set_clip_count(str(current.get("full_email_body") or ""), count - 1)
+        current["full_email_body"] = body
+        current["subject"] = set_subject_count(str(current.get("subject") or ""), count - 1)
+        _write_json_atomic(PENDING_OUTREACH_PATH, pending)
+    logger.info("Removed clip %d from the pitch for %s; %d left.", index, record.get("channel_title"), count - 1)
+    return {"count": count - 1, "email_updated": email_updated, "drive_failed": drive_failed}
 
 
 # Why you passed on a pitch (Outbox buttons). Saved on the record so the lead
@@ -1227,7 +1295,11 @@ def _process_lead(
     page_name: str | None = None
     try:
         source_video = Path(download_source_video(video_url))
-        share = on_camera_share(source_video)
+        # Right after the download, before any transcribing, AI, rendering or upload.
+        camera = camera_check(source_video)
+        if camera.screen_share_pip:
+            raise NotAFit(f"{SCREEN_SHARE_PIP}: a screen share with a small webcam in the {camera.pip_corner} corner")
+        share = camera.share
         if share is not None and share < MIN_ON_CAMERA_SHARE:
             raise NotAFit(f"no one on camera (a face in {share:.0%} of sampled frames)")
         words = load_cached_transcript(video_id)

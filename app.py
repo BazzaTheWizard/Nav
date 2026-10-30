@@ -30,6 +30,7 @@ from autonomous_worker import (
     mark_follow_up,
     prioritize_queued_lead,
     record_clip_trim,
+    remove_pitch_clip,
     drive_backup_on,
     restore_passed_as_sent,
     update_pending_draft,
@@ -64,6 +65,7 @@ from core.outreach import (
 )
 from core.hook_selector import ClipResult, select_clips
 from core.pipeline import (
+    MIN_CLIPS,
     pick_clips_with_agent,
     render_selected_clip,
     video_info_and_peaks,
@@ -841,6 +843,12 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
         body_key = f"pending_pitch_{record_id}"
         name_key = f"pending_name_{record_id}"
         email_body = str(record.get("full_email_body") or "")
+        if st.session_state.pop(f"draft_refresh_{record_id}", False):  # a clip was removed: new count
+            st.session_state[subject_key] = str(record.get("subject") or SUBJECT)
+            st.session_state[body_key] = email_body
+        note = st.session_state.pop(f"pitch_toast_{record_id}", None)
+        if note:
+            st.toast(note, icon="🗑️")
         # Widgets start from the saved draft; edits are saved as you make them.
         st.session_state.setdefault(subject_key, str(record.get("subject") or SUBJECT))
         st.session_state.setdefault(body_key, email_body)
@@ -950,6 +958,8 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
     # waiting (after the app restarts, say). Its arguments never change, so Streamlit
     # never treats it as a new, closed panel.
     open_key = f"trim_open_{record_id}_{index}"
+    if st.session_state.pop(f"trim_close_{record_id}_{index}", False):  # a clip before it was removed
+        st.session_state[open_key] = False
     if waiting and open_key not in st.session_state:
         st.session_state[open_key] = True
     with st.expander("✂️ Trim", key=open_key, on_change=_ignore):
@@ -1015,6 +1025,50 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
                 discard_trim(record_id, index)
                 st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
                 _rerun_this_clip()
+    _render_remove_clip(record, index, len(pitch.get("clips", [])))
+
+
+def _render_remove_clip(record: dict[str, Any], index: int, count: int) -> None:
+    """🗑 Remove clip: confirm in a pop-over (floats, so nothing moves until you do)."""
+    record_id = str(record["record_id"])
+    if count <= MIN_CLIPS:
+        st.button(
+            "🗑 Remove clip", key=f"remove_off_{record_id}_{index}", disabled=True, width="stretch",
+            help=f"A pitch keeps at least {MIN_CLIPS} clips. To send fewer, Pass this creator.",
+        )
+        return
+    places = [p for p in (
+        "their clip page" if record.get("page_name") else "",
+        "the Drive backup" if record.get("drive_link") else "",
+        "this Mac",
+    ) if p]
+    where = ", ".join(places[:-1]) + (" and " if len(places) > 1 else "") + places[-1]
+    with st.popover("🗑 Remove clip", width="stretch"):
+        st.markdown(
+            f"Remove clip {index}? It's deleted from {where}. The clips after it move up a number, "
+            f"and the email and subject change to {count - 1}."
+        )
+        if not st.button(f"Yes, remove clip {index}", key=f"remove_clip_{record_id}_{index}", type="primary", width="stretch"):
+            return
+        with st.spinner("Removing…"):
+            try:
+                result = remove_pitch_clip(record_id, index)
+            except Exception as exc:
+                logging.exception("Could not remove the clip")
+                st.error(f"Couldn't remove it: {exc}")
+                return
+    # The clips after it changed numbers: their trim numbers start at 0 and their panels closed.
+    for number in range(index, count + 1):
+        st.session_state[f"trim_reset_{record_id}_{number}"] = [f"trim_start_{record_id}_{number}", f"trim_end_{record_id}_{number}"]
+        st.session_state[f"trim_close_{record_id}_{number}"] = True
+    st.session_state[f"draft_refresh_{record_id}"] = True
+    note = f"Clip {index} removed. {result['count']} clips left; the email and subject say {result['count']}."
+    if not result["email_updated"]:
+        note = f"Clip {index} removed. Your email doesn't use the usual 'I cut N highlight moments' line: check the number in it."
+    if result["drive_failed"]:
+        note += " The Drive backup couldn't be updated (their page is fine)."
+    st.session_state[f"pitch_toast_{record_id}"] = note
+    st.rerun()  # the whole card: clip count, scores, email and subject
 
 
 def _rerun_this_clip() -> None:
@@ -1525,6 +1579,7 @@ def _render_pass_menu(channel_id: str, key: str) -> None:
 _AUTO_SKIP_LABELS = {
     "auto_weak": "no clip strong enough",
     "auto_faceless": "nobody on camera",
+    "auto_screen_share": "screen share with a corner webcam",
 }
 
 

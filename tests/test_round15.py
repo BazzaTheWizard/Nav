@@ -155,6 +155,7 @@ DU.build, DU._get_user_credentials = real_build, real_creds
 
 # ---------- Worker: files made with the pitch, gone when sent/passed ----------
 import autonomous_worker as W
+from core.face_tracker import CameraCheck  # noqa: E402
 W.STORAGE_DIR = tmp / "storage"
 W.STORAGE_DIR.mkdir()
 for name, file in (("PENDING_OUTREACH_PATH", "pending.json"), ("SEEN_CHANNELS_PATH", "seen.json"),
@@ -167,7 +168,7 @@ P.PITCHES_DIR = W.STORAGE_DIR / "pitches"
 from core import outreach as O
 W.check_drive_access = lambda: None
 W.download_source_video = lambda url: str(src)
-W.on_camera_share = lambda path: 1.0
+W.camera_check = lambda path: CameraCheck(1.0)  # round 19: one check for camera and screen share
 W.extract_audio_only = lambda s, d: d
 W.transcribe_audio = lambda audio, settings: words
 W._video_duration = lambda path: 120.0

@@ -153,6 +153,7 @@ check("The test page is still cleaned up", "✓ Test page deleted" in lines and 
 
 # ---------- Worker ----------
 import autonomous_worker as W
+from core.face_tracker import CameraCheck  # noqa: E402
 from core import outreach as O
 W.STORAGE_DIR = tmp / "storage"; W.STORAGE_DIR.mkdir()
 for attr, file in (("PENDING_OUTREACH_PATH", "pending.json"), ("SEEN_CHANNELS_PATH", "seen.json"),
@@ -166,7 +167,7 @@ W.check_drive_access = lambda: drive_calls.append("check")
 W.upload_clips_to_drive = lambda *a, **k: drive_calls.append("upload") or DRIVE
 W.download_source_video = lambda url: str(tmp / "src.mp4")
 (tmp / "src.mp4").write_bytes(b"x")
-W.on_camera_share = lambda path: 1.0
+W.camera_check = lambda path: CameraCheck(1.0)  # round 19: one check for camera and screen share
 W.extract_audio_only = lambda s, d: d
 W.transcribe_audio = lambda audio, settings: []
 W._video_duration = lambda path: 1800.0
