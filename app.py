@@ -854,7 +854,8 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
                 key=name_key,
                 on_change=_on_greeting_change,
                 args=(record_id, name_key, body_key),
-                help="Who you're writing to, e.g. Marcela. Updates the 'Hi ___,' line.",
+                help="Who you're writing to, e.g. Marcela. The email opens with it: 'Marcela — I cut ...'. "
+                "Until you type one it says 'Hi there'.",
             )
         with subject_column:
             st.text_input(
@@ -1486,7 +1487,7 @@ def _on_draft_edit(record_id: str, key: str, field: str) -> None:
 
 
 def _on_greeting_change(record_id: str, name_key: str, body_key: str) -> None:
-    """Put the new first name into the 'Hi ___,' line and save both."""
+    """Put the new first name at the start of the email ('Marcela — I cut ...') and save both."""
     name = str(st.session_state.get(name_key, "")).strip()
     if not name:
         return

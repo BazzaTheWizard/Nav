@@ -23,10 +23,10 @@ DRIVE = "https://drive.google.com/drive/folders/abc123"
 email = O.build_outreach_email("Coach Dana", "Knee Pain Fixes", "fixing knee pain when squatting", DRIVE,
                                key_point="squatting below parallel being fine for healthy knees", shorts_status="none")
 body = email.split("\n\n", 1)[1].rsplit("\n\nBest,", 1)[0]
-check("Ends on one interest question", body.endswith("for every new upload?") and body.count("?") == 1)
-check("No-strings line", "No watermark, no strings." in body)
+check("Ends on one interest question", body.endswith("Worth exploring?") and body.count("?") == 1)
+check("No-strings line", "unwatermarked, no strings attached." in body)
 check("Drive link is the only link", email.count("http") == 1 and DRIVE in email)
-check("Key point from the AI is used", "Your point about squatting below parallel" in body)
+check("Round 18 offer: a free week of clips", "produce your clips for the next week completely free" in body)
 check("The AI is asked for a key point", '"key_point"' in __import__("core.agent_brain", fromlist=["x"])._SYSTEM_PROMPT)
 # Round 10: the template no longer mentions their Shorts habits, for any status.
 check("No 'aren't posting' line for any Shorts status", not any(
@@ -44,10 +44,10 @@ softer = ('Hi Coach,\n\nI run Nav Studios, a small editing studio that turns lon
 check("Round 5 'marketing agency' draft is recognised", O.is_old_template(marketing))
 check("Round 5 softer draft is recognised", O.is_old_template(softer))
 redone = O.rewrite_old_draft(marketing, "Tristan", "https://drive.google.com/x")
-check("Rewrite keeps the title",
-      'Your recent video, "The Death Of Ivan Ilych", stuck with me.' in redone, redone[:300])
+check("Rewrite gives the current email for that channel",
+      redone.startswith("Hi there — I cut 3 highlight moments from your recent Tristan upload"), redone[:300])
 check("Rewrite puts the Drive link in", "https://drive.google.com/x" in redone)
-check("Rewrite keeps the topic", "on squat depth" in O.rewrite_old_draft(softer, "Coach", "https://drive.google.com/x"))
+check("Rewrite of the softer draft is the current email too", "Worth exploring?" in O.rewrite_old_draft(softer, "Coach", "https://drive.google.com/x"))
 check("New email is not seen as old", not O.is_old_template(redone) and not O.is_old_template(email))
 
 # ---------- Website address: one line, unsent drafts follow it ----------
@@ -121,7 +121,7 @@ wrapper = tmp / "run_app.py"; wrapper.write_text(script)
 at = AppTest.from_file(str(wrapper), default_timeout=120).run()
 check("App runs", not at.exception, str([e.value for e in at.exception]))
 keys = {t.key: t.value for t in at.text_area if t.key}
-check("Outbox card shows the email", "No watermark, no strings." in keys.get("pending_pitch_draft", ""), str(list(keys)))
+check("Outbox card shows the email", "Worth exploring?" in keys.get("pending_pitch_draft", ""), str(list(keys)))
 check("Waiting section shows the follow-up", "Open to having me do this" in keys.get("follow_body_due", "") and DRIVE in keys.get("follow_body_due", ""))
 check("Waiting section heading", any("Sent: waiting for a reply (1)" in str(h.value) for h in at.subheader))
 

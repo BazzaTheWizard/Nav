@@ -173,7 +173,10 @@ W._video_duration = lambda path: 1800.0
 W.video_info_and_peaks = lambda url: ({}, [])
 from core.hook_selector import ClipResult
 picked = [ClipResult(start_time=100 + i * 60, end_time=140 + i * 60, viral_title="t", caption="c", hashtags=["x"], virality_score=80) for i in range(3)]
-W.pick_clips_with_agent = lambda *a, **k: (picked, O.build_outreach_email("Coach Dana", "Knee Pain Fixes", "fixing knee pain", content_format="episode"), "3 Shorts")
+def episode_pick(*a, **k):
+    k["report"]["format"] = "episode"  # what pick_clips_with_agent reports for a podcast (round 18)
+    return picked, O.build_outreach_email("Coach Dana", "Knee Pain Fixes", "fixing knee pain", content_format="episode"), "3 shorts"
+W.pick_clips_with_agent = episode_pick
 def fake_render(source, clips_, job_dir, settings, words, layouts_out=None, rendered_out=None):
     paths = []
     for i, clip in enumerate(clips_, start=1):

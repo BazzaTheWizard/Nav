@@ -17,7 +17,7 @@ from core.downloader import extract_audio_segment, fetch_video_info
 from core.face_tracker import CropBox, CropPlan, analyze_crop_plan
 from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
-from core.outreach import build_outreach_email, build_subject
+from core.outreach import build_outreach_email, build_subject, clean_format
 from core.service_pause import ServicePause
 from core.title_card import SEAM_PLACEMENT, TitleOverlay, prepare_title_overlay
 from core.transcriber import (
@@ -234,10 +234,11 @@ def pick_clips_with_agent(
         if len(good) < len(clips):
             logger.info("Dropped %d weak clip(s); sending %d.", len(clips) - len(good), len(good))
         clips = good
-    if report is not None:
-        report["judge_scores"] = [judged.get(_clip_key(clip)) for clip in clips]
     short_topic = str(result.get("short_topic") or "")
     content_format = str(result.get("format") or "")
+    if report is not None:
+        report["judge_scores"] = [judged.get(_clip_key(clip)) for clip in clips]
+        report["format"] = clean_format(content_format)  # "episode" or "video", for the clip page
     if not clips:
         return clips, str(result["outreach_email"]), build_subject(short_topic, content_format)
     # "Your point at 12:34 about ...": the best clip's real start time and its point

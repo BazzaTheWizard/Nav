@@ -37,33 +37,31 @@ picks = [
 ]
 answer = {"clips": picks, "short_topic": "knee pain", "format": "podcast", "host_first_name": "dana"}
 A._request_openai = lambda key, prompt, system_prompt=A._SYSTEM_PROMPT: json.dumps(answer)
-clips, email, subject = P.pick_clips_with_agent(words, duration, 3, "Coach Dana", "Knee Pain Fixes")
+report = {}
+clips, email, subject = P.pick_clips_with_agent(words, duration, 3, "Coach Dana", "Knee Pain Fixes", report=report)
 best = max(clips, key=lambda clip: clip.virality_score)
-hook = email.split("\n\n")[1]
 check("Three clips, an email and a subject come back", len(clips) == 3 and email and subject)
-check("Email opens on the best clip", best.viral_title == "Best" and "knee pain coming from weak hips" in hook, hook)
-check("…at that clip's real start time (after snapping)",
-      hook.startswith(f"Your point at {O.format_timestamp(best.start_time)} about "), f"{best.start_time:.1f}s -> {hook[:40]}")
-check("…with its 'flips the usual take' part", hook.endswith("especially how it flips the usual take on knee pain."), hook)
-check("Other clips' points aren't used", "rest days" not in email and "warm-up" not in email)
-check("Podcast -> 'from the episode'", "I cut that moment and two others from the episode into vertical clips with captions:" in email)
-check("Greets the host by first name", email.startswith("Hi Dana,\n\n"))
-check("Subject names the topic", subject == "3 Shorts from your knee pain episode", subject)
+# Round 18: Barry's template names the channel, not a clip's point or time.
+check("Email is the round 18 template for this channel",
+      email.startswith("Dana — I cut 3 highlight moments from your recent Coach Dana upload into vertical 9:16 clips"), email[:120])
+check("No clip points or timestamps in it", best.viral_title == "Best" and "weak hips" not in email
+      and O.format_timestamp(best.start_time) not in email and "rest days" not in email and "warm-up" not in email)
+check("Podcast -> marked an episode (the clip page and subject use it)", report["format"] == "episode", str(report))
+check("Greets the host by first name", email.startswith("Dana — "))
+check("Subject names the topic", subject == "3 shorts from your knee pain episode", subject)
 check("Subject length is in the 36–50 target here", 36 <= len(subject) <= 50, str(len(subject)))
 check("Drive placeholder until the upload", O.DRIVE_LINK_PLACEHOLDER in email and DRIVE in O.fill_drive_link(email, DRIVE))
 
-# The best clip's point is missing: quote its opening words instead of borrowing another clip's point.
+# The best clip's point is missing: the email doesn't change (it never names a moment).
 answer["clips"] = [dict(picks[0], point=""), *picks[1:]]
 _, email2, _ = P.pick_clips_with_agent(words, duration, 3, "Coach Dana", "Knee Pain Fixes")
-hook2 = email2.split("\n\n")[1]
-check("No point for the best clip -> quotes its opening words",
-      hook2.startswith(f"The moment at {O.format_timestamp(best.start_time)} that starts \"w"), hook2)
+check("No point for the best clip -> same email", email2 == email)
 
 # Solo upload, no topic: still a clean subject.
 answer.update(clips=picks, short_topic="", format="video")
 _, email3, subject3 = P.pick_clips_with_agent(words, duration, 3, "Coach Dana", "Knee Pain Fixes")
-check("Solo upload -> 'from the video' and a plain subject",
-      "from the video into vertical clips" in email3 and subject3 == "3 Shorts from your latest video", subject3)
+check("Solo upload -> a plain subject",
+      "Worth exploring?" in email3 and subject3 == "3 shorts from your recent video", subject3)
 
 # Matching a final clip back to the AI's pick when the title differs.
 moved = ClipResult(start_time=108.0, end_time=140.0, viral_title="Renamed", caption="", hashtags=[], virality_score=90)

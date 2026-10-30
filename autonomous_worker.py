@@ -38,6 +38,7 @@ from core.outreach import (
     fill_drive_link,
     greeting_name_of,
     is_old_template,
+    modern_subject,
     refresh_site_links,
     rewrite_old_draft,
     site_host,
@@ -572,17 +573,22 @@ def get_pending_outreach() -> list[dict[str, Any]]:
                     f"{record.get('target_video_id', uuid.uuid4().hex)}"
                 )
                 changed = True
-            # Unsent drafts written with the old template get the new email once.
+            # Unsent drafts written with an older template get the current email once
+            # (same clip count, link and first name; a subject you wrote stays).
             body = str(record.get("full_email_body") or "")
             if record.get("status", "pending") == "pending" and is_old_template(body):
+                clips = [clip for clip in record.get("clips") or [] if isinstance(clip, dict)]
                 record["full_email_body"] = rewrite_old_draft(
                     body,
                     str(record.get("channel_title") or ""),
                     clip_link(record),
                     str(record.get("video_title") or ""),
                     shorts_status=str(record.get("shorts_status") or ""),
+                    clip_count=len(clips) or 3,
                 )
-                record["subject"] = subject_for(record["full_email_body"])
+                old_subject = str(record.get("subject") or "")
+                record["subject"] = modern_subject(old_subject) if old_subject else subject_for(record["full_email_body"])
+                record["greeting_name"] = greeting_name_of(record["full_email_body"])
                 changed = True
             # Unsent drafts follow the current website address (core/outreach.py SITE_URL).
             old_site = str(record.get("site_url") or LEGACY_SITE_URL)
@@ -1090,6 +1096,14 @@ def _update_lead_status(
     _write_json_atomic(PROCESSED_CREATORS_PATH, state)
 
 
+def _content_kind(report: dict[str, Any], subject: str, email: str) -> str:
+    """'episode' (podcast, interview) or 'video', for the clip page's wording."""
+    content_format = str(report.get("format") or "")
+    if content_format:
+        return "episode" if content_format == "episode" else "video"
+    return "episode" if subject.rstrip().endswith(" episode") or " from the episode " in email else "video"
+
+
 def _render_selected_clips(
     source_path: Path,
     clips: list[ClipResult],
@@ -1273,7 +1287,7 @@ def _process_lead(
                     channel_title,
                     video_title,
                     [{"path": path, "start": clip.start_time, "end": clip.end_time} for path, clip in zip(rendered, clips)],
-                    kind="episode" if " from the episode " in outreach_email else "video",
+                    kind=_content_kind(report, subject, outreach_email),
                 )
             except Exception:
                 logger.warning(

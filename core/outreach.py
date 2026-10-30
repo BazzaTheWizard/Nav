@@ -13,7 +13,7 @@ AGENCY = "Nav Studios"  # one name everywhere: email, signature, Drive folder, s
 # line (no trailing slash). Unsent drafts in the Outbox switch to it automatically.
 SITE_URL = "https://navstudiolab.com"
 DRIVE_LINK_PLACEHOLDER = "[Google Drive link is added after the clips upload]"
-SUBJECT = "3 Shorts from your latest video"  # used when there's no topic to name
+SUBJECT = "3 shorts from your recent video"  # used when there's no topic to name
 MAX_SUBJECT_CHARS = 50
 
 
@@ -24,17 +24,19 @@ def site_host(url: str | None = None) -> str:
 
 SIGNATURE = f"Best,\nBarry Navan\n{AGENCY} | {site_host()}"
 
+# Round 18: Barry's template. "{greeting}" is the host's first name, or NO_NAME_GREETING
+# until you type one in the Outbox's First name field.
 _BODY = (
-    "Hi {recipient},\n\n"
-    "{hook}\n\n"
-    "I cut {cut_text} from the {content_format} into {clip_noun} with captions:\n\n"
+    "{greeting} — I cut {count} highlight {moments} from your recent {channel}upload into "
+    "{clip_noun} with captions:\n\n"
     "{drive_link}\n\n"
-    "{yours} to post on Shorts, Reels, or TikTok. No watermark, no strings.\n\n"
-    "If {useful}, would you want me to do 3–5 of these for every new upload?\n\n"
+    "{yours} completely yours to post across Shorts, Reels, or TikTok—unwatermarked, no strings attached.\n\n"
+    "If you like how {they} {perform}, I’d love to produce your clips for the next week completely free "
+    "to help you drive more reach.\n\n"
+    "Worth exploring?\n\n"
     "{signature}"
 )
-_OTHERS = {1: "one other", 2: "two others", 3: "three others", 4: "four others"}
-_COUNT_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
+NO_NAME_GREETING = "Hi there"
 
 # No reply after a few days: the link again and the same question, shorter.
 _FOLLOW_UP = (
@@ -53,13 +55,12 @@ OLD_TEMPLATE_MARKERS = (
     "I run Nav, a short-form",
     "hook retention cuts",
     "a private Google Drive folder for you:",  # Oct 2026: link in the first email
+    "of these for every new upload?",  # rounds 10-17: "...do 3–5 of these for every new upload?"
 )
-_OLD_TITLE_PATTERNS = (re.compile(r'I loved the "(.+?)"'), re.compile(r'your recent video "(.+?)"'))
-_OLD_QUOTE_PATTERN = re.compile(r'opens on your line "(.+?)" \((\d+(?::\d{2}){1,2})\)')
-_QUOTE_PATTERNS = (re.compile(r'especially the part that starts "(.+?)"'), re.compile(r'especially when you said "(.+?)"'))
-# "—especially the point about X." (round 7) or "Your point (at 12:34) about X stuck with me" (round 10)
-_KEY_POINT_PATTERN = re.compile(r"(?:—especially the point about (.+?)\.\n|Your point (?:at [\d:]+ )?about (.+?) stuck with me)")
+# "Hi Dana,\n" (templates before round 18) and "Dana — I cut ..." (round 18).
 _GREETING_PATTERN = re.compile(r"^(?:Hi|Hello|Hey) (.+?),\n")
+_DASH_GREETING = re.compile(r"\A([^\n—]{1,60}?) — ")
+_EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]+")
 _FILE_EXTENSION = re.compile(r"\.(?:mp4|mov|mkv|webm|avi|m4v|mp3|wav|m4a)$", re.IGNORECASE)
 
 
@@ -155,17 +156,32 @@ def clean_short_topic(topic: object) -> str:
 
 
 def build_subject(short_topic: str = "", content_format: str = "", clip_count: int = 3) -> str:
-    """'3 Shorts from your knee arthritis episode' (at most MAX_SUBJECT_CHARS).
+    """'3 shorts from your knee arthritis episode' (at most MAX_SUBJECT_CHARS).
 
-    Without a short enough topic: '3 Shorts from your latest episode'.
+    Without a short enough topic: '3 shorts from your recent episode'.
     """
-    noun = "Short" if clip_count == 1 else "Shorts"
+    noun = "short" if clip_count == 1 else "shorts"
     kind = clean_format(content_format)
     topic = clean_short_topic(short_topic)
     subject = f"{clip_count} {noun} from your {topic} {kind}"
     if topic and len(subject) <= MAX_SUBJECT_CHARS:
         return subject
-    return f"{clip_count} {noun} from your latest {kind}"
+    return f"{clip_count} {noun} from your recent {kind}"
+
+
+_OLD_SUBJECT = re.compile(r"^(\d+) Shorts? from your (?:latest )?")
+
+
+def modern_subject(subject: str) -> str:
+    """An unsent draft's subject in the round 18 style ('3 Shorts from your latest video'
+    -> '3 shorts from your recent video'). A subject you wrote yourself is left alone."""
+    match = _OLD_SUBJECT.match(subject or "")
+    if not match:
+        return subject
+    count = int(match.group(1))
+    rest = subject[match.end():]
+    latest = "latest " in match.group(0)
+    return f"{count} {'short' if count == 1 else 'shorts'} from your {'recent ' if latest else ''}{rest}"
 
 
 def clean_usual_take(take: object) -> str:
@@ -177,31 +193,10 @@ def clean_usual_take(take: object) -> str:
     return text if 1 <= len(text.split()) <= 4 and len(text) <= 40 else ""
 
 
-def _hook(
-    timestamp: str,
-    point: str,
-    quote: str,
-    usual_take: str,
-    content_format: str,
-    video_title: str,
-    video_topic: str,
-) -> tuple[str, bool]:
-    """The opening line, and whether it names one specific moment (its timestamp)."""
-    flip = f", especially how it flips the usual take on {usual_take}" if usual_take else ""
-    if timestamp and point:
-        return f"Your point at {timestamp} about {point} stuck with me{flip}.", True
-    if timestamp and quote:
-        # Not "your point": the first words of a clip may be a guest's.
-        return f'The moment at {timestamp} that starts "{quote.rstrip(".")}" stuck with me.', True
-    if point:
-        return f"Your point about {point} stuck with me{flip}.", False
-    topic = clean_topic(video_topic)
-    if topic:
-        return f"Your recent {content_format} on {topic} stuck with me.", False
-    title = _clean_title(video_title)
-    if title:
-        return f'Your recent {content_format}, "{title}", stuck with me.', False
-    return f"Your recent {content_format} stuck with me.", False
+def clean_channel_name(name: object) -> str:
+    """'Leighton Grey - Grey Matter 🇨🇦' -> 'Leighton Grey - Grey Matter' (for 'your recent ___ upload')."""
+    text = _EMOJI.sub(" ", str(name or ""))
+    return " ".join(text.split()).strip(" -–—|·•:")
 
 
 def build_outreach_email(
@@ -218,42 +213,29 @@ def build_outreach_email(
     usual_take: str = "",
     content_format: str = "",
 ) -> str:
-    """The first email. Without a Drive link yet, a placeholder marks where it goes.
+    """The first email (Barry's round 18 template). Without a link yet, a placeholder
+    marks where it goes.
 
-    ``opening_at``: start of the best clip in the source video (seconds), shown as
-    "Your point at 12:34 about ...". ``key_point``: what that clip's point is (from
-    the AI step); if missing, the clip's opening words (``opening_line``) are quoted.
-    ``usual_take``: the common view the moment pushes against; the "flips the usual
-    take" part is left out when there isn't one. ``content_format``: "episode" for
-    podcasts, otherwise "video". ``greeting_name``: the host's first name when known;
-    otherwise the channel name is used. ``shorts_status`` is no longer used.
+    ``greeting_name``: the host's first name when known; otherwise the email opens with
+    NO_NAME_GREETING ("Hi there") until you type the name in the Outbox. The channel
+    name goes in "your recent ___ upload". The other arguments (the topic, the best
+    clip's time and point, ...) belonged to the older templates; they're still accepted
+    so every caller keeps working, but this template doesn't use them.
     """
-    del shorts_status  # kept for older callers; this template doesn't mention Shorts habits
-    kind = clean_format(content_format)
-    point = clean_key_point(key_point)
-    hook, names_moment = _hook(
-        format_timestamp(opening_at) if opening_at is not None else "",
-        point,
-        clean_quote(opening_line),
-        clean_usual_take(usual_take) if point else "",
-        kind,
-        video_title,
-        video_topic,
-    )
+    del video_title, video_topic, opening_line, opening_at, key_point, shorts_status, usual_take, content_format
     count = max(1, int(clip_count))
-    if names_moment:
-        cut_text = "that moment" if count == 1 else f"that moment and {_OTHERS.get(count - 1, f'{count - 1} others')}"
-    else:
-        cut_text = f"{_COUNT_WORDS.get(count, str(count))} moment" + ("" if count == 1 else "s")
+    one = count == 1
+    channel = clean_channel_name(channel_name)
     return _BODY.format(
-        recipient=clean_first_name(greeting_name) or channel_name.strip() or "there",
-        hook=hook,
-        cut_text=cut_text,
-        content_format=kind,
-        clip_noun="a vertical clip" if count == 1 else "vertical clips",
+        greeting=clean_first_name(greeting_name) or NO_NAME_GREETING,
+        count=count,
+        moments="moment" if one else "moments",
+        channel=f"{channel} " if channel else "",
+        clip_noun="a vertical 9:16 clip" if one else "vertical 9:16 clips",
         drive_link=drive_link.strip() or DRIVE_LINK_PLACEHOLDER,
-        yours="It's yours" if count == 1 else "They're yours",
-        useful="it's useful" if count == 1 else "they're useful",
+        yours="It’s" if one else "They’re",
+        they="it" if one else "they",
+        perform="performs" if one else "perform",
         signature=SIGNATURE,
     )
 
@@ -282,7 +264,8 @@ _TOPIC_IN_EMAIL = re.compile(r"[Yy]our recent (?:video|episode) on (.+?)(?: stuc
 
 
 def subject_for(email: str) -> str:
-    """A subject when only the email text is known (older drafts): no topic to name."""
+    """A subject when only the email text is known (older drafts): no topic to name.
+    (Round 18 emails don't say "episode", so they get "video".)"""
     return build_subject("", "episode" if " from the episode " in email else "video")
 
 
@@ -307,48 +290,44 @@ def is_old_template(email: str) -> bool:
 
 
 def rewrite_old_draft(
-    email: str, channel_name: str, drive_link: str, video_title: str = "", shorts_status: str = ""
+    email: str,
+    channel_name: str,
+    drive_link: str,
+    video_title: str = "",
+    shorts_status: str = "",
+    clip_count: int = 3,
 ) -> str:
     """Rebuild a not-yet-sent draft from an older template with the current one,
-    keeping its topic or title, key point or quoted line, and greeting name."""
-    topic = topic_from_email(email)
-    for pattern in _OLD_TITLE_PATTERNS:
-        if video_title:
-            break
-        match = pattern.search(email)
-        video_title = match.group(1) if match else ""
-    old_quote = _OLD_QUOTE_PATTERN.search(email)
-    quote = old_quote.group(1) if old_quote else ""
-    for pattern in _QUOTE_PATTERNS:
-        match = pattern.search(email)
-        if match and not quote:
-            quote = match.group(1)
-    key_point = _KEY_POINT_PATTERN.search(email)
-    greeting = _GREETING_PATTERN.search(email)
-    greeting_name = greeting.group(1) if greeting and greeting.group(1) != channel_name.strip() else ""
+    keeping the first name it greets (unless that was just the channel name)."""
+    del video_title, shorts_status  # the current template doesn't name the video
+    name = greeting_name_of(email)
     return build_outreach_email(
         channel_name,
-        video_title=video_title,
-        video_topic=topic,
         drive_link=drive_link,
-        opening_line=quote,
-        key_point=(key_point.group(1) or key_point.group(2)) if key_point else "",
-        shorts_status=shorts_status,
-        greeting_name=greeting_name,
+        clip_count=clip_count,
+        greeting_name="" if name == channel_name.strip() else name,
     )
 
 
 def greeting_name_of(email: str) -> str:
-    """The name in an email's 'Hi ___,' line."""
-    match = _GREETING_PATTERN.search(email)
+    """The name the email opens with ('Dana — I cut ...', or 'Hi Dana,' in older
+    drafts); '' while it still says NO_NAME_GREETING."""
+    match = _DASH_GREETING.match(email or "")
+    if match:
+        name = match.group(1).strip()
+        return "" if name == NO_NAME_GREETING else name
+    match = _GREETING_PATTERN.search(email or "")
     return match.group(1) if match else ""
 
 
 def set_greeting(email: str, name: str) -> str:
-    """Replace the name in the 'Hi ___,' line (adds one if missing)."""
+    """Put ``name`` at the start of the email ('Dana — I cut ...'; 'Hi Dana,' in older
+    drafts). Adds a greeting if there is none."""
     name = name.strip()
     if not name:
         return email
+    if _DASH_GREETING.match(email):
+        return _DASH_GREETING.sub(lambda _m: f"{name} — ", email, count=1)
     if _GREETING_PATTERN.search(email):
         return _GREETING_PATTERN.sub(lambda _m: f"Hi {name},\n", email, count=1)
     return f"Hi {name},\n\n{email}"

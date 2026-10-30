@@ -40,11 +40,11 @@ email = O.build_outreach_email(
     "Coach Dana", "Knee Pain Fixes", "fixing knee pain when squatting", DRIVE,
     opening_line="Most people squat way too deep. And that is the problem", opening_at=762.4,
 )
-check("Quotes their own words when there's no key point",
-      email.split("\n\n")[1] == 'The moment at 12:42 that starts "Most people squat way too deep" stuck with me.', email.split("\n\n")[1][-200:])
+check("Round 18 template: no quoted line or timestamp in the email",
+      "Most people squat" not in email and "12:42" not in email and email.startswith("Hi there — I cut 3 highlight moments"))
 check("One brand name everywhere", "\nNav Studios | " in email and "I run Nav," not in email)
 check("Drive link in the first email", DRIVE in email)
-check("Subject is the template's", O.subject_for(email) == O.SUBJECT == "3 Shorts from your latest video")
+check("Subject is the template's", O.subject_for(email) == O.SUBJECT == "3 shorts from your recent video")
 check("Short/empty quotes are skipped", O.clean_quote("Yeah so") == "")
 check("Timestamps over an hour", O.format_timestamp(3725) == "1:02:05")
 words = [Word(text=t, start=100 + i * 0.4, end=100.3 + i * 0.4) for i, t in enumerate("Most people squat way too deep. And here is why".split())]
@@ -73,8 +73,10 @@ W._write_json_atomic(W.PENDING_OUTREACH_PATH, [
 due = W.get_follow_ups_due()
 check("Only pitches sent 4+ days ago without a reply are due", [d["record_id"] for d in due] == ["old"], str([d["record_id"] for d in due]))
 check("Follow-up names the video", '"Knee Pain Fixes"' in due[0]["follow_up_body"], due[0]["follow_up_body"][:160])
-topic_email = O.build_outreach_email("Coach Dana", "Knee Pain Fixes", "fixing knee pain when squatting", DRIVE)
-check("Follow-up keeps the topic when the email names one", O.topic_from_email(topic_email) == "fixing knee pain when squatting")
+round10_email = "Hi Dana,\n\nYour recent video on fixing knee pain when squatting stuck with me.\n\nMore"
+check("Follow-up keeps the topic when an older email names one", O.topic_from_email(round10_email) == "fixing knee pain when squatting")
+check("Round 18 emails name no topic, so follow-ups use the video title",
+      O.topic_from_email(O.build_outreach_email("Coach Dana", "Knee Pain Fixes", "fixing knee pain", DRIVE)) == "")
 check("Follow-up subject is a reply to the first email", due[0]["follow_up_subject"] == "Re: " + O.SUBJECT, due[0]["follow_up_subject"])
 W.mark_follow_up("old", "followed_up")
 check("Marked follow-ups leave the list", W.get_follow_ups_due() == [])
