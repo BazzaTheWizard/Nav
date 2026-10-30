@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 import functools
+import io
 import logging
 import os
 import re
 import shutil
 import time
 import uuid
+import zipfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -22,8 +24,11 @@ from autonomous_worker import (
     LOG_PATH as WORKER_LOG_PATH,
     MAX_PENDING_LEADS,
     MIN_CLIP_SCORE,
+    FORCEABLE_GROUPS,
     PASS_REASONS,
+    force_lead_to_queue,
     get_awaiting_reply,
+    get_forceable_leads,
     get_cached_leads,
     get_recently_passed,
     get_worker_status,
@@ -49,8 +54,10 @@ from core.downloader import (
     download_audio_only,
     download_source_video,
     extract_audio_only,
+    fetch_video_info,
     video_format_sort,
 )
+from core import series
 from core.clipper import MIN_CLIP_DURATION, rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
 from core.drive_uploader import replace_clip_in_drive, upload_clips_to_drive
@@ -75,6 +82,7 @@ from core.pitch_files import (
     accept_trim,
     discard_trim,
     load_pitch,
+    make_preview,
     pitch_files_bytes,
     rerender_trim,
     trim_limits,
@@ -215,11 +223,15 @@ def _render_lead_queue() -> None:
         length_text = f"{int(seconds) // 60} min" if isinstance(seconds, int) else "length unknown"
         video_url = lead.get("latest_video_url") or ""
         video_title = lead.get("latest_video_title") or "Target video"
-        shorts_text = lead.get("shorts_summary") or "Shorts: not checked (queued before this update)"
+        forced = bool(lead.get("forced"))
+        shorts_text = lead.get("shorts_summary") or (
+            "Shorts: not checked" if forced else "Shorts: not checked (queued before this update)"
+        )
+        forced_text = " · :violet[⏩ forced: automatic checks off]" if forced else ""
         with st.container(border=True):
             info, next_col, action = st.columns([6, 1, 1])
             with info:
-                st.markdown(f"**{index + 1}. [{title}]({channel_url})** · {subscriber_text} · {email_text}")
+                st.markdown(f"**{index + 1}. [{title}]({channel_url})** · {subscriber_text} · {email_text}{forced_text}")
                 st.caption(f"{shorts_text} · [{video_title}]({video_url}) ({length_text})")
             with next_col:
                 if index > 0 and st.button("Do next", key=f"do_next_{channel_id}_{index}", use_container_width=True):
@@ -258,6 +270,54 @@ def _is_finished(record: dict[str, Any]) -> bool:
 def _active_cached_leads() -> list[dict[str, Any]]:
     """Leads still worth seeing in the app (not sent or completed)."""
     return [record for record in _latest_lead_records() if not _is_finished(record)]
+
+
+FORCEABLE_PREVIEW = 30  # per group
+
+
+def _render_forceable_leads() -> None:
+    """Creators that didn't finish, that the worker skipped, or that you passed or
+    skipped, each with ⏩ Force to queue."""
+    try:
+        rows = get_forceable_leads()
+    except Exception as exc:
+        st.error(f"Could not read skipped and unfinished leads: {exc}")
+        return
+    if not rows:
+        return
+    st.subheader(f"Skipped or unfinished ({len(rows)})")
+    st.caption(
+        "**⏩ Force to queue** puts a creator at the top of the queue and clears why they were "
+        "skipped. The worker then makes their clips without the automatic checks (on camera, "
+        "screen share, AI score bar); every clip still gets an AI score, so you can remove weak "
+        "ones in the Outbox."
+    )
+    for group, label in FORCEABLE_GROUPS.items():
+        members = [row for row in rows if row["group"] == group]
+        if not members:
+            continue
+        with st.expander(f"{label} ({len(members)})"):
+            for row in members[:FORCEABLE_PREVIEW]:
+                channel_id = row["channel_id"]
+                info, action = st.columns([6, 2], vertical_alignment="center")
+                with info:
+                    video = f" · [video]({row['video_url']})" if row["video_url"] else ""
+                    st.markdown(f"**[{row['channel_title']}](https://www.youtube.com/channel/{channel_id})**{video}")
+                    reason = f": {row['reason']}" if row["reason"] else ""
+                    st.caption(f"{row['status']}{reason}"[:220])
+                with action:
+                    if st.button("⏩ Force to queue", key=f"force_{channel_id}", width="stretch"):
+                        with st.spinner("Adding them to the queue…"):
+                            try:
+                                lead = force_lead_to_queue(channel_id)
+                            except Exception as exc:
+                                logging.exception("Could not force the lead")
+                                st.error(f"Couldn't force them: {exc}")
+                            else:
+                                st.session_state["lead_forced"] = lead.get("channel_title") or channel_id
+                                st.rerun()
+            if len(members) > FORCEABLE_PREVIEW:
+                st.caption(f"…and {len(members) - FORCEABLE_PREVIEW} older ones.")
 
 
 LAYOUT_LABELS = {
@@ -1118,6 +1178,8 @@ def _render_pitch_badges(record: dict[str, Any]) -> None:
     subscribers = record.get("subscriber_count")
     if isinstance(subscribers, int):
         badges.append((f"{subscribers:,} subs", "gray"))
+    if record.get("forced"):
+        badges.append(("⏩ forced through", "violet"))
     seconds = record.get("video_seconds")
     if isinstance(seconds, (int, float)) and seconds > 0:
         badges.append((f"{int(seconds) // 60} min video", "gray"))
@@ -1157,18 +1219,13 @@ def _render_contact(record: dict[str, Any]) -> None:
 
 # --- 🧭 Pipeline: what the worker does next ---------------------------------------------
 def _render_pipeline(pending: list[dict[str, Any]]) -> None:
+    forced = st.session_state.pop("lead_forced", None)
+    if forced:
+        st.success(f"⏩ {forced} is at the top of the queue. The worker takes them next.")
     _render_lead_queue()
-    pending_ids = {record.get("channel_id") for record in pending}
-    unfinished = [record for record in _active_cached_leads() if record.get("channel_id") not in pending_ids]
+    _render_forceable_leads()
     lead_records = _latest_lead_records()
     finished_count = sum(_is_finished(record) for record in lead_records)
-    if unfinished:
-        with st.expander(f"Unfinished leads ({len(unfinished)}): failed or still being retried"):
-            for record in unfinished:
-                channel_id = record.get("channel_id", "")
-                title = record.get("channel_title") or channel_id or "Creator"
-                st.markdown(f"**[{title}](https://www.youtube.com/channel/{channel_id})**")
-                st.caption(f"Status: {record.get('status', 'recorded')}")
     st.caption(
         f"Active leads: {len(lead_records) - finished_count} | "
         f"Finished (hidden): {finished_count} | "
@@ -1177,11 +1234,25 @@ def _render_pipeline(pending: list[dict[str, Any]]) -> None:
 
 
 # --- 🎬 Make clips: any video, by hand ---------------------------------------------------
+CLIP_MODES = {
+    "🎯 3 highlights": "highlights",
+    "🎞️ Series: the whole video in order": "series",
+}
+
+
 def _render_clip_generator() -> None:
     st.caption(
         "Make clips from any YouTube link or video file, outside the worker. Nothing here is "
         "tracked as a pitch: the worker's pitches are in the 📬 Outbox."
     )
+    mode = st.radio(
+        "Mode", list(CLIP_MODES), key="clip_mode", horizontal=True,
+        help="3 highlights: the AI picks the 3 best moments. Series: Part 1, Part 2, Part 3… "
+        "covering the whole video in order, one batch of 3 at a time.",
+    )
+    if CLIP_MODES[mode] == "series":
+        _render_series_maker()
+        return
     with st.form("clip_generator_form"):
         video_url = st.text_input(
             "YouTube link",
@@ -1281,6 +1352,235 @@ def _make_clips(video_url: str, uploaded_video: Any, channel_name: str, layout_l
     finally:
         if uploaded_input is not None:
             uploaded_input.unlink(missing_ok=True)
+
+
+# --- 🎞️ Series mode (Make clips): Part 1, 2, 3… in order -------------------------------------
+def _render_series_maker() -> None:
+    st.caption(
+        "Cuts the whole video into parts in order. Each part ends on a finished sentence and the "
+        "next one starts right there, so nothing that's said is left out. Each batch makes 3 parts "
+        "with **Part N: title** on the title card. They're saved on this Mac only: no Drive, no clip page."
+    )
+    url = st.text_input("YouTube link", key="series_url", placeholder="https://www.youtube.com/watch?v=...").strip()
+    upload = st.file_uploader("Or upload a video file", type=["mp4", "mov"], key="series_upload")
+    if url and upload is not None:
+        st.error("Give either a YouTube link or one video file, not both.")
+        return
+    key = None
+    if url:
+        key = series.series_key(url=url)
+    elif upload is not None:
+        key = series.series_key(file_name=upload.name, file_head=bytes(upload.getbuffer()[:1_000_000]), file_size=upload.size)
+    state = series.load_series(key) if key else None
+
+    # A new video: fill in what was used for it last time (title, part length, next batch).
+    if key and st.session_state.get("series_key") != key:
+        st.session_state["series_key"] = key
+        lengths = (int(state["shortest"]), int(state["longest"])) if state and state.get("shortest") else series.DEFAULT_LENGTHS
+        st.session_state["series_title"] = str((state or {}).get("title") or "")
+        st.session_state["series_lengths"] = lengths
+        st.session_state["series_batch"] = series.next_batch(state, *lengths) if state and state.get("words") else 1
+    if "series_batch_pending" in st.session_state:  # after a batch: suggest the next one
+        st.session_state["series_batch"] = st.session_state.pop("series_batch_pending")
+    if "series_title_pending" in st.session_state:  # the title found on the first batch
+        st.session_state["series_title"] = st.session_state.pop("series_title_pending")
+    note = st.session_state.pop("series_toast", None)
+    if note:
+        st.toast(note, icon="✅")
+    st.session_state.setdefault("series_lengths", series.DEFAULT_LENGTHS)
+    st.session_state.setdefault("series_batch", 1)
+
+    st.text_input(
+        "Title on every part", key="series_title", max_chars=series.MAX_TITLE_CHARS,
+        placeholder="The video's title (found automatically)",
+        help="Each part's title card reads 'Part N: <this title>'.",
+    )
+    shortest, longest = st.slider(
+        "Part length (seconds)", min_value=series.MIN_PART_SECONDS, max_value=series.MAX_PART_SECONDS,
+        step=5, key="series_lengths",
+        help="Each part ends at the first sentence end after the shorter length, and never runs past "
+        "the longer one. Only the very last part of the video can be shorter.",
+    )
+    batch = int(st.number_input(
+        "Batch", min_value=1, step=1, key="series_batch",
+        help="Batch 1 = Parts 1–3, batch 2 = Parts 4–6, and so on: run them one after another to cover the whole video.",
+    ))
+    first, last = (batch - 1) * series.BATCH_SIZE + 1, batch * series.BATCH_SIZE
+    can_make = bool(key)
+    if state and state.get("words"):
+        parts = series.plan_parts(series.rows_to_words(state["words"]), float(state["duration"]), shortest, longest)
+        count = series.batch_count(parts)
+        if (state.get("shortest"), state.get("longest")) not in {(None, None), (shortest, longest)}:
+            st.warning(
+                f"Earlier parts of this video were {state['shortest']}–{state['longest']} s. A different length "
+                "renumbers the parts, so the series won't line up with the ones you made."
+            )
+        if batch > count:
+            st.warning(f"This video has {len(parts)} parts, so batches 1 to {count}.")
+            can_make = False
+        else:
+            chosen = series.batch_parts(parts, batch)
+            last = chosen[-1][0]
+            made = sorted(int(n) for n in state.get("made") or [])
+            made_text = f" Made so far: {_part_ranges(made)}." if made and (state.get("shortest"), state.get("longest")) == (shortest, longest) else ""
+            st.caption(
+                f"Batch {batch} of {count}: Parts {first}–{last}, {_clock(chosen[0][1])}–{_clock(chosen[-1][2])} "
+                f"of {_clock(float(state['duration']))}.{made_text}"
+            )
+    elif key:
+        st.caption(f"Batch {batch} = Parts {first}–{last}. The whole video is transcribed once, on the first batch.")
+    if st.session_state.get("series_layout") not in LAYOUT_LABELS:
+        st.session_state["series_layout"] = next(iter(LAYOUT_LABELS))
+    with st.expander("Framing (optional)"):
+        layout_label = st.selectbox("Layout", list(LAYOUT_LABELS), key="series_layout")
+    if st.button(f"Make parts {first}–{last}", type="primary", disabled=not can_make):
+        _make_series_batch(key, url, upload, st.session_state.get("series_title", ""), shortest, longest, batch, LAYOUT_LABELS[layout_label])
+    _render_series_results()
+
+
+def _part_ranges(numbers: list[int]) -> str:
+    """[1, 2, 3, 4, 5, 6, 10, 11, 12] -> 'Parts 1–6, 10–12'."""
+    ranges: list[list[int]] = []
+    for number in numbers:
+        if ranges and number == ranges[-1][1] + 1:
+            ranges[-1][1] = number
+        else:
+            ranges.append([number, number])
+    return "Parts " + ", ".join(f"{a}–{b}" if a != b else str(a) for a, b in ranges)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "series"
+
+
+def _make_series_batch(
+    key: str, url: str, upload: Any, title_input: str, shortest: int, longest: int, batch: int, layout_mode: str
+) -> None:
+    """Transcribe once (saved per video), plan the parts, render this batch's 3 locally."""
+    settings = load_settings()
+    settings.temp_dir.mkdir(parents=True, exist_ok=True)
+    settings.raw_dir.mkdir(parents=True, exist_ok=True)
+    state = series.load_series(key) or {"key": key, "made": []}
+    progress = st.progress(0.0, text="Starting…")
+    audio_path = settings.temp_dir / f"audio_{uuid.uuid4().hex}.wav"
+    all_made = False
+    try:
+        source_video: Path | None = None
+        if upload is not None:
+            suffix = Path(upload.name).suffix.lower()
+            if suffix not in {".mp4", ".mov"}:
+                raise ValueError("Uploaded files must be MP4 or MOV.")
+            source_video = settings.raw_dir / f"series_{key}{suffix}"
+            if not source_video.is_file():
+                source_video.write_bytes(upload.getbuffer())
+        if not state.get("words"):
+            progress.progress(0.05, text="Transcribing the whole video (once per video)…")
+            if url:
+                download_audio_only(url, audio_path)
+                duration = _audio_duration(audio_path)
+            else:
+                extract_audio_only(source_video, audio_path)
+                duration = _video_duration(source_video)
+            words = transcribe_audio(audio_path, settings)
+            if not words:
+                raise RuntimeError("No speech was found in this video.")
+            video_title = Path(upload.name).stem if upload is not None else ""
+            if url:
+                try:
+                    video_title = str(fetch_video_info(url).get("title") or "")
+                except Exception:
+                    logging.warning("Could not read the video title", exc_info=True)
+            state.update(source=url or upload.name, title=series.clean_series_title(video_title),
+                         duration=duration, words=series.words_to_rows(words))
+            series.save_series(key, state)  # a failed render later doesn't lose the transcript
+        words = series.rows_to_words(state["words"])
+        title = series.clean_series_title(title_input) or str(state.get("title") or "") or "Series"
+        parts = series.plan_parts(words, float(state["duration"]), shortest, longest)
+        chosen = series.batch_parts(parts, batch)
+        if (state.get("shortest"), state.get("longest")) != (shortest, longest):
+            state["made"] = []  # new part lengths: new numbering
+        progress.progress(0.35, text="Getting the video…")
+        if url:
+            source_video = Path(download_source_video(url))  # kept for a day, so the next batch reuses it
+        if source_video is None:
+            raise RuntimeError("No source video is available for rendering.")
+        folder = render_output_dir() / "Series" / f"{_slug(title)}-{key[-6:]}"
+        folder.mkdir(parents=True, exist_ok=True)
+
+        def render_part(number: int, start: float, end: float) -> dict[str, Any]:
+            clip = ClipResult(start_time=start, end_time=end, viral_title=series.part_title(number, title),
+                              caption="", hashtags=[], virality_score=0)
+            output = folder / f"part_{number:02d}.mp4"
+            render_selected_clip(source_video, clip, words, settings, output, layout_mode=layout_mode)
+            preview = settings.temp_dir / f"series_{key}_part_{number:02d}.preview.mp4"
+            make_preview(output, preview)  # small copy for the player (the full file is ~10 MB a minute)
+            return {"path": str(output), "preview": str(preview), "number": number, "start": start, "end": end}
+
+        items: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {executor.submit(render_part, *part): part[0] for part in chosen}
+            for done, future in enumerate(as_completed(futures), start=1):
+                try:
+                    items.append(future.result())
+                except Exception as exc:
+                    logging.exception("Part %d failed", futures[future])
+                    st.warning(f"Part {futures[future]} failed to render: {exc}")
+                progress.progress(0.35 + 0.65 * done / len(chosen), text=f"Rendered {done} of {len(chosen)} parts")
+        items.sort(key=lambda item: item["number"])
+        state.update(title=title, shortest=shortest, longest=longest,
+                     made=sorted(set(int(n) for n in state.get("made") or []) | {item["number"] for item in items}))
+        series.save_series(key, state)
+        st.session_state["series_results"] = {"title": title, "folder": str(folder), "items": items, "total": len(parts)}
+        st.session_state["series_batch_pending"] = min(batch + 1, series.batch_count(parts))
+        st.session_state["series_title_pending"] = title
+        progress.progress(1.0, text="Done")
+        all_made = len(items) == len(chosen)
+        if all_made:
+            st.session_state["series_toast"] = f"Parts {chosen[0][0]}–{chosen[-1][0]} are ready (of {len(parts)})."
+    except Exception as exc:
+        logging.exception("Series batch failed")
+        st.error(f"Making the parts failed: {exc}")
+    finally:
+        audio_path.unlink(missing_ok=True)
+    if all_made:
+        st.rerun()  # the form now shows the real part times and suggests the next batch
+
+
+def _zip_parts(paths: list[str], names: list[str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:  # MP4s don't compress further
+        for path, name in zip(paths, names):
+            archive.write(path, arcname=name)
+    return buffer.getvalue()
+
+
+def _render_series_results() -> None:
+    result = st.session_state.get("series_results")
+    items = [item for item in (result or {}).get("items", []) if Path(item["path"]).is_file()]
+    if not items:
+        return
+    slug = _slug(result["title"])
+    st.subheader(f"{result['title']}: Parts {items[0]['number']}–{items[-1]['number']} of {result['total']}")
+    names = [f"{slug}_part_{item['number']:02d}.mp4" for item in items]
+    for column, item, name in zip(st.columns(series.BATCH_SIZE), items, names):
+        with column:
+            with st.container(key=f"preview_series_{item['number']}"):
+                if Path(item["preview"]).is_file():
+                    st.video(item["preview"], width=PREVIEW_PLAYER_WIDTH)
+                else:
+                    st.caption("Preview expired: the file is in the folder below.")
+            st.markdown(f"**Part {item['number']}** · {_clock(item['start'])}–{_clock(item['end'])} · {item['end'] - item['start']:.0f} s")
+            st.download_button(
+                f"⬇ Download Part {item['number']}", data=functools.partial(Path(item["path"]).read_bytes),
+                file_name=name, mime="video/mp4", key=f"series_download_{item['number']}", width="stretch",
+            )
+    st.download_button(
+        f"⬇ Download all {len(items)} (zip)",
+        data=functools.partial(_zip_parts, [item["path"] for item in items], names),
+        file_name=f"{slug}_parts_{items[0]['number']:02d}-{items[-1]['number']:02d}.zip",
+        mime="application/zip", key="series_download_all", type="primary",
+    )
+    st.caption(f"Also saved on this Mac: {result['folder']}")
 
 
 def _clock(seconds: float) -> str:

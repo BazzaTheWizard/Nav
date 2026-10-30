@@ -25,6 +25,14 @@ FAKE_RECORDS = [
 
 autonomous_worker.get_cached_leads = lambda: [dict(r) for r in FAKE_RECORDS]
 autonomous_worker.get_pending_outreach = lambda: []
+# Round 20: the Pipeline tab lists skipped/unfinished creators with ⏩ Force to queue
+# (the filtering itself is tested in test_round20.py with real files).
+autonomous_worker.get_forceable_leads = lambda: [
+    {"channel_id": "UC_C", "channel_title": "Charlie", "status": "failed", "reason": "HTTP Error 403",
+     "group": "unfinished", "updated_at": "2026-10-30", "video_url": "https://www.youtube.com/watch?v=c1"},
+    {"channel_id": "UC_F", "channel_title": "Foxtrot", "status": "skipped", "reason": "Not a good creator fit",
+     "group": "you", "updated_at": "2026-10-29", "video_url": ""},
+]
 
 fails = 0
 
@@ -38,11 +46,10 @@ def check(name, cond, detail=""):
 at = AppTest.from_file(str(root / "app.py"), default_timeout=120).run()
 check("App runs without errors", not at.exception, str([e.value for e in at.exception]))
 
-statuses = [c.value for c in at.caption if c.value.startswith("Status:")]
-check("Only unfinished leads are shown",
-      statuses == ["Status: failed", "Status: processing"], str(statuses))
-check("Sent and completed leads are hidden",
-      not any(s.lower() in ("status: sent", "status: completed") for s in statuses))
+forces = sorted(b.key for b in at.button if (b.key or "").startswith("force_"))
+check("Skipped/unfinished creators each get ⏩ Force to queue", forces == ["force_UC_C", "force_UC_F"], str(forces))
+check("Sent and completed leads aren't listed", not any(k in ("force_UC_A", "force_UC_B") for k in forces))
+check("Each shows why", any(c.value.startswith("failed: HTTP Error 403") for c in at.caption))
 
 summary = [c.value for c in at.caption if c.value.startswith("Active leads")]
 check("Scout tab shows active and hidden counts",

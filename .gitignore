@@ -21,3 +21,9 @@ project_code_bundle.txt
 # Worker state (contains creator contact details)
 storage/*.json
 storage/.autonomous_worker.lock
+# Series mode progress, saved transcripts, pitch files, worker logs and locks
+storage/series/
+storage/transcripts/
+storage/pitches/
+storage/logs/
+storage/*.lock

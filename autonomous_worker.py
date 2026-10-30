@@ -25,6 +25,7 @@ from core.downloader import (
     download_source_video,
     downloaded_video_info,
     extract_audio_only,
+    fetch_video_info,
     yt_dlp_version,
 )
 from core.drive_uploader import DriveAuthError, check_drive_access, remove_clip_in_drive, upload_clips_to_drive
@@ -96,6 +97,16 @@ DRIVE_SIGN_IN_WAIT_SEC = 10 * 60
 # (narration, slides, animation): those creators aren't a fit, so they're
 # skipped right after download, before any transcribing, AI, rendering or upload.
 MIN_ON_CAMERA_SHARE = 0.25
+# ⏩ Force to queue (Pipeline tab): the creator's clips are still all scored by the AI,
+# but none is dropped for scoring under MIN_CLIP_SCORE.
+FORCED_MIN_CLIP_SCORE = 0
+FORCED_STATUS = "queued (forced)"
+# What a lead carries (the queue entry), kept on its record for forcing it again later.
+LEAD_KEYS = (
+    "channel_id", "channel_title", "channel_url", "channel_about_url", "latest_video_url",
+    "latest_video_title", "contact_email", "contact_info", "social_links", "subscriber_count",
+    "duration_seconds", "shorts", "shorts_status", "shorts_summary", "priority",
+)
 # Slides, tutorials or gameplay with a small webcam in a corner (core.face_tracker
 # camera_check): skipped as not a fit, with this code at the start of the reason.
 SCREEN_SHARE_PIP = "screen_share_pip"
@@ -1033,14 +1044,20 @@ def _enqueue_leads(leads: list[dict[str, Any]]) -> int:
     return added
 
 
+FIRST_IN_LINE = 1000  # "Do next" and forced creators go before every scored lead
+
+
 def _lead_priority(lead: dict[str, Any]) -> int:
-    """Queue rank. A lead that failed drops back so it doesn't block the queue."""
+    """Queue rank. A lead that failed drops back so it doesn't block the queue.
+    "Do next" and ⏩ forced creators come first (the worker takes the highest rank,
+    so moving one to the top of the list alone didn't make it next)."""
     try:
         priority = int(lead.get("priority", 0) or 0)
         attempts = int(lead.get("attempts", 0) or 0)
     except (TypeError, ValueError):
-        return 0
-    return priority - 3 * attempts
+        priority, attempts = 0, 0
+    first = FIRST_IN_LINE if lead.get("forced") or lead.get("do_next") else 0
+    return first + priority - 3 * attempts
 
 
 def _pop_fresh_lead() -> dict[str, Any] | None:
@@ -1090,9 +1107,150 @@ def prioritize_queued_lead(channel_id: str) -> bool:
         index = next((i for i, lead in enumerate(queue) if str(lead.get("channel_id")) == channel_id), None)
         if index is None:
             return False
-        queue.insert(0, queue.pop(index))
+        queue.insert(0, {**queue.pop(index), "do_next": True})
         _write_json_atomic(LEAD_QUEUE_PATH, queue)
     return True
+
+
+# --- ⏩ Force to queue (Pipeline tab) -----------------------------------------------------
+FORCEABLE_GROUPS = {
+    "unfinished": "Didn't finish",
+    "worker": "Skipped by the worker",
+    "you": "Passed or skipped by you",
+}
+
+
+def get_forceable_leads() -> list[dict[str, Any]]:
+    """Creators that can be forced back into the queue, newest first: ones that didn't
+    finish (failed, stuck), ones the worker skipped ("not a fit"), and ones you passed
+    or skipped. Not: sent, already in the Outbox or the queue, or being made right now.
+    Each: {channel_id, channel_title, status, reason, group, updated_at, video_url}."""
+    with _worker_lock():
+        records = _processed_state()["records"]
+        skipped = _skipped_records()
+        queued = {str(lead.get("channel_id")) for lead in _lead_queue()}
+        outbox = {str(r.get("channel_id")) for r in _pending_records() if r.get("status", "pending") == "pending"}
+    status_now = get_worker_status()
+    busy = status_now.get("detail") if status_now.get("running") and status_now.get("state") == "processing" else None
+    latest: dict[str, dict[str, Any]] = {}
+    for record in records:
+        latest[str(record.get("channel_id") or "")] = record  # newest record per creator wins
+    rows: dict[str, dict[str, Any]] = {}
+    for channel_id, record in latest.items():
+        status = str(record.get("status") or "")
+        if not channel_id or status in {"sent", "completed", FORCED_STATUS} or channel_id in queued | outbox:
+            continue
+        if status == "processing" and busy == record.get("channel_title"):
+            continue
+        group = "worker" if status == "not a fit" else "you" if status == "skipped" else "unfinished"
+        reason = record.get("error") or PASS_REASONS.get(str(record.get("pass_reason") or ""), "") or record.get("skip_reason") or ""
+        rows[channel_id] = {
+            "channel_id": channel_id, "channel_title": record.get("channel_title") or channel_id, "status": status,
+            "reason": str(reason), "group": group, "updated_at": str(record.get("updated_at") or record.get("created_at") or ""),
+            "video_url": f"https://www.youtube.com/watch?v={record['video_id']}" if record.get("video_id") else "",
+        }
+    for record in skipped:  # skipped from the queue: no work was done, so no record above
+        channel_id = str(record.get("channel_id") or "")
+        if not channel_id or channel_id in rows or channel_id in queued | outbox or record.get("status") != "skipped":
+            continue
+        if str(latest.get(channel_id, {}).get("status")) in {"sent", "completed", FORCED_STATUS}:
+            continue
+        rows[channel_id] = {
+            "channel_id": channel_id, "channel_title": record.get("channel_title") or channel_id, "status": "skipped",
+            "reason": PASS_REASONS.get(str(record.get("pass_reason") or ""), "") or "skipped from the queue",
+            "group": "you", "updated_at": str(record.get("skipped_at") or ""),
+            "video_url": str(record.get("latest_video_url") or ""),
+        }
+    return sorted(rows.values(), key=lambda row: row["updated_at"], reverse=True)
+
+
+def _lead_from_saved(channel_id: str, record: dict[str, Any] | None, passed: dict[str, Any] | None) -> dict[str, Any]:
+    """Rebuild a queue entry from what was saved: the record's lead (round 20 on), or
+    the passed/skipped entry, or the record's own fields (older records)."""
+    saved: dict[str, Any] = dict((record or {}).get("lead") or {})
+    if not saved and passed:
+        saved = {key: passed[key] for key in LEAD_KEYS if passed.get(key) not in (None, "")}
+        saved.setdefault("latest_video_title", passed.get("video_title") or "")
+        if not saved.get("latest_video_url") and passed.get("target_video_id"):
+            saved["latest_video_url"] = f"https://www.youtube.com/watch?v={passed['target_video_id']}"
+    if str(saved.get("contact_email") or "").startswith(("http://", "https://")):
+        saved.pop("contact_email")  # the About page link, not an email: the worker adds it again
+    video_id = (record or {}).get("video_id")
+    lead = {key: saved[key] for key in LEAD_KEYS if saved.get(key) not in (None, "")}
+    for key in ("shorts", "duration_seconds", "priority"):
+        if key not in lead and (record or {}).get(key) not in (None, ""):
+            lead[key] = record[key]
+    lead.update(
+        channel_id=channel_id,
+        channel_title=str(saved.get("channel_title") or (record or {}).get("channel_title") or (passed or {}).get("channel_title") or channel_id),
+        channel_url=str(saved.get("channel_url") or f"https://www.youtube.com/channel/{channel_id}"),
+        latest_video_url=str(saved.get("latest_video_url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")),
+        latest_video_title=str(saved.get("latest_video_title") or ""),
+        attempts=0,
+        forced=True,
+        forced_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return lead
+
+
+def force_lead_to_queue(channel_id: str) -> dict[str, Any]:
+    """⏩ Force to queue: put a creator back at the top of the queue (one the worker
+    skipped or gave up on, or one you passed or skipped). Their old status, error and
+    pass/skip reason are cleared (kept under "forced_from" for tuning), and they're no
+    longer marked as done, so the worker takes them on its next cycle. Forced creators
+    skip the 'nobody on camera' and 'screen share' checks and the AI score bar. Returns
+    the queued lead."""
+    channel_id = channel_id.strip()
+    if not channel_id:
+        raise ValueError("channel_id must not be empty.")
+    with _worker_lock():
+        if any(str(r.get("channel_id")) == channel_id and r.get("status", "pending") == "pending" for r in _pending_records()):
+            raise ValueError("They're already in your Outbox.")
+        queue = _lead_queue()
+        queued = next((lead for lead in queue if str(lead.get("channel_id")) == channel_id), None)
+        if queued is not None:  # already queued: just move them to the top
+            queue.remove(queued)
+            queue.insert(0, {**queued, "forced": True})
+            _write_json_atomic(LEAD_QUEUE_PATH, queue)
+            return queue[0]
+        record = next((r for r in reversed(_processed_state()["records"]) if str(r.get("channel_id")) == channel_id), None)
+        passed = next((r for r in reversed(_skipped_records()) if str(r.get("channel_id")) == channel_id), None)
+    if record is not None and record.get("status") in {"sent", "completed"}:
+        raise ValueError("They were already pitched.")
+    if record is None and passed is None:
+        raise ValueError("There are no saved details for this creator.")
+    lead = _lead_from_saved(channel_id, record, passed)
+    if not lead["latest_video_url"]:
+        raise ValueError("No video is saved for this creator.")
+    if not lead["latest_video_title"]:  # older records didn't keep it (one quick YouTube lookup)
+        try:
+            lead["latest_video_title"] = str(fetch_video_info(lead["latest_video_url"]).get("title") or "")
+        except Exception as exc:
+            logger.warning("Couldn't look up the video title for %s: %s", lead["channel_title"], exc)
+        lead["latest_video_title"] = lead["latest_video_title"] or "Latest video"
+    video_id = lead["latest_video_url"].rsplit("=", maxsplit=1)[-1]
+    now = datetime.now(timezone.utc).isoformat()
+    with _worker_lock():
+        state = _processed_state()
+        state["processed_channel_ids"] = [c for c in state["processed_channel_ids"] if c != channel_id]
+        state["processed_video_ids"] = [v for v in state["processed_video_ids"] if v != video_id]
+        latest = next((r for r in reversed(state["records"]) if str(r.get("channel_id")) == channel_id), None)
+        if latest is not None:
+            latest["forced_from"] = {key: latest.get(key) for key in ("status", "error", "skip_reason", "pass_reason") if latest.get(key)}
+            for key in ("error", "skip_reason", "pass_reason"):
+                latest.pop(key, None)
+            latest["status"] = FORCED_STATUS
+            latest["updated_at"] = now
+        _write_json_atomic(PROCESSED_CREATORS_PATH, state)
+        skipped = _skipped_records()
+        remaining = [r for r in skipped if str(r.get("channel_id")) != channel_id]
+        if len(remaining) != len(skipped):
+            _write_json_atomic(SKIPPED_LEADS_PATH, remaining)
+        queue = [entry for entry in _lead_queue() if str(entry.get("channel_id")) != channel_id]
+        queue.insert(0, lead)
+        _write_json_atomic(LEAD_QUEUE_PATH, queue)
+    logger.info("Forced %s into the queue (was: %s).", lead["channel_title"], (record or passed or {}).get("status"))
+    return lead
 
 
 def skip_queued_lead(channel_id: str, reason: str = "user_skipped_before_processing") -> bool:
@@ -1143,6 +1301,9 @@ def _reserve_lead(
             "shorts": lead.get("shorts"),
             "has_email": bool(lead.get("contact_email")),
             "duration_seconds": lead.get("duration_seconds"),
+            # Round 20: the lead itself, so "Force to queue" can put them back later.
+            "lead": {key: lead[key] for key in LEAD_KEYS if lead.get(key) not in (None, "")},
+            **({"forced": True} if lead.get("forced") else {}),
         }
     )
     _write_json_atomic(PROCESSED_CREATORS_PATH, state)
@@ -1287,6 +1448,7 @@ def _process_lead(
     video_url = str(lead["latest_video_url"])
     video_id = video_url.rsplit("=", maxsplit=1)[-1]
     shorts_status = str((lead.get("shorts") or {}).get("status") or "")
+    forced = bool(lead.get("forced"))
     job_dir = settings.temp_dir / f"worker_{uuid.uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=False)
     source_video: Path | None = None
@@ -1296,10 +1458,11 @@ def _process_lead(
     try:
         source_video = Path(download_source_video(video_url))
         # Right after the download, before any transcribing, AI, rendering or upload.
-        camera = camera_check(source_video)
-        if camera.screen_share_pip:
+        # A creator you forced into the queue skips these checks: you decided.
+        camera = camera_check(source_video) if not forced else None
+        if camera is not None and camera.screen_share_pip:
             raise NotAFit(f"{SCREEN_SHARE_PIP}: a screen share with a small webcam in the {camera.pip_corner} corner")
-        share = camera.share
+        share = camera.share if camera is not None else None
         if share is not None and share < MIN_ON_CAMERA_SHARE:
             raise NotAFit(f"no one on camera (a face in {share:.0%} of sampled frames)")
         words = load_cached_transcript(video_id)
@@ -1330,7 +1493,9 @@ def _process_lead(
                 video_title,
                 peaks,
                 shorts_status=shorts_status,
-                min_judge_score=MIN_CLIP_SCORE,
+                # Forced: every clip is still scored (never unscored filler), but none
+                # is dropped for a low score; remove weak ones in the Outbox.
+                min_judge_score=FORCED_MIN_CLIP_SCORE if forced else MIN_CLIP_SCORE,
                 report=report,
             )
         except WeakMoments as exc:
@@ -1419,6 +1584,7 @@ def _process_lead(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "channel_id": str(lead["channel_id"]),
             "target_video_id": video_id,
+            **({"forced": True} if forced else {}),
             "status": "pending",
         }
         while True:
