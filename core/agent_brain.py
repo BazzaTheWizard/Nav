@@ -11,6 +11,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from core.service_pause import ServicePause
 from core.gemini_resilience import (
     gemini_thinking_config,
     generate_content_with_fallback,
@@ -143,7 +144,8 @@ def _request_gemini(api_key: str, prompt: str, system_prompt: str = _SYSTEM_PROM
             "Install it with `python -m pip install google-genai`."
         ) from exc
 
-    client = genai.Client(api_key=api_key)
+    # No timeout is the SDK default: one stuck request would stall the worker forever.
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
     response = generate_content_with_fallback(
         client.models.generate_content,
         model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
@@ -152,6 +154,8 @@ def _request_gemini(api_key: str, prompt: str, system_prompt: str = _SYSTEM_PROM
             system_instruction=system_prompt,
             response_mime_type="application/json",
             thinking_config=gemini_thinking_config(types),
+            # No tools are passed, so automatic function calling only adds a log line.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         ),
     )
     if not response.text:
@@ -160,6 +164,7 @@ def _request_gemini(api_key: str, prompt: str, system_prompt: str = _SYSTEM_PROM
 
 
 AI_ATTEMPTS = 2
+GEMINI_TIMEOUT_MS = 120_000  # per request; picking clips from a 2-hour transcript takes ~15 s
 
 
 def _validated_clips(result: dict[str, Any], transcript_start: float, transcript_end: float) -> list[dict[str, Any]]:
@@ -319,7 +324,10 @@ For each numbered clip (its exact words), give three scores from 1 to 10:
 - payoff: does it end on a point, answer, story ending or punchline instead of trailing off?
 Return JSON only: {"scores": [{"clip": 1, "hook": 7, "standalone": 8, "payoff": 6}, ...]}
 with exactly one entry per clip."""
-JUDGE_MAX_WORDS = 160  # per clip; about a minute of speech
+# Per clip. Round 17: was 160, which cut the ending (the "payoff" score) off any clip
+# longer than ~54 s at the 177 words a minute these creators speak. 300 covers 60 s
+# at 300 words a minute.
+JUDGE_MAX_WORDS = 300
 
 
 def _judge_scores(result: dict[str, Any], count: int) -> list[int]:
@@ -344,8 +352,10 @@ def _judge_scores(result: dict[str, Any], count: int) -> list[int]:
 
 
 def judge_clips(clip_texts: list[str]) -> list[int] | None:
-    """Score each clip's words 0-100. Best effort: None when there's no AI key or the
-    answer is unusable, and the caller keeps the first pass's ranking."""
+    """Score each clip's words 0-100. None when there's no AI key or no usable answer
+    after AI_ATTEMPTS tries (the worker's gate then waits and tries the creator again;
+    the app keeps the first pass's ranking). A used-up Gemini limit (ServicePause) is
+    passed on, so the worker pauses instead of retrying straight away."""
     if not clip_texts:
         return None
     load_dotenv(_PROJECT_ROOT / ".env")
@@ -357,12 +367,15 @@ def judge_clips(clip_texts: list[str]) -> list[int] | None:
         f"Clip {number}: " + " ".join(text.split()[:JUDGE_MAX_WORDS])
         for number, text in enumerate(clip_texts, start=1)
     )
-    try:
-        if gemini_key:
-            answer = _request_gemini(gemini_key, prompt, _JUDGE_PROMPT)
-        else:
-            answer = _request_openai(str(openai_key), prompt, _JUDGE_PROMPT)
-        return _judge_scores(_parse_json_response(answer), len(clip_texts))
-    except Exception as exc:  # noqa: BLE001 - a second opinion must never fail the lead
-        logger.warning("Clip judge skipped: %s", exc)
-        return None
+    for attempt in range(1, AI_ATTEMPTS + 1):
+        try:
+            if gemini_key:
+                answer = _request_gemini(gemini_key, prompt, _JUDGE_PROMPT)
+            else:
+                answer = _request_openai(str(openai_key), prompt, _JUDGE_PROMPT)
+            return _judge_scores(_parse_json_response(answer), len(clip_texts))
+        except ServicePause:
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported as None, the caller decides
+            logger.warning("Clip judge answer unusable (attempt %d/%d): %s", attempt, AI_ATTEMPTS, exc)
+    return None

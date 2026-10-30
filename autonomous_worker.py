@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import Any, Generator
 
 from config import PROJECT_ROOT, load_settings
-from core.downloader import download_source_video, extract_audio_only
+from core.downloader import (
+    DownloadForbidden,
+    UPDATE_HINT,
+    download_source_video,
+    downloaded_video_info,
+    extract_audio_only,
+    yt_dlp_version,
+)
 from core.drive_uploader import DriveAuthError, check_drive_access, upload_clips_to_drive
 from core.face_tracker import on_camera_share
 from core.storage_manager import prune_stale_files
@@ -42,12 +49,14 @@ from core.lead_harvester import (
     discover_channels,
     generate_search_queries,
 )
+from core.hook_selector import replay_peaks
 from core.pipeline import (
     WeakMoments,
     pick_clips_with_agent,
     render_selected_clip,
     video_info_and_peaks,
 )
+from core.service_pause import ServicePause
 from core import clip_pages
 from core.pitch_files import prune_pitch_files, remove_pitch_files, save_pitch_files
 from core.transcriber import TranscriptionLimitReached, Word, transcribe_audio
@@ -64,6 +73,7 @@ SKIPPED_LEADS_PATH = STORAGE_DIR / "skipped_leads.json"
 SEEN_CHANNELS_PATH = STORAGE_DIR / "seen_channels.json"
 LEAD_QUEUE_PATH = STORAGE_DIR / "lead_queue.json"
 MAX_PENDING_LEADS = 5
+CONSOLE_LOG_MAX_BYTES = 1_000_000
 PENDING_SLOT_POLL_INTERVAL_SEC = 5
 # Each discovery run costs ~500 YouTube API units (5 searches x 100) out of a
 # 10,000/day quota, so back off when it finds nothing instead of retrying every 5 s.
@@ -241,7 +251,13 @@ def start_worker() -> bool:
     if shutil.which("caffeinate"):
         command = ["caffeinate", "-i", *command]  # macOS: the Mac doesn't idle-sleep while it works
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with (LOG_PATH.parent / "worker_console.log").open("a", encoding="utf-8") as console:
+    console_path = LOG_PATH.parent / "worker_console.log"
+    try:  # keep it from growing forever: past 1 MB, the old one becomes worker_console.old.log
+        if console_path.stat().st_size > CONSOLE_LOG_MAX_BYTES:
+            console_path.replace(console_path.with_name("worker_console.old.log"))
+    except OSError:
+        pass
+    with console_path.open("a", encoding="utf-8") as console:
         subprocess.Popen(
             command,
             cwd=root,
@@ -300,21 +316,41 @@ def get_cached_leads() -> list[dict[str, Any]]:
         return []
 
 
-def _read_json(path: Path, default: Any) -> Any:
+class StateFileError(RuntimeError):
+    """A state file exists but can't be read. The worker (and the Outbox) stop instead
+    of starting over empty, which would forget who was already pitched."""
+
+
+def _read_json(path: Path, default: Any, *, required: bool = False) -> Any:
+    """``required``: the files that remember who was pitched (processed creators, the
+    Outbox, the lead queue). A damaged one is copied aside and StateFileError raised;
+    other files fall back to ``default``."""
     if not path.exists():
         return default
     try:
         content = path.read_text(encoding="utf-8").strip()
         if not content:
-            return default
+            raise ValueError("the file is empty")
         return json.loads(content)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "Could not read persistent state at %s: %s. Using default.",
-            path,
-            exc,
-        )
-        return default
+    except (OSError, ValueError) as exc:  # JSONDecodeError is a ValueError
+        if not required:
+            logger.warning(
+                "Could not read persistent state at %s: %s. Using default.",
+                path,
+                exc,
+            )
+            return default
+        try:  # named after the file's own time, so the app's reruns don't copy it again
+            backup = path.with_name(f"{path.name}.damaged-{datetime.fromtimestamp(path.stat().st_mtime):%Y%m%d-%H%M%S}")
+            if not backup.exists():
+                shutil.copy2(path, backup)
+            saved = f"A copy is in storage/{backup.name}."
+        except OSError:
+            saved = "It couldn't be copied aside."
+        raise StateFileError(
+            f"storage/{path.name} can't be read ({exc}). {saved} Nothing was changed: fix or "
+            "restore the file (Time Machine, or the copy), then start the worker again."
+        ) from exc
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
@@ -363,8 +399,10 @@ def _processed_state() -> dict[str, Any]:
         "processed_video_ids": [],
         "records": [],
     }
-    raw = _read_json(PROCESSED_CREATORS_PATH, None)
-    if raw is None or not isinstance(raw, dict):
+    raw = _read_json(PROCESSED_CREATORS_PATH, None, required=True)
+    if raw is not None and not isinstance(raw, dict):
+        raise StateFileError(f"storage/{PROCESSED_CREATORS_PATH.name} isn't in the expected format; nothing was changed.")
+    if raw is None:
         logger.info("Initializing %s with default schema.", PROCESSED_CREATORS_PATH)
         _write_json_atomic(PROCESSED_CREATORS_PATH, default_state)
         return dict(default_state)
@@ -414,8 +452,10 @@ def _processed_state() -> dict[str, Any]:
 
 
 def _pending_records() -> list[dict[str, Any]]:
-    raw = _read_json(PENDING_OUTREACH_PATH, None)
-    if raw is None or not isinstance(raw, list):
+    raw = _read_json(PENDING_OUTREACH_PATH, None, required=True)
+    if raw is not None and not isinstance(raw, list):
+        raise StateFileError(f"storage/{PENDING_OUTREACH_PATH.name} isn't in the expected format; nothing was changed.")
+    if raw is None:
         logger.info("Initializing %s with empty list.", PENDING_OUTREACH_PATH)
         _write_json_atomic(PENDING_OUTREACH_PATH, [])
         return []
@@ -893,9 +933,9 @@ def skip_lead(channel_id: str, reason: str = "user_skipped", pass_reason: str | 
 
 
 def _lead_queue() -> list[dict[str, Any]]:
-    queue = _read_json(LEAD_QUEUE_PATH, [])
+    queue = _read_json(LEAD_QUEUE_PATH, [], required=True)
     if not isinstance(queue, list):
-        return []
+        raise StateFileError(f"storage/{LEAD_QUEUE_PATH.name} isn't in the expected format; nothing was changed.")
     return [lead for lead in queue if isinstance(lead, dict)]
 
 
@@ -1154,8 +1194,11 @@ def _process_lead(
     settings: Any,
 ) -> dict[str, Any]:
     _wait_for_pending_slot()
-    use_drive = drive_backup_on() or not clip_pages.configured()
-    if use_drive:
+    pages_on = clip_pages.configured()
+    # Round 17: with clip pages set up, the page is the link and Drive is only a backup
+    # copy, so a Drive problem no longer stops pitches. Without pages, Drive is the link.
+    drive_wanted = drive_backup_on() or not pages_on
+    if not pages_on:
         check_drive_access()  # before any download: a dead Drive login must not burn the lead
     channel_title = str(lead["channel_title"])
     video_title = str(lead["latest_video_title"])
@@ -1173,13 +1216,24 @@ def _process_lead(
         share = on_camera_share(source_video)
         if share is not None and share < MIN_ON_CAMERA_SHARE:
             raise NotAFit(f"no one on camera (a face in {share:.0%} of sampled frames)")
-        audio_path = extract_audio_only(source_video, job_dir / "source.wav")
-        words = transcribe_audio(audio_path, settings)
+        words = load_cached_transcript(video_id)
+        if words is None:
+            audio_path = extract_audio_only(source_video, job_dir / "source.wav")
+            words = transcribe_audio(audio_path, settings)
+            save_cached_transcript(video_id, words)  # a retry won't pay Groq again
+        else:
+            logger.info("Reusing the saved transcript of %s (no Groq call).", video_title)
         duration = _video_duration(source_video)
         if duration <= 0:
             raise RuntimeError(f"Source video has invalid duration: {source_video}")
 
-        _info, peaks = video_info_and_peaks(video_url)
+        downloaded = downloaded_video_info(video_url)
+        if downloaded is not None:  # the download already had the heatmap: no second YouTube call
+            peaks = replay_peaks(downloaded.get("heatmap"))  # type: ignore[arg-type]
+            if peaks:
+                logger.info("Using %d 'Most replayed' peak(s) for clip picking.", len(peaks))
+        else:
+            _info, peaks = video_info_and_peaks(video_url)
         report: dict[str, Any] = {}
         try:
             clips, outreach_email, subject = pick_clips_with_agent(
@@ -1212,15 +1266,8 @@ def _process_lead(
             except Exception:
                 # The pitch is still good; it just can't be previewed or trimmed in the app.
                 logger.warning("Could not save the Outbox preview files for %s.", channel_title, exc_info=True)
-        drive_link = ""
-        if use_drive:
-            drive_link = upload_clips_to_drive(
-                channel_title,
-                video_title,
-                [str(path) for path in rendered],
-            )
         page_url = ""
-        if clip_pages.configured():
+        if pages_on:
             try:
                 page_name, page_url = clip_pages.publish_page(
                     channel_title,
@@ -1229,7 +1276,22 @@ def _process_lead(
                     kind="episode" if " from the episode " in outreach_email else "video",
                 )
             except Exception:
-                logger.warning("Couldn't make the clip page for %s; the email uses the Drive link.", channel_title, exc_info=True)
+                logger.warning(
+                    "Couldn't make the clip page for %s%s.", channel_title,
+                    "; the email uses the Drive link" if drive_wanted else "", exc_info=True,
+                )
+        drive_link = ""
+        if drive_wanted:
+            try:
+                drive_link = upload_clips_to_drive(
+                    channel_title,
+                    video_title,
+                    [str(path) for path in rendered],
+                )
+            except Exception:
+                if not page_url:
+                    raise  # Drive is the only link
+                logger.warning("Drive backup failed for %s; the email uses the clip page.", channel_title, exc_info=True)
         link = page_url or drive_link
         if not link:
             raise RuntimeError("The clip page couldn't be made and DRIVE_BACKUP is off, so there's no link to send.")
@@ -1292,7 +1354,12 @@ def _process_lead(
             )
             time.sleep(PENDING_SLOT_POLL_INTERVAL_SEC)
         return pending_record
+    except NotAFit:
+        drop_cached_transcript(video_id)  # never retried
+        raise
     finally:
+        if queued:
+            drop_cached_transcript(video_id)
         if not queued:
             remove_pitch_files(record_id, _pitches_dir())
             if page_name:
@@ -1311,11 +1378,66 @@ def _process_lead(
         job_dir.rmdir()
 
 
+# --- Saved transcripts: a retried creator (YouTube error, Gemini pause, crash) doesn't
+# pay Groq again. Removed once the pitch is made or the creator is skipped, and after
+# TRANSCRIPT_KEEP_DAYS otherwise.
+TRANSCRIPT_KEEP_DAYS = 7
+_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{6,20}")
+
+
+def _transcripts_dir() -> Path:
+    return STORAGE_DIR / "transcripts"
+
+
+def _transcript_path(video_id: str) -> Path | None:
+    return _transcripts_dir() / f"{video_id}.json" if _VIDEO_ID.fullmatch(video_id or "") else None
+
+
+def load_cached_transcript(video_id: str) -> list[Word] | None:
+    path = _transcript_path(video_id)
+    if path is None or not path.is_file():
+        return None
+    try:
+        return [Word(*row) for row in json.loads(path.read_text(encoding="utf-8"))]
+    except (OSError, ValueError, TypeError):
+        logger.warning("Ignoring an unreadable saved transcript: %s", path)
+        return None
+
+
+def save_cached_transcript(video_id: str, words: list[Word]) -> None:
+    path = _transcript_path(video_id)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        rows = [[w.text, w.start, w.end, w.segment_start, w.segment_end] for w in words]
+        temporary.write_text(json.dumps(rows), encoding="utf-8")
+        temporary.replace(path)
+    except (OSError, AttributeError):
+        logger.warning("Couldn't save the transcript of %s.", video_id, exc_info=True)
+
+
+def drop_cached_transcript(video_id: str) -> None:
+    path = _transcript_path(video_id)
+    if path is not None:
+        path.unlink(missing_ok=True)
+
+
+# Old title-card images and subtitle files too: an interrupted render can leave them.
+TEMP_PATTERNS = ("*.mp4", "*.mov", "*.part", "*.wav", "*.m4a", "*.png", "*.ass")
+
+
 def _prune_leftovers(settings: Any) -> None:
-    """Delete downloads/temp files older than a day (the app does this on each run too).
+    """Delete downloads/temp files older than a day (the app does this on each run too),
+    and saved transcripts older than TRANSCRIPT_KEEP_DAYS.
     Best effort: a cleanup problem never stops the worker."""
     try:
-        removed = prune_stale_files(settings.raw_dir) + prune_stale_files(settings.temp_dir)
+        removed = (
+            prune_stale_files(settings.raw_dir)
+            + prune_stale_files(settings.temp_dir, patterns=TEMP_PATTERNS)
+            + prune_stale_files(_transcripts_dir(), max_age_hours=TRANSCRIPT_KEEP_DAYS * 24, patterns=("*.json",))
+        )
     except (AttributeError, OSError):
         logger.debug("Skipped leftover cleanup.", exc_info=True)
         return
@@ -1414,6 +1536,37 @@ def _discover_leads(max_results: int) -> list[dict[str, Any]]:
     return leads
 
 
+# --- Pauses for outside services (Round 17) --------------------------------------------
+# YouTube blocking downloads, Gemini's limit used up, the clip judge not answering: the
+# creator goes back in the queue without using an attempt, and the worker waits. If the
+# same service pauses again before a pitch gets through, the wait doubles (up to 4 h),
+# so a limit that lasts all night doesn't cost a download every half hour.
+MAX_SERVICE_PAUSE_SEC = 4 * 3600
+FORBIDDEN_STREAK_PAUSE = 2  # HTTP 403s in a row (different creators) before pausing
+_pause_streak: dict[str, int] = {}
+
+
+def _pause_for_service(lead: dict[str, Any], error: ServicePause) -> float:
+    """Requeue the creator (no attempt used), show the pause in the app; returns how
+    many seconds to wait."""
+    _handle_lead_failure(lead, error, count_attempt=False)
+    streak = _pause_streak.get(error.service, 0)
+    _pause_streak[error.service] = streak + 1
+    wait = min(error.retry_after * 2**streak, MAX_SERVICE_PAUSE_SEC)
+    resume = (datetime.now() + timedelta(seconds=wait)).strftime("%-I:%M %p")
+    text = f"{error}; trying again at about {resume}" + (f". {error.hint}" if error.hint else "")
+    _set_status("quota_pause", text)
+    logger.warning("%s. %s is back in the queue (no attempt used).", text.rstrip("."), lead.get("channel_title"))
+    return wait
+
+
+def _forbidden_pause() -> ServicePause:
+    return ServicePause(
+        f"YouTube refused {FORBIDDEN_STREAK_PAUSE} downloads in a row (HTTP 403)",
+        30 * 60, service="youtube", hint=UPDATE_HINT,
+    )
+
+
 def run_worker(batch: int = 3) -> int:
     if batch < 1:
         raise ValueError("batch must be at least 1.")
@@ -1455,9 +1608,15 @@ def run_worker(batch: int = 3) -> int:
         except KeyboardInterrupt:
             _requeue_interrupted(lead)
             raise
+        except StateFileError:
+            raise
         except DriveAuthError as exc:
             _handle_lead_failure(lead, exc, count_attempt=False)
             logger.error("%s Stopping; the lead is back in the queue.", exc)
+            return 1
+        except ServicePause as exc:
+            _pause_for_service(lead, exc)
+            logger.warning("Stopping this run; start it again later.")
             return 1
         except TranscriptionLimitReached as exc:
             _handle_lead_failure(lead, exc, count_attempt=False)
@@ -1480,6 +1639,7 @@ def run_worker(batch: int = 3) -> int:
         with _worker_lock():
             state = _processed_state()
             _update_lead_status(state, channel_id, "completed")
+        _pause_streak.clear()
         processed_count += 1
         logger.info("Prepared outreach for %s; clips: %s", pending_record["channel_title"], clip_link(pending_record))
 
@@ -1509,6 +1669,7 @@ def run_continuous_queue(
     _set_status("starting")
     discovery_backoff = DISCOVERY_BACKOFF_START_SEC
     logged_full_at: int | None = None
+    forbidden_streak = 0
     while True:
         if _stop_requested():
             _clear_stop_request()
@@ -1578,6 +1739,8 @@ def run_continuous_queue(
         except KeyboardInterrupt:
             _requeue_interrupted(fresh_lead)
             raise
+        except StateFileError:
+            raise
         except DriveAuthError as exc:
             _handle_lead_failure(fresh_lead, exc, count_attempt=False)
             _set_status("drive_sign_in", "Google Drive needs signing in again")
@@ -1591,10 +1754,22 @@ def run_continuous_queue(
             logger.warning("%s Waiting; the lead is back in the queue.", exc)
             time.sleep(exc.retry_after + 60)
             continue
+        except ServicePause as exc:
+            time.sleep(_pause_for_service(fresh_lead, exc))
+            continue
         except NotAFit as exc:
             _skip_not_a_fit(fresh_lead, exc)
+            forbidden_streak = 0
             continue
         except Exception as exc:
+            if isinstance(exc, DownloadForbidden):
+                forbidden_streak += 1
+                if forbidden_streak >= FORBIDDEN_STREAK_PAUSE:
+                    forbidden_streak = 0
+                    time.sleep(_pause_for_service(fresh_lead, _forbidden_pause()))
+                    continue
+            else:
+                forbidden_streak = 0
             logger.warning(
                 "Continuous queue processing failed for %s (%s); retrying the next "
                 "lead in 10 seconds: %s",
@@ -1609,6 +1784,8 @@ def run_continuous_queue(
         with _worker_lock():
             state = _processed_state()
             _update_lead_status(state, channel_id, "completed")
+        _pause_streak.clear()
+        forbidden_streak = 0
         logger.info("Queued outreach for %s; clips: %s", pending_record["channel_title"], clip_link(pending_record))
 
 
@@ -1649,12 +1826,13 @@ def main() -> int:
         parser.error("--batch must be at least 1.")
     continuous = arguments.continuous_queue or arguments.batch is None
     _setup_logging()
+    logger.info("Worker starting (yt-dlp %s).", yt_dlp_version())  # most YouTube 403 waves are fixed by an update
     instance = _claim_single_instance()
     if instance is None:
         logger.info("Another worker is already running (see the app), so this one isn't starting.")
         return 0
-    init_storage_files()
     try:
+        init_storage_files()
         if continuous:
             try:
                 run_continuous_queue(
@@ -1671,6 +1849,9 @@ def main() -> int:
         except KeyboardInterrupt:
             logger.info("Worker stopped.")
             return 0
+    except StateFileError as exc:
+        logger.error("Worker stopped: %s", exc)
+        return 1
     finally:
         _set_status("stopped")
         instance.close()

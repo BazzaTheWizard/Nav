@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 from pydantic import BaseModel
 
 from autonomous_worker import (
@@ -709,6 +710,20 @@ def _generate_clips(
 
 
 TAB_LABELS = ("📬 Outbox", "📨 Sent", "🧭 Pipeline", "🎬 Make clips", "🩺 System")
+# Page styles. Outbox players keep a 9:16 box while a new preview loads, so swapping
+# a clip after a re-render never collapses the column and moves the page. The About
+# page button is the big blue one: it's where the creator's email usually is.
+PAGE_CSS = """
+<style>
+[class*="st-key-preview_"] video { aspect-ratio: 9 / 16; height: auto; background: #000; object-fit: contain; }
+[class*="st-key-about_"] a {
+  background-color: #1a73e8 !important; border-color: #1a73e8 !important; color: #ffffff !important;
+  min-height: 3.1rem; font-size: 1.08rem; font-weight: 600;
+}
+[class*="st-key-about_"] a:hover { background-color: #1558b0 !important; border-color: #1558b0 !important; }
+[class*="st-key-about_"] a p { font-size: 1.08rem; font-weight: 600; color: #ffffff !important; }
+</style>
+"""
 LAYOUT_NAMES = {
     "smart_crop": "face-tracked",
     "blurred_background": "full frame",
@@ -719,6 +734,7 @@ LAYOUT_NAMES = {
 
 def main() -> None:
     st.set_page_config(page_title="Nav Studios", page_icon="🎬", layout="wide")
+    st.html(PAGE_CSS)
     if st.session_state.pop("_reset_clip_inputs_pending", False):
         st.session_state["video_url_input"] = ""
         st.session_state["channel_name_input"] = ""
@@ -811,12 +827,13 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
             _render_contact(record)
             drive_link = str(record.get("drive_link") or "")
             page_url = str(record.get("page_url") or "")
+            small = []
             if page_url:
-                st.link_button("🌐 Open their page (what they'll see)", page_url, use_container_width=True)
+                small.append(("🌐 Their clip page", page_url, "What they'll see when they open the link in your email."))
             if drive_link:
-                st.link_button(
-                    "📁 Drive backup" if page_url else "📁 Open the clips (Drive)", drive_link, use_container_width=True
-                )
+                small.append(("📁 Drive backup" if page_url else "📁 Open the clips (Drive)", drive_link, None))
+            for column, (label, url, help_text) in zip(st.columns(len(small) or 1), small):
+                column.link_button(label, url, help=help_text, width="stretch")
 
         _render_pitch_clips(record)
 
@@ -890,27 +907,37 @@ def _render_pitch_clips(record: dict[str, Any]) -> None:
     if pitch is None or not pitch.get("clips"):
         st.caption("No preview on this Mac for this pitch (it was made before previews existed). Use the Drive link.")
         return
-    flash = st.session_state.pop(f"trim_flash_{record_id}", None)
-    if flash:
-        st.success(flash)
     columns = st.columns(3)
     for column, item in zip(columns, pitch["clips"]):
         with column:
-            _render_pitch_clip(record, item)
+            _render_pitch_clip(record, int(item["index"]))
 
 
-def _render_pitch_clip(record: dict[str, Any], item: dict[str, Any]) -> None:
+@st.fragment
+def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
+    """One clip: player, times and trim. A fragment, so − / +, Re-render and the
+    new-cut buttons rerun only this clip: the rest of the page doesn't move. The layout
+    above the trim controls is the same in every state, and the trim panel remembers
+    whether it's open, so nothing jumps after a re-render either."""
     record_id = str(record["record_id"])
-    index = int(item["index"])
+    pitch = load_pitch(record_id)  # fresh from disk: a fragment rerun keeps the old arguments
+    item = next((clip for clip in (pitch or {}).get("clips", []) if int(clip["index"]) == index), None)
+    if item is None:
+        st.caption("This clip's files are gone (the pitch was sent or passed).")
+        return
     start_key, end_key = f"trim_start_{record_id}_{index}", f"trim_end_{record_id}_{index}"
+    toast = st.session_state.pop(f"trim_toast_{record_id}_{index}", None)
+    if toast:
+        st.toast(toast, icon="✅")  # floats over the page, so nothing moves
     for key in st.session_state.pop(f"trim_reset_{record_id}_{index}", []):  # before the inputs exist
-        st.session_state.pop(key, None)
+        st.session_state[key] = 0.0  # setting (not removing) also resets the number shown
     waiting = bool(item.get("trim_waiting")) and "trim" in item
     preview = Path(item["trim_preview_path"] if waiting else item["preview_path"])
-    if preview.is_file():
-        st.video(str(preview), width=PREVIEW_PLAYER_WIDTH)
-    else:
-        st.caption("Preview file missing. Use the Drive link.")
+    with st.container(key=f"preview_{record_id}_{index}"):
+        if preview.is_file():
+            st.video(str(preview), width=PREVIEW_PLAYER_WIDTH)
+        else:
+            st.caption("Preview file missing. Use the Drive link.")
     start, end = float(item["start"]), float(item["end"])
     saved = [clip for clip in record.get("clips") or [] if isinstance(clip, dict)]
     score = saved[index - 1].get("judge") if len(saved) >= index else None
@@ -918,36 +945,26 @@ def _render_pitch_clip(record: dict[str, Any], item: dict[str, Any]) -> None:
         f"**Clip {index}** · {_clock(start)}–{_clock(end)} · {end - start:.0f} s"
         + (f" · AI {int(score)}" if isinstance(score, (int, float)) else "")
     )
-    if waiting:
-        new = item["trim"]
-        st.markdown(f":orange-badge[New cut, not used yet] {_clock(new['start'])}–{_clock(new['end'])} ({new['end'] - new['start']:.1f} s)")
-        use_column, keep_column = st.columns(2)
-        if use_column.button("✅ Use this cut", key=f"trim_use_{record_id}_{index}", type="primary", use_container_width=True):
-            with st.spinner("Replacing the clip on their page and in Drive…"):
-                try:
-                    times = accept_trim(record_id, index, _clip_replacer(record, new["start"], new["end"]))
-                    record_clip_trim(record_id, index, times["start"], times["end"])
-                except Exception as exc:
-                    logging.exception("Could not use the trimmed clip")
-                    st.error(f"Couldn't use the new cut: {exc}")
-                    return
-            st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
-            st.session_state[f"trim_flash_{record_id}"] = f"Clip {index} updated. The link in the email stays the same."
-            st.rerun()
-        if keep_column.button("↩️ Keep the old cut", key=f"trim_keep_{record_id}_{index}", use_container_width=True):
-            discard_trim(record_id, index)
-            st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
-            st.rerun()
-    with st.expander("✂️ Trim"):
+    # Keyed, so it stays open across reruns; it opens by itself when a new cut is
+    # waiting (after the app restarts, say). Its arguments never change, so Streamlit
+    # never treats it as a new, closed panel.
+    open_key = f"trim_open_{record_id}_{index}"
+    if waiting and open_key not in st.session_state:
+        st.session_state[open_key] = True
+    with st.expander("✂️ Trim", key=open_key, on_change=_ignore):
         earliest, latest = trim_limits(item)
+        # The offsets live in session state (no value=): one source of truth, so a reset
+        # after "Use this cut" also resets the number on screen.
+        st.session_state.setdefault(start_key, 0.0)
+        st.session_state.setdefault(end_key, 0.0)
         st.number_input(
-            "Start: move by (seconds)", key=start_key, value=0.0, step=0.5, format="%.1f",
+            "Start: move by (seconds)", key=start_key, step=0.5, format="%.1f",
             min_value=min(0.0, round(earliest - start, 1)),
             max_value=max(0.0, round(end - MIN_CLIP_DURATION - start, 1)),
             help="Negative starts earlier. − / + nudge by half a second.",
         )
         st.number_input(
-            "End: move by (seconds)", key=end_key, value=0.0, step=0.5, format="%.1f",
+            "End: move by (seconds)", key=end_key, step=0.5, format="%.1f",
             min_value=min(0.0, round(start + MIN_CLIP_DURATION - end, 1)),
             max_value=max(0.0, round(latest - end, 1)),
             help="Positive ends later. − / + nudge by half a second.",
@@ -966,7 +983,50 @@ def _render_pitch_clip(record: dict[str, Any], item: dict[str, Any]) -> None:
                     logging.exception("Could not re-render the trimmed clip")
                     st.error(f"Couldn't re-render: {exc}")
                     return
-            st.rerun()
+            _rerun_this_clip()
+        if waiting:
+            # Below the controls, so it never pushes them (or the player) around.
+            new = item["trim"]
+            st.markdown(
+                f":orange-badge[New cut, not used yet] {_clock(new['start'])}–{_clock(new['end'])} "
+                f"({new['end'] - new['start']:.1f} s). The player shows it."
+            )
+            use_column, keep_column = st.columns(2)
+            use_clicked = use_column.button(
+                "✅ Use this cut", key=f"trim_use_{record_id}_{index}", type="primary", use_container_width=True
+            )
+            keep_clicked = keep_column.button(
+                "↩️ Keep the old cut", key=f"trim_keep_{record_id}_{index}", use_container_width=True
+            )
+            if use_clicked:
+                with st.spinner("Replacing the clip on their page and in Drive…"):
+                    try:
+                        times = accept_trim(record_id, index, _clip_replacer(record, new["start"], new["end"]))
+                        record_clip_trim(record_id, index, times["start"], times["end"])
+                    except Exception as exc:
+                        logging.exception("Could not use the trimmed clip")
+                        st.error(f"Couldn't use the new cut: {exc}")  # both buttons stay
+                        return
+                st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
+                st.session_state[f"trim_toast_{record_id}_{index}"] = f"Clip {index} updated. The link in the email stays the same."
+                _rerun_this_clip()
+            if keep_clicked:
+                discard_trim(record_id, index)
+                st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
+                _rerun_this_clip()
+
+
+def _rerun_this_clip() -> None:
+    """Rerun just this clip (the page stays put). If this run was a full-page run (rare in
+    the browser; always in tests), Streamlit refuses that, so rerun the page instead."""
+    try:
+        st.rerun(scope="fragment")
+    except StreamlitAPIException:
+        st.rerun()
+
+
+def _ignore() -> None:
+    """on_change for widgets that only need Streamlit to remember their state."""
 
 
 def _clip_replacer(record: dict[str, Any], start: float, end: float):
@@ -1011,14 +1071,33 @@ def _render_pitch_badges(record: dict[str, Any]) -> None:
         st.markdown(" ".join(f":{color}-badge[{label.replace(']', ')')}]" for label, color in badges))
 
 
+def _about_url(record: dict[str, Any]) -> str:
+    """The creator's YouTube About page (where the email usually is)."""
+    contact = str(record.get("contact_email") or "")
+    if contact.startswith(("http://", "https://")):
+        return contact
+    channel_url = str(record.get("channel_url") or "")
+    if channel_url.startswith(("http://", "https://")):
+        return channel_url.rstrip("/") + "/about"
+    channel_id = str(record.get("channel_id") or "")
+    if re.fullmatch(r"UC[A-Za-z0-9_-]{10,}", channel_id):
+        return f"https://www.youtube.com/channel/{channel_id}/about"
+    return ""
+
+
 def _render_contact(record: dict[str, Any]) -> None:
+    """The email if the worker found one, then the big About page button."""
     contact = str(record.get("contact_email") or "")
     if "@" in contact and not contact.startswith(("http://", "https://")):
         st.markdown(f"✉️ [{contact}](mailto:{contact})")
-    elif contact.startswith(("http://", "https://")):
-        st.markdown(f"No email found: check their [About page]({contact})")
     else:
-        st.caption("No email found: check their YouTube About page")
+        st.caption("No email found yet: it's usually on their About page.")
+    about = _about_url(record)
+    if about:
+        st.link_button(
+            "📇 Open their About page", about, key=f"about_{record['record_id']}", width="stretch",
+            help="Their YouTube About page: the email is usually under 'View email address'.",
+        )
 
 
 # --- 🧭 Pipeline: what the worker does next ---------------------------------------------

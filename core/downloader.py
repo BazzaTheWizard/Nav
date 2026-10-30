@@ -41,6 +41,62 @@ def video_format_sort() -> list[str]:
     height = min(2160, max(720, height))
     return [f"res:{height}", *VIDEO_FORMAT_SORT[1:]]
 
+# YouTube refusing the worker for a while (bot check, rate limit): pause the worker
+# instead of using up creators' attempts. A plain 403 is often just one video or an
+# outdated yt-dlp, so it's reported separately (DownloadForbidden).
+_YOUTUBE_BLOCKED = re.compile(r"not a bot|HTTP Error 429|Too Many Requests", re.IGNORECASE)
+YOUTUBE_PAUSE_SEC = 30 * 60
+UPDATE_HINT = "If it keeps happening, update yt-dlp: .venv/bin/pip install -U yt-dlp"
+
+
+class DownloadForbidden(RuntimeError):
+    """YouTube answered HTTP 403. Two in a row and the worker pauses (see the worker)."""
+
+
+# What yt-dlp learned while downloading (title, heatmap, ...), so the worker doesn't
+# ask YouTube a second time for the "Most replayed" heatmap. url -> info.
+_DOWNLOAD_INFO: dict[str, dict[str, object]] = {}
+
+
+def downloaded_video_info(url: str) -> dict[str, object] | None:
+    """Title, channel, duration and heatmap from this URL's download (once), or None
+    when the file came from the cache or the download didn't report them."""
+    return _DOWNLOAD_INFO.pop(url, None)
+
+
+def yt_dlp_version() -> str:
+    try:
+        from yt_dlp.version import __version__
+    except ImportError:
+        return "not installed"
+    return str(__version__)
+
+
+def _download_error(exc: Exception, what: str) -> Exception:
+    """The exception to raise for a yt-dlp DownloadError."""
+    text = str(exc)
+    if _YOUTUBE_BLOCKED.search(text):
+        from core.service_pause import ServicePause
+
+        return ServicePause(
+            "YouTube is blocking downloads for now (bot check or too many requests)",
+            YOUTUBE_PAUSE_SEC, service="youtube", hint=UPDATE_HINT,
+        )
+    if "HTTP Error 403" in text:
+        return DownloadForbidden(f"yt-dlp could not download {what}: {exc}")
+    return RuntimeError(f"yt-dlp could not download {what}: {exc}")
+
+
+def _audio_language(info: object) -> str | None:
+    """The language of the audio track yt-dlp picked (a video can have dubbed tracks)."""
+    if not isinstance(info, dict):
+        return None
+    for item in info.get("requested_formats") or []:
+        if isinstance(item, dict) and item.get("acodec") not in (None, "none") and item.get("language"):
+            return str(item["language"])
+    return str(info["language"]) if info.get("language") else None
+
+
 __all__ = [
     "fetch_video_info",
     "download_audio_only",
@@ -116,6 +172,7 @@ def _download_url(
             }
         ],
         "quiet": True,
+        "noprogress": True,  # the progress hook still runs; this only drops the bars in the log
         "no_warnings": True,
         "ffmpeg_location": ffmpeg_path,
         "progress_hooks": [_yt_dlp_progress_hook(on_progress)],
@@ -125,8 +182,15 @@ def _download_url(
         with YoutubeDL(options) as downloader:
             info = downloader.extract_info(url, download=True)
     except DownloadError as exc:
-        raise RuntimeError(f"yt-dlp could not download the input URL: {exc}") from exc
+        raise _download_error(exc, "the input URL") from exc
 
+    if isinstance(info, dict):
+        _DOWNLOAD_INFO[url] = {
+            "title": info.get("title"),
+            "channel": info.get("channel") or info.get("uploader"),
+            "duration": info.get("duration"),
+            "heatmap": info.get("heatmap") if isinstance(info.get("heatmap"), list) else None,
+        }
     downloaded_files = list(settings.raw_dir.glob(f"{download_id}*.mp4"))
     if len(downloaded_files) != 1 or not downloaded_files[0].is_file():
         raise RuntimeError(
@@ -139,6 +203,7 @@ def _download_url(
             (info or {}).get("format_id") if isinstance(info, dict) else None,
             downloaded_files[0].stat().st_size,
             time.monotonic() - started,
+            _audio_language(info),
         ),
     )
     if cached is not None:
@@ -147,12 +212,13 @@ def _download_url(
     return downloaded_files[0]
 
 
-def download_summary(format_id: object, size_bytes: int, seconds: float) -> str:
+def download_summary(format_id: object, size_bytes: int, seconds: float, audio_language: str | None = None) -> str:
     """One log line per download, so slow or oversized downloads show up in the log."""
     megabytes = size_bytes / 1_000_000
     return (
         f"Downloaded format {format_id or '?'}: {megabytes:,.0f} MB in {seconds:,.0f} s "
         f"({megabytes / max(seconds, 0.001):.1f} MB/s)"
+        + (f", audio language {audio_language}" if audio_language else "")
     )
 
 
@@ -258,6 +324,7 @@ def download_audio_only(
         "outtmpl": output_template,
         "noplaylist": True,
         "quiet": True,
+        "noprogress": True,
         "no_warnings": True,
         "postprocessors": [
             {
@@ -324,7 +391,7 @@ def download_audio_only(
                 "Audio download completed, but the expected output file is missing."
             )
     except DownloadError as exc:
-        raise RuntimeError(f"yt-dlp could not download audio from the URL: {exc}") from exc
+        raise _download_error(exc, "audio from the URL") from exc
     finally:
         for temporary_file in set(temporary_files) | set(destination_dir.glob(f"{download_id}.*")):
             if temporary_file.is_file() or temporary_file.is_symlink():
