@@ -269,7 +269,11 @@ check("Captions: just under the title card while it shows, then under the slides
 from streamlit.testing.v1 import AppTest  # noqa: E402
 import core.clipper as C  # noqa: E402
 log = tmp / "app_calls.json"
-out = tmp / "Desktop"
+# The clips folder is reached through a symlinked parent, like macOS temp folders
+# (/var -> /private/var): the app must find a clip's saved framing however its path is spelled.
+(tmp / "private_home").mkdir()
+(tmp / "home").symlink_to(tmp / "private_home")
+out = tmp / "home" / "Desktop"
 wrapper = tmp / "app_wrapper.py"
 wrapper.write_text(textwrap.dedent(f"""
     import sys, json; sys.path.insert(0, {str(ROOT)!r})

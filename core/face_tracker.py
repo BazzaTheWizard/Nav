@@ -231,6 +231,30 @@ class _FaceDetector:
         if self._haar is None:
             return []
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return self._haar_faces(gray)
+
+    def faces_with_eyes(
+        self, frame: np.ndarray
+    ) -> list[tuple[float, float, float, float, float, tuple[float, float], tuple[float, float]]]:
+        """Faces with eye centers: (cx, cy, w, h, score, right eye, left eye). YuNet only
+        (the Haar fallback doesn't find eyes): [] without it."""
+        if self._yunet is None:
+            return []
+        height, width = frame.shape[:2]
+        if self._yunet_size != (width, height):
+            self._yunet.setInputSize((width, height))
+            self._yunet_size = (width, height)
+        _count, faces = self._yunet.detect(frame)
+        if faces is None:
+            return []
+        return [
+            (float(x + w / 2), float(y + h / 2), float(w), float(h), float(face[-1]),
+             (float(face[4]), float(face[5])), (float(face[6]), float(face[7])))
+            for face in faces
+            for x, y, w, h in [face[:4]]
+        ]
+
+    def _haar_faces(self, gray: np.ndarray) -> list[tuple[float, float, float, float, float]]:
         detections, _, scores = self._haar.detectMultiScale3(
             gray,
             scaleFactor=1.1,

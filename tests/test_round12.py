@@ -63,9 +63,9 @@ check("With SOURCE_MAX_HEIGHT=2160 -> 4K VP9", pick(youtube_like) == "vp9-2160+m
 os.environ.pop("SOURCE_MAX_HEIGHT")
 
 # ---------- Encoder and sharpening ----------
-check("Sharpening matched to the enlargement: 1080p crop (1.78x) as before",
-      V._sharpen(1920 / 1078) == ",unsharp=5:5:0.7:5:5:0.0", V._sharpen(1920 / 1078))
-check("1440p crop (1.33x): lighter", V._sharpen(1920 / 1440) == ",unsharp=5:5:0.3:5:5:0.0", V._sharpen(1920 / 1440))
+check("Sharpening matched to the enlargement: 1080p crop (1.78x) gets the full 0.8 (round 22)",
+      V._sharpen(1920 / 1078) == ",unsharp=5:5:0.8:5:5:0.0", V._sharpen(1920 / 1078))
+check("1440p crop (1.33x): lighter", V._sharpen(1920 / 1440) == ",unsharp=5:5:0.67:5:5:0.0", V._sharpen(1920 / 1440))
 check("4K crop (downscaled): none", V._sharpen(1920 / 2160) == "")
 real_run = V.subprocess.run
 V.subprocess.run = lambda *a, **k: type("R", (), {"stdout": " V..... h264_videotoolbox VideoToolbox H.264 Encoder"})()
@@ -113,7 +113,8 @@ check("AUDIO_TARGET_LUFS=-16 is used", "loudnorm=I=-16.0" in V._audio_filter("ff
 os.environ.pop("AUDIO_TARGET_LUFS")
 silent = tmp / "silent.mp4"
 subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "3", str(silent)], check=True)
-check("Silence can't be measured -> left alone", V._audio_filter("ffmpeg", silent, 0, 3) == "aresample=async=1:first_pts=0")
+check("Silence can't be measured -> left alone (cleanup only)", "loudnorm" not in V._audio_filter("ffmpeg", silent, 0, 3)
+      and V._audio_filter("ffmpeg", silent, 0, 3).startswith("aresample=async=1:first_pts=0"))
 whisper = tmp / "whisper.mp4"
 subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=330:duration=4,volume=0.02", str(whisper)], check=True)
 check("Nearly silent clip isn't boosted 30+ dB (that would only raise noise)", "loudnorm" not in V._audio_filter("ffmpeg", whisper, 0, 4))

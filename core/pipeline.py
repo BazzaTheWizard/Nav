@@ -48,6 +48,7 @@ class RenderedClip:
     crop: CropBox
     crop_plan: CropPlan | None
     webinar: WebinarLayout | None = None  # layout "webinar": reused when the clip is trimmed
+    pin_title: bool = False  # the title card stayed on for the whole clip
 
 
 def choose_layout(requested: str, plan: CropPlan | None) -> str:
@@ -80,12 +81,16 @@ def render_selected_clip(
     work_dir: Path | None = None,
     pin_title: bool = False,
     webinar_corner: str = "auto",
+    webinar_options: dict[str, str] | None = None,
+    webinar_layout: WebinarLayout | None = None,
 ) -> RenderedClip:
     """Subtitles, framing and render for one selected clip.
 
     ``pin_title``: the title card stays on for the whole clip (Make clips tab).
-    ``webinar_corner``: layout "webinar" only, where the speaker's webcam is
-    ("auto" finds it)."""
+    Layout "webinar" only: ``webinar_corner`` is where the speaker's webcam is ("auto"
+    finds it); ``webinar_options`` the slide shape and divider (core.webinar.plan_webinar's
+    ``slides``, ``divider``, ``accent``); ``webinar_layout`` a layout found before (a
+    trim reuses the first render's)."""
     work_dir = work_dir or settings.temp_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     subtitle_path = work_dir / f"{output_path.stem}.ass"
@@ -105,7 +110,9 @@ def render_selected_clip(
             except Exception:
                 logger.warning("Framing analysis failed; using a fallback layout.", exc_info=True)
         layout = choose_layout(layout_mode, plan)
-        webinar = plan_webinar(source_video, start, end, webinar_corner) if layout == "webinar" else None
+        webinar = None
+        if layout == "webinar":
+            webinar = webinar_layout or plan_webinar(source_video, start, end, webinar_corner, **(webinar_options or {}))
 
         full_frame: list[tuple[float, float]] = []
         split = None
@@ -177,6 +184,7 @@ def render_selected_clip(
             crop=crop,
             crop_plan=plan if layout in CROP_LAYOUTS else None,
             webinar=webinar,
+            pin_title=pin_title,
         )
     finally:
         subtitle_path.unlink(missing_ok=True)

@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
+
 from config import PROJECT_ROOT
 from core.clipper import MAX_CLIP_DURATION, MIN_CLIP_DURATION
 from core.transcriber import Word
@@ -31,6 +33,17 @@ logger = logging.getLogger(__name__)
 PITCHES_DIR = PROJECT_ROOT / "storage" / "pitches"
 TRIM_MARGIN_SEC = 30.0  # how far each end can move from the AI's cut
 PREVIEW_WIDTH = 720
+# Cut a slice from just after its keyframe. FFmpeg goes back to the keyframe at or before
+# the time it's given; a time written to the millisecond can land a hair *before* the
+# keyframe (298.96530 written as 298.965), and the slice then started one keyframe
+# (2-5 s) earlier than recorded: trimmed clips' captions were off by that much.
+SEEK_NUDGE = 0.004  # under half a frame even at 120 fps
+# Every slice's start is checked by finding the clip's sound in it (10 ms steps).
+ALIGN_STEP = 0.01
+MIN_ALIGN_MATCH = 0.8  # correlation of the two loudness curves; real matches are ~1.0
+# A stream-copied slice's sound can sit ~20-30 ms off its picture (AAC comes in 21 ms
+# blocks). Captions follow the sound, so the slice start measured from the sound wins.
+SLICE_FIX_LOG = 0.04  # seconds: a bigger difference is logged as a wrong slice
 _SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
@@ -98,7 +111,7 @@ def cut_source_slice(source: Path, start: float, end: float, output: Path) -> fl
     at the slice's 0:00 (source time = that + slice time, for picture and sound)."""
     keyframe = keyframe_at_or_before(source, start)
     _run([
-        _tool("ffmpeg"), "-v", "error", "-y", "-ss", f"{keyframe:.3f}", "-i", str(source),
+        _tool("ffmpeg"), "-v", "error", "-y", "-ss", f"{keyframe + SEEK_NUDGE if keyframe > 0 else 0.0:.4f}", "-i", str(source),
         "-t", f"{max(0.1, end - keyframe):.3f}", "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
         "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(output),
     ])
@@ -113,6 +126,43 @@ def cut_source_slice(source: Path, start: float, end: float, output: Path) -> fl
     except ValueError:
         video_start = 0.0
     return keyframe - video_start
+
+
+def _loudness_curve(path: Path) -> np.ndarray:
+    """Log loudness every ALIGN_STEP seconds (mono, 8 kHz)."""
+    raw = subprocess.run(
+        [_tool("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:a:0", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"],
+        capture_output=True, timeout=300,
+    ).stdout
+    samples = np.frombuffer(raw, np.int16).astype(np.float64)
+    block = int(8000 * ALIGN_STEP)
+    samples = samples[: samples.size // block * block].reshape(-1, block)
+    return np.log10((samples ** 2).mean(axis=1) + 1.0) if samples.size else np.zeros(0)
+
+
+def find_clip_in_slice(slice_path: Path, clip_path: Path) -> float | None:
+    """Where (seconds into the slice) the clip's sound starts, or None when it can't be
+    matched (no sound, or too different). The clip was rendered from the full source,
+    so this is the ground truth for the slice's start: slice start = clip start - this.
+    (Loudness normalization only scales the sound, so the curves still line up.)"""
+    try:
+        long, short = _loudness_curve(slice_path), _loudness_curve(clip_path)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    n = short.size
+    if n < 200 or long.size < n or short.std() < 0.05:
+        return None
+    short = short - short.mean()
+    numerator = np.correlate(long, short, mode="valid")
+    sums = np.concatenate([[0.0], np.cumsum(long)])
+    squares = np.concatenate([[0.0], np.cumsum(long ** 2)])
+    window_sum = sums[n:] - sums[:-n]
+    window_var = np.maximum(squares[n:] - squares[:-n] - window_sum ** 2 / n, 1e-12)
+    match = numerator / np.sqrt(window_var * float((short ** 2).sum()))
+    best = int(np.argmax(match))
+    if match[best] < MIN_ALIGN_MATCH:
+        return None
+    return best * ALIGN_STEP
 
 
 def make_preview(clip: Path, output: Path) -> None:
@@ -183,6 +233,12 @@ def save_pitch_files(
             make_preview(directory / f"{name}.mp4", directory / f"{name}.preview.mp4")
             slice_end = min(source_duration, end + TRIM_MARGIN_SEC) if source_duration > 0 else end + TRIM_MARGIN_SEC
             slice_start = cut_source_slice(source_video, max(0.0, start - TRIM_MARGIN_SEC), slice_end, directory / f"{name}.source.mp4")
+            found = find_clip_in_slice(directory / f"{name}.source.mp4", directory / f"{name}.mp4")
+            if found is not None:
+                if abs((start - found) - slice_start) > SLICE_FIX_LOG:
+                    logger.warning("Clip %d's source slice starts at %.3f s, not %.3f s; using what its sound says.",
+                                   index, start - found, slice_start)
+                slice_start = start - found
             slice_end = slice_start + _duration(directory / f"{name}.source.mp4")
             slice_start = max(slice_start, 0.0)
             window = [
@@ -204,6 +260,8 @@ def save_pitch_files(
                 "layout": item.layout_mode,
                 "clip": item.clip.model_dump(),
                 "words": window,
+                "slice_checked": found is not None,
+                **_render_options(item),
             })
         _write_manifest(record_id, {
             "record_id": record_id,
@@ -214,6 +272,94 @@ def save_pitch_files(
         remove_pitch_files(record_id, root)
         raise
     return directory
+
+
+def _render_options(item: Any) -> dict[str, Any]:
+    """The first render's own options (pinned title, webinar layout), so a trim keeps them."""
+    options: dict[str, Any] = {}
+    if getattr(item, "pin_title", False):
+        options["pin_title"] = True
+    if getattr(item, "webinar", None) is not None:
+        from core.webinar import layout_to_dict
+
+        options["webinar"] = layout_to_dict(item.webinar)
+    return options
+
+
+def check_slice(record_id: str, index: int) -> float:
+    """Make sure clip ``index``'s slice start is right (pitches made before round 22
+    could be a keyframe off). Fixes the saved start, the trim limits and the words'
+    times if it wasn't. Returns the correction in seconds (0 when it was right or
+    couldn't be checked)."""
+    directory = pitch_dir(record_id)
+    manifest = json.loads(_manifest_path(record_id).read_text(encoding="utf-8"))
+    item = next((clip for clip in manifest["clips"] if clip["index"] == index), None)
+    if item is None or item.get("slice_checked"):
+        return 0.0
+    found = find_clip_in_slice(directory / item["source"], directory / item["file"])
+    correction = 0.0
+    if found is not None:
+        true_start = float(item["start"]) - found
+        correction = round(true_start - float(item["slice_start"]), 3)
+        if abs(correction) >= 0.02:
+            # Words were saved relative to the wrong start: move them by the difference.
+            item["words"] = [[text, round(a - correction, 3), round(b - correction, 3)] for text, a, b in item["words"]]
+            item["slice_start"] = round(true_start, 3)
+            item["slice_end"] = round(float(item["slice_end"]) + correction, 3)
+            if abs(correction) > SLICE_FIX_LOG:
+                logger.warning("Pitch %s clip %d: its source slice was %.2f s off; fixed.", record_id, index, correction)
+        else:
+            correction = 0.0
+        item["slice_checked"] = True
+        _write_manifest(record_id, manifest)
+    return correction
+
+
+SNAP_PAD = 0.05  # when snapping to whole words: this much room before/after the word
+CUT_WORDS = 5  # words shown at each end of a cut
+
+
+def cut_report(item: dict[str, Any], new_start: float, new_end: float) -> dict[str, Any]:
+    """What a cut sounds like at its edges (times in the source video):
+    {"opens": first words, "closes": last words, "start_word" / "end_word": the word a
+    cut lands inside (None if it falls between words), "snap_start" / "snap_end": the
+    cut moved out to take that whole word (inside the trim limits)}."""
+    offset = float(item["slice_start"])
+    words = [(str(text), float(a) + offset, float(b) + offset) for text, a, b in item.get("words", [])]
+    inside = [w for w in words if w[2] > new_start and w[1] < new_end]
+    earliest, latest = trim_limits(item)
+    start_word = next((w for w in words if w[1] < new_start - 0.02 and new_start + 0.02 < w[2]), None)
+    end_word = next((w for w in words if w[1] < new_end - 0.02 and new_end + 0.02 < w[2]), None)
+    return {
+        "opens": " ".join(w[0] for w in inside[:CUT_WORDS]),
+        "closes": " ".join(w[0] for w in inside[-CUT_WORDS:]),
+        "start_word": start_word[0] if start_word else None,
+        "end_word": end_word[0] if end_word else None,
+        "snap_start": max(earliest, start_word[1] - SNAP_PAD) if start_word else new_start,
+        "snap_end": min(latest, end_word[2] + SNAP_PAD) if end_word else new_end,
+    }
+
+
+def poster_after_trim(item: dict[str, Any], new_start: float, new_end: float) -> float | None:
+    """A picked poster frame after a trim: the same moment of the video, now further in
+    or out of the clip. None (picked automatically again) if none was picked or that
+    moment is no longer in the clip."""
+    if item.get("poster_at") is None:
+        return None
+    at = round(float(item["poster_at"]) + float(item["start"]) - new_start, 2)
+    return at if 0.0 <= at <= new_end - new_start - 0.1 else None
+
+
+def set_poster_time(record_id: str, index: int, at: float | None) -> None:
+    """Remember the poster frame picked for a clip (None: automatic again)."""
+    manifest = json.loads(_manifest_path(record_id).read_text(encoding="utf-8"))
+    for item in manifest["clips"]:
+        if item["index"] == index:
+            if at is None:
+                item.pop("poster_at", None)
+            else:
+                item["poster_at"] = round(float(at), 2)
+    _write_manifest(record_id, manifest)
 
 
 def trim_limits(item: dict[str, Any]) -> tuple[float, float]:
@@ -228,9 +374,10 @@ def rerender_trim(record_id: str, index: int, new_start: float, new_end: float, 
     from core.hook_selector import ClipResult
     from core.pipeline import render_selected_clip
 
-    manifest = load_pitch(record_id)
-    if manifest is None:
+    if load_pitch(record_id) is None:
         raise RuntimeError("This pitch's files aren't on this Mac any more.")
+    check_slice(record_id, index)
+    manifest = load_pitch(record_id)
     item = next((clip for clip in manifest["clips"] if clip["index"] == index), None)
     if item is None:
         raise ValueError(f"No clip {index} in this pitch.")
@@ -248,9 +395,16 @@ def rerender_trim(record_id: str, index: int, new_start: float, new_end: float, 
     work_dir = Path(settings.temp_dir) / f"trim_{uuid.uuid4().hex[:12]}"
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
+        kept: dict[str, Any] = {}  # the first render's own options (only when it had them)
+        if item.get("pin_title"):
+            kept["pin_title"] = True
+        if item.get("webinar"):
+            from core.webinar import layout_from_dict
+
+            kept["webinar_layout"] = layout_from_dict(item["webinar"])
         rendered = render_selected_clip(
             directory / item["source"], clip, words, settings, work_dir / item["file"],
-            layout_mode=str(item["layout"]), work_dir=work_dir,
+            layout_mode=str(item["layout"]), work_dir=work_dir, **kept,
         )
         trimmed = directory / _trim_name(item["file"])
         shutil.move(str(rendered.path), trimmed)
@@ -288,6 +442,11 @@ def accept_trim(
     trimmed_preview.replace(directory / item["preview"])
     times = item.pop("trim")
     item["start"], item["end"] = times["start"], times["end"]
+    poster_at = poster_after_trim(item, times["start"], times["end"])
+    if poster_at is None:
+        item.pop("poster_at", None)
+    else:
+        item["poster_at"] = poster_at
     _write_manifest(record_id, manifest)
     return times
 

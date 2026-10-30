@@ -16,10 +16,11 @@ so the Mac's VideoToolbox encoder is still used.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import statistics
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import cv2
@@ -32,7 +33,14 @@ logger = logging.getLogger(__name__)
 OUTPUT_WIDTH, OUTPUT_HEIGHT = 1080, 1920
 BAND_HEIGHT = 460  # the speaker band: 24% of the frame
 CONTENT_MAX_HEIGHT = 640  # slides fit in 1080 x this (16:9 slides use the full width: 608 px)
-DIVIDER = "drawbox=x=0:y={y}:w=1080:h=4:color=black@0.85:t=fill"
+# Between the speaker and the slides (DIVIDERS: what the app offers).
+DIVIDERS = ("line", "accent", "shadow", "gap")
+DEFAULT_ACCENT = "#4F8EF7"
+GAP_HEIGHT = 24  # "gap": dark space between the two
+SHADOW_STEPS = (0.55, 0.42, 0.3, 0.2, 0.12, 0.06)  # "shadow": 4 px bands, darkest at the top
+# Slide shape: "auto" trims dark borders; "16:9" and "4:3" crop the slide area to exactly
+# that shape (centered), so it's scaled evenly and never stretched.
+SLIDE_SHAPES = {"auto": None, "16:9": 16 / 9, "4:3": 4 / 3}
 TITLE_GAP = 28  # slides -> title card
 CAPTION_GAP = 36  # slides (or the title card) -> captions
 TITLE_CAPTION_GAP = 20
@@ -73,10 +81,17 @@ class WebinarLayout:
     content: CropBox  # source pixels shown as the slides
     content_width: int  # output size of the slides
     content_height: int
+    slides: str = "auto"  # "auto", "16:9" or "4:3"
+    divider: str = "line"  # one of DIVIDERS
+    accent: str = DEFAULT_ACCENT  # "#RRGGBB", for the "accent" divider
+
+    @property
+    def content_top(self) -> int:
+        return BAND_HEIGHT + (GAP_HEIGHT if self.divider == "gap" else 0)
 
     @property
     def content_bottom(self) -> int:
-        return BAND_HEIGHT + self.content_height
+        return self.content_top + self.content_height
 
     @property
     def title_top(self) -> int:
@@ -106,9 +121,55 @@ class WebinarLayout:
             f"crop=270:{band // 4},boxblur=5:2,eq=brightness=-0.15,scale={OUTPUT_WIDTH}:{band}[web_back];"
             "[web_back][web_face]overlay=x=(W-w)/2:y=(H-h)/2[web_top];"
             f"[web_slides]{content_crop},scale={self.content_width}:{self.content_height}:flags=lanczos,"
-            f"pad={OUTPUT_WIDTH}:{rest}:(ow-iw)/2:0:color=black[web_bottom];"
-            f"[web_top][web_bottom]vstack=inputs=2,{DIVIDER.format(y=band - 2)}[base]"
+            f"pad={OUTPUT_WIDTH}:{rest}:(ow-iw)/2:{self.content_top - band}:color=black[web_bottom];"
+            f"[web_top][web_bottom]vstack=inputs=2{self._divider()}[base]"
         )
+
+    def _divider(self) -> str:
+        """Filters after the vstack that draw the divider ('' for a plain gap)."""
+        band = BAND_HEIGHT
+        if self.divider == "gap":
+            return ""
+        if self.divider == "accent":
+            return f",drawbox=x=0:y={band - 3}:w={OUTPUT_WIDTH}:h=6:color=0x{self.accent.lstrip('#')}@1.0:t=fill"
+        if self.divider == "shadow":
+            return "".join(
+                f",drawbox=x=0:y={band + 4 * step}:w={OUTPUT_WIDTH}:h=4:color=black@{alpha}:t=fill"
+                for step, alpha in enumerate(SHADOW_STEPS)
+            )
+        return f",drawbox=x=0:y={band - 2}:w={OUTPUT_WIDTH}:h=4:color=black@0.85:t=fill"
+
+
+def clean_accent(value: str | None) -> str:
+    """'#RRGGBB' (the default accent for anything else)."""
+    text = (value or "").strip()
+    text = text if text.startswith("#") else f"#{text}"
+    return text.upper() if re.fullmatch(r"#[0-9A-Fa-f]{6}", text) else DEFAULT_ACCENT
+
+
+def layout_to_dict(layout: WebinarLayout) -> dict[str, object]:
+    """For pitch.json: the layout as plain values."""
+    return asdict(layout)
+
+
+def layout_from_dict(data: dict[str, object]) -> WebinarLayout:
+    values = dict(data)
+    for key in ("camera", "content"):
+        box = values[key]
+        values[key] = CropBox(**box) if isinstance(box, dict) else box
+    return WebinarLayout(**values)  # type: ignore[arg-type]
+
+
+def _slide_shape(box: CropBox, shape: str) -> CropBox:
+    """``box`` cropped (centered) to exactly the shape's aspect ratio."""
+    ratio = SLIDE_SHAPES.get(shape)
+    if ratio is None:
+        return box
+    if box.width / box.height > ratio:  # too wide: keep the height
+        width = _even(box.height * ratio)
+        return CropBox(_even_position(box.x + (box.width - width) / 2), box.y, width, box.height)
+    height = _even(box.width / ratio)
+    return CropBox(box.x, _even_position(box.y + (box.height - height) / 2), box.width, height)
 
 
 def _even(value: float) -> int:
@@ -262,11 +323,25 @@ def _default_box(corner: str, width: int, height: int) -> CropBox:
     return CropBox(_even_position(x), _even_position(y), box_w, box_h)
 
 
-def plan_webinar(source: Path, start: float, end: float, corner: str = "auto") -> WebinarLayout:
+def plan_webinar(
+    source: Path,
+    start: float,
+    end: float,
+    corner: str = "auto",
+    *,
+    slides: str = "auto",
+    divider: str = "line",
+    accent: str = DEFAULT_ACCENT,
+) -> WebinarLayout:
     """Find the speaker's webcam (in ``corner``, or the corner where a face shows up
-    most) and the slide area for one clip."""
+    most) and the slide area for one clip. ``slides``: "auto", "16:9" or "4:3";
+    ``divider``: one of DIVIDERS; ``accent``: its color for "accent"."""
     if corner not in CORNERS:
         raise ValueError(f"Unknown webcam corner {corner!r}; choose one of {CORNERS}.")
+    if slides not in SLIDE_SHAPES:
+        raise ValueError(f"Unknown slide shape {slides!r}; choose one of {tuple(SLIDE_SHAPES)}.")
+    if divider not in DIVIDERS:
+        raise ValueError(f"Unknown divider {divider!r}; choose one of {DIVIDERS}.")
     width, height = _probe_display_size(source)
     try:
         frames = _sample_frames(source, start, max(0.5, end - start), (width, height))
@@ -290,11 +365,15 @@ def plan_webinar(source: Path, start: float, end: float, corner: str = "auto") -
             camera, how = _camera_box(face, chosen, width, height), "face"  # type: ignore[arg-type]
     else:
         camera, how = _default_box(chosen, width, height), "no face: default corner box"
-    content = _content_box(frames, width, height, camera if how == "webcam window" else None)
+    if slides == "16:9":
+        content = _slide_shape(CropBox(0, 0, _even(width), _even(height)), slides)
+    else:
+        content = _slide_shape(_content_box(frames, width, height, camera if how == "webcam window" else None), slides)
     scale = min(OUTPUT_WIDTH / content.width, CONTENT_MAX_HEIGHT / content.height)
     layout = WebinarLayout(
         frame_width=width, frame_height=height, corner=chosen, found=how, camera=camera, content=content,
         content_width=_even(content.width * scale), content_height=_even(content.height * scale),
+        slides=slides, divider=divider, accent=clean_accent(accent),
     )
     logger.info(
         "Webinar layout: speaker in the %s corner (%s, %d of %d frames), camera crop %dx%d at %d,%d; "

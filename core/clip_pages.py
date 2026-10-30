@@ -125,32 +125,46 @@ def _check_name(name: str) -> str:
     return name
 
 
-def make_poster(clip: Path, output: Path) -> None:
-    """A frame a little into the clip (the title card is already up), 540 px wide."""
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        raise RuntimeError("FFmpeg was not found.")
-    result = subprocess.run(
-        [ffmpeg, "-v", "error", "-y", "-ss", "1.2", "-i", str(clip), "-frames:v", "1", "-vf", "scale=540:-2",
-         "-q:v", "4", str(output)],
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0 or not output.is_file():
-        raise RuntimeError(f"Could not make a poster image: {result.stderr.strip()[-300:]}")
+def make_poster(clip: Path, output: Path, at: float | None = None) -> float:
+    """The poster still, 540 px wide: the frame at ``at`` seconds, or (None) the best
+    moment of the first seconds, eyes open (core.poster). Returns the time used."""
+    from core.poster import best_poster_time, poster_jpeg
+
+    seconds = best_poster_time(clip) if at is None else float(at)
+    try:
+        output.write_bytes(poster_jpeg(clip, seconds))
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        raise RuntimeError(f"Could not make a poster image: {exc}") from exc
+    return seconds
 
 
-def _upload_clip(client: Any, settings: PageSettings, name: str, index: int, clip: Path) -> None:
+def _upload_poster(client: Any, settings: PageSettings, name: str, index: int, clip: Path, at: float | None) -> float:
     with tempfile.TemporaryDirectory() as temporary:
         poster = Path(temporary) / "poster.jpg"
-        make_poster(clip, poster)
-        client.upload_file(
-            str(clip), settings.bucket, f"{name}/clip_{index:02d}.mp4",
-            ExtraArgs={"ContentType": "video/mp4", "CacheControl": "no-cache"},
-        )
+        seconds = make_poster(clip, poster, at)
         client.upload_file(
             str(poster), settings.bucket, f"{name}/poster_{index:02d}.jpg",
             ExtraArgs={"ContentType": "image/jpeg", "CacheControl": "no-cache"},
         )
+    return seconds
+
+
+def _upload_clip(
+    client: Any, settings: PageSettings, name: str, index: int, clip: Path, poster_at: float | None = None
+) -> None:
+    client.upload_file(
+        str(clip), settings.bucket, f"{name}/clip_{index:02d}.mp4",
+        ExtraArgs={"ContentType": "video/mp4", "CacheControl": "no-cache"},
+    )
+    _upload_poster(client, settings, name, index, clip, poster_at)
+
+
+def replace_poster(name: str, index: int, clip: Path, at: float | None) -> float:
+    """Swap one clip's poster on its page (the frame at ``at`` s; None: picked again).
+    Returns the time used."""
+    settings, client = _require()
+    _check_name(name)
+    return _upload_poster(client, settings, name, int(index), Path(clip), at)
 
 
 def publish_page(
@@ -187,15 +201,23 @@ def publish_page(
     return name, page_url(name, settings)
 
 
-def replace_clip(name: str, file_name: str, clip: Path, start: float | None = None, end: float | None = None) -> None:
-    """After a trim: same address, new clip (and poster, and times on the page)."""
+def replace_clip(
+    name: str,
+    file_name: str,
+    clip: Path,
+    start: float | None = None,
+    end: float | None = None,
+    poster_at: float | None = None,
+) -> None:
+    """After a trim: same address, new clip (and poster, and times on the page).
+    ``poster_at``: the poster frame you picked (None: picked automatically)."""
     match = CLIP_FILE.fullmatch(file_name)
     if match is None:
         raise ValueError(f"Unexpected clip file name: {file_name!r}")
     index = int(match.group(1))
     settings, client = _require()
     _check_name(name)
-    _upload_clip(client, settings, name, index, Path(clip))
+    _upload_clip(client, settings, name, index, Path(clip), poster_at)
     if start is None or end is None:
         return
     info = json.loads(client.get_object(Bucket=settings.bucket, Key=f"{name}/page.json")["Body"].read())

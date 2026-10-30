@@ -57,6 +57,7 @@ from core.downloader import (
     video_format_sort,
 )
 from core import series
+from core import webinar as webinar_defaults
 from core.clipper import MIN_CLIP_DURATION, rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
 from core.drive_uploader import replace_clip_in_drive, upload_clips_to_drive
@@ -79,13 +80,17 @@ from core.pipeline import (
 from core import clip_pages
 from core.pitch_files import (
     accept_trim,
+    cut_report,
     discard_trim,
     load_pitch,
     make_preview,
     pitch_files_bytes,
+    poster_after_trim,
     rerender_trim,
+    set_poster_time,
     trim_limits,
 )
+from core.poster import best_poster_time, poster_jpeg
 from core.storage_manager import (
     prune_output_folder,
     prune_stale_files,
@@ -335,6 +340,8 @@ WEBCAM_CORNERS = {
     "Bottom right": "bottom-right",
     "Bottom left": "bottom-left",
 }
+SLIDE_SHAPE_LABELS = {"Auto (trims dark borders)": "auto", "16:9": "16:9", "4:3 (most medical and academic decks)": "4:3"}
+DIVIDER_LABELS = {"Thin dark line": "line", "Accent color line": "accent", "Soft shadow": "shadow", "Dark gap": "gap"}
 PIN_TITLE_LABEL = "📌 Pin title card for full video duration"
 PIN_TITLE_HELP = "Off: the title card shows for the first few seconds. On: it stays on screen until the clip's last frame."
 WEBINAR_HELP = (
@@ -568,6 +575,7 @@ def _generate_clips(
     layout_mode: str,
     *,
     webcam_corner: str = "auto",
+    webinar_options: dict[str, str] | None = None,
     pin_title: bool = False,
 ) -> list[tuple[Path, ClipResult]]:
     settings = load_settings()
@@ -733,11 +741,12 @@ def _generate_clips(
                     layout_mode=layout_mode,
                     pin_title=pin_title,
                     webinar_corner=webcam_corner,
+                    webinar_options=webinar_options,
                 )
             except Exception:
                 output_path.unlink(missing_ok=True)
                 raise
-            render_contexts[str(result.path)] = {
+            render_contexts[_clip_key(result.path)] = {
                 "source_path": str(source_video),
                 "words": words,
                 "layout_mode": result.layout_mode,
@@ -1021,6 +1030,9 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
         st.toast(toast, icon="✅")  # floats over the page, so nothing moves
     for key in st.session_state.pop(f"trim_reset_{record_id}_{index}", []):  # before the inputs exist
         st.session_state[key] = 0.0  # setting (not removing) also resets the number shown
+    snap = st.session_state.pop(f"trim_snap_{record_id}_{index}", None)  # "Snap to whole words"
+    if snap is not None:
+        st.session_state[start_key], st.session_state[end_key] = snap
     waiting = bool(item.get("trim_waiting")) and "trim" in item
     preview = Path(item["trim_preview_path"] if waiting else item["preview_path"])
     with st.container(key=f"preview_{record_id}_{index}"):
@@ -1050,13 +1062,13 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
         st.session_state.setdefault(start_key, 0.0)
         st.session_state.setdefault(end_key, 0.0)
         st.number_input(
-            "Start: move by (seconds)", key=start_key, step=0.5, format="%.1f",
+            "Start: move by (seconds)", key=start_key, step=0.5, format="%.2f",
             min_value=min(0.0, round(earliest - start, 1)),
             max_value=max(0.0, round(end - MIN_CLIP_DURATION - start, 1)),
             help="Negative starts earlier. − / + nudge by half a second.",
         )
         st.number_input(
-            "End: move by (seconds)", key=end_key, step=0.5, format="%.1f",
+            "End: move by (seconds)", key=end_key, step=0.5, format="%.2f",
             min_value=min(0.0, round(start + MIN_CLIP_DURATION - end, 1)),
             max_value=max(0.0, round(latest - end, 1)),
             help="Positive ends later. − / + nudge by half a second.",
@@ -1064,6 +1076,7 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
         new_start = start + float(st.session_state.get(start_key) or 0.0)
         new_end = end + float(st.session_state.get(end_key) or 0.0)
         st.caption(f"New cut: {_clock(new_start)}–{_clock(new_end)} ({new_end - new_start:.1f} s)")
+        _render_cut_words(record_id, index, item, start, end, new_start, new_end)
         if st.button(
             "🔄 Re-render", key=f"trim_go_{record_id}_{index}", use_container_width=True,
             disabled=new_start == start and new_end == end,
@@ -1100,13 +1113,104 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
                         st.error(f"Couldn't use the new cut: {exc}")  # both buttons stay
                         return
                 st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
+                st.session_state.pop(f"poster_at_{record_id}_{index}", None)  # the poster slider follows the new clip
                 st.session_state[f"trim_toast_{record_id}_{index}"] = f"Clip {index} updated. The link in the email stays the same."
                 _rerun_this_clip()
             if keep_clicked:
                 discard_trim(record_id, index)
                 st.session_state[f"trim_reset_{record_id}_{index}"] = [start_key, end_key]
                 _rerun_this_clip()
+    _render_poster_picker(record, item)
     _render_remove_clip(record, index, len(pitch.get("clips", [])))
+
+
+def _render_cut_words(
+    record_id: str, index: int, item: dict[str, Any], start: float, end: float, new_start: float, new_end: float
+) -> None:
+    """The words at each edge of the cut, a warning when an edge lands inside a word,
+    and a button that moves it out to take the whole word."""
+    try:
+        report = cut_report(item, new_start, new_end)
+    except (KeyError, TypeError, ValueError):
+        return
+    if report["opens"]:
+        st.caption(f"Opens on “{report['opens']}…” · ends on “…{report['closes']}”")
+    cuts = [f"the start cuts into “{report['start_word']}”" if report["start_word"] else "",
+            f"the end cuts into “{report['end_word']}”" if report["end_word"] else ""]
+    cuts = [cut for cut in cuts if cut]
+    if not cuts:
+        return
+    st.markdown(f":orange[✂ {' and '.join(cuts).capitalize()}.]")
+    if st.button("↔ Snap to whole words", key=f"trim_snapgo_{record_id}_{index}", use_container_width=True,
+                 help="Moves each cut that lands inside a word out to just before (or after) that word."):
+        st.session_state[f"trim_snap_{record_id}_{index}"] = (
+            round(report["snap_start"] - start, 2), round(report["snap_end"] - end, 2)
+        )
+        _rerun_this_clip()
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _auto_poster_time(path: str, modified: float) -> float:
+    return best_poster_time(Path(path))
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _poster_image(path: str, modified: float, at: float) -> bytes:
+    return poster_jpeg(Path(path), at)
+
+
+def _render_poster_picker(record: dict[str, Any], item: dict[str, Any]) -> None:
+    """🖼 Poster frame: the still on their clip page before they press play."""
+    record_id, index = str(record["record_id"]), int(item["index"])
+    open_key = f"poster_open_{record_id}_{index}"
+    with st.expander("🖼 Poster frame", key=open_key, on_change=_ignore):
+        if not st.session_state.get(open_key):
+            return  # nothing to read until it's opened (the automatic pick takes ~2 s a clip)
+        page_name = str(record.get("page_name") or "")
+        clip_path = Path(item["path"])
+        if not page_name:
+            st.caption("The poster is the still on their clip page before they press play. "
+                       "This pitch has no clip page (Drive shows its own).")
+            return
+        if not clip_path.is_file():
+            st.caption("This clip's file is missing on this Mac.")
+            return
+        modified = clip_path.stat().st_mtime
+        length = float(item["end"]) - float(item["start"])
+        latest = max(0.5, round(length - 0.1, 1))
+        saved = item.get("poster_at")
+        current = float(saved) if saved is not None else _auto_poster_time(str(clip_path), modified)
+        at_key = f"poster_at_{record_id}_{index}"
+        pending = st.session_state.pop(f"poster_set_{record_id}_{index}", None)  # before the slider exists
+        if pending is not None:
+            st.session_state[at_key] = pending
+        if at_key not in st.session_state:
+            st.session_state[at_key] = min(latest, round(current, 1))
+        st.slider("Frame (seconds into the clip)", 0.0, latest, step=0.1, key=at_key, format="%.1f s")
+        at = round(float(st.session_state[at_key]), 1)
+        try:
+            st.image(_poster_image(str(clip_path), modified, at), width=PREVIEW_PLAYER_WIDTH)
+        except Exception as exc:
+            st.caption(f"Couldn't show that frame: {exc}")
+        st.caption(f"Their page shows the frame at {current:.1f} s "
+                   + ("(picked by you)." if saved is not None else "(picked automatically: eyes open, face sharp)."))
+        auto_column, use_column = st.columns(2)
+        if auto_column.button("✨ Auto", key=f"poster_auto_{record_id}_{index}", use_container_width=True,
+                              help="Jump to the best frame of the first seconds: eyes open, face sharp."):
+            st.session_state[f"poster_set_{record_id}_{index}"] = round(_auto_poster_time(str(clip_path), modified), 1)
+            _rerun_this_clip()
+        if use_column.button("✅ Use this frame", key=f"poster_use_{record_id}_{index}", type="primary",
+                             use_container_width=True, disabled=abs(at - current) < 0.05):
+            with st.spinner("Updating the poster on their page…"):
+                try:
+                    used = clip_pages.replace_poster(page_name, index, clip_path, at)
+                    set_poster_time(record_id, index, used)
+                except Exception as exc:
+                    logging.exception("Could not update the poster")
+                    st.error(f"Couldn't update the poster: {exc}")
+                    return
+            st.session_state[f"trim_toast_{record_id}_{index}"] = f"Clip {index}'s poster updated on their page."
+            _rerun_this_clip()
 
 
 def _render_remove_clip(record: dict[str, Any], index: int, count: int) -> None:
@@ -1142,6 +1246,7 @@ def _render_remove_clip(record: dict[str, Any], index: int, count: int) -> None:
     for number in range(index, count + 1):
         st.session_state[f"trim_reset_{record_id}_{number}"] = [f"trim_start_{record_id}_{number}", f"trim_end_{record_id}_{number}"]
         st.session_state[f"trim_close_{record_id}_{number}"] = True
+        st.session_state.pop(f"poster_at_{record_id}_{number}", None)
     st.session_state[f"draft_refresh_{record_id}"] = True
     note = f"Clip {index} removed. {result['count']} clips left; the email and subject say {result['count']}."
     if not result["email_updated"]:
@@ -1174,7 +1279,11 @@ def _clip_replacer(record: dict[str, Any], start: float, end: float):
 
     def replace(path: Path, file_name: str) -> None:
         if page_name:
-            clip_pages.replace_clip(page_name, file_name, path, start, end)
+            pitch = load_pitch(str(record["record_id"])) if record.get("record_id") else None
+            item = next((c for c in (pitch or {}).get("clips", []) if c.get("file") == file_name), None)
+            poster_at = poster_after_trim(item, start, end) if item else None
+            picked = {"poster_at": poster_at} if poster_at is not None else {}  # None: picked automatically
+            clip_pages.replace_clip(page_name, file_name, path, start, end, **picked)
         if drive_link:
             replace_clip_in_drive(drive_link, file_name, path)
 
@@ -1293,24 +1402,55 @@ def _render_clip_generator() -> None:
         )
         if st.session_state.get("crop_mode") not in LAYOUT_LABELS:
             st.session_state["crop_mode"] = next(iter(LAYOUT_LABELS))
-        if st.session_state.get("webcam_corner") not in WEBCAM_CORNERS:
-            st.session_state["webcam_corner"] = next(iter(WEBCAM_CORNERS))
         with st.expander("Framing (optional)"):
             layout_label = st.selectbox("Layout", list(LAYOUT_LABELS), key="crop_mode", help=WEBINAR_HELP)
-            # Inside a form the box can't appear only for the webinar layout, so it's always here.
-            corner_label = st.selectbox(
-                "Webcam corner (webinar layout only)", list(WEBCAM_CORNERS), key="webcam_corner",
-                help="Where the speaker's webcam is. Automatic finds the live webcam window next to the slides.",
-            )
+            # Inside a form these can't appear only for the webinar layout, so they're always here.
+            st.caption("**Webinar layout only:**")
+            webcam_corner, webinar_options = _webinar_controls()
         pin_title = st.checkbox(PIN_TITLE_LABEL, key="pin_title", help=PIN_TITLE_HELP)
         generate_clicked = st.form_submit_button("Make 3 vertical clips", type="primary")
 
     if generate_clicked:
         _make_clips(
             video_url, uploaded_video, channel_name, layout_label,
-            webcam_corner=WEBCAM_CORNERS[corner_label], pin_title=pin_title,
+            webcam_corner=webcam_corner, webinar_options=webinar_options, pin_title=pin_title,
         )
     _render_generated_clips()
+
+
+def _webinar_controls(prefix: str = "") -> tuple[str, dict[str, str]]:
+    """Webinar layout settings: (webcam corner, {slides, divider, accent}). ``prefix``
+    keeps the Series boxes apart from the 3-highlights ones."""
+    defaults = {
+        f"{prefix}webcam_corner": next(iter(WEBCAM_CORNERS)),
+        f"{prefix}webinar_slides": next(iter(SLIDE_SHAPE_LABELS)),
+        f"{prefix}webinar_divider": next(iter(DIVIDER_LABELS)),
+    }
+    for key, default in defaults.items():
+        options = WEBCAM_CORNERS if key.endswith("corner") else SLIDE_SHAPE_LABELS if key.endswith("slides") else DIVIDER_LABELS
+        if st.session_state.get(key) not in options:
+            st.session_state[key] = default
+    corner_column, slides_column = st.columns(2)
+    corner = corner_column.selectbox(
+        "Webcam corner", list(WEBCAM_CORNERS), key=f"{prefix}webcam_corner",
+        help="Where the speaker's webcam is. Automatic finds the live webcam window next to the slides.",
+    )
+    slides = slides_column.selectbox(
+        "Slides", list(SLIDE_SHAPE_LABELS), key=f"{prefix}webinar_slides",
+        help="Auto shows the whole slide area. 16:9 or 4:3 crops it to exactly that shape, centered: "
+        "slides are always scaled evenly, never stretched.",
+    )
+    divider_column, color_column = st.columns(2)
+    divider = divider_column.selectbox(
+        "Divider", list(DIVIDER_LABELS), key=f"{prefix}webinar_divider",
+        help="Between the speaker and the slides.",
+    )
+    accent = color_column.color_picker(
+        "Accent color (accent line)", value=webinar_defaults.DEFAULT_ACCENT, key=f"{prefix}webinar_accent",
+    )
+    return WEBCAM_CORNERS[corner], {
+        "slides": SLIDE_SHAPE_LABELS[slides], "divider": DIVIDER_LABELS[divider], "accent": accent,
+    }
 
 
 def _make_clips(
@@ -1320,6 +1460,7 @@ def _make_clips(
     layout_label: str,
     *,
     webcam_corner: str = "auto",
+    webinar_options: dict[str, str] | None = None,
     pin_title: bool = False,
 ) -> None:
     clip_count = 3
@@ -1375,7 +1516,8 @@ def _make_clips(
         st.session_state["outreach_channel_override"] = channel_name
         st.session_state["outreach_title_override"] = video_title_override
         generated = _generate_clips(
-            input_path, clip_count, LAYOUT_LABELS[layout_label], webcam_corner=webcam_corner, pin_title=pin_title
+            input_path, clip_count, LAYOUT_LABELS[layout_label], webcam_corner=webcam_corner,
+            webinar_options=webinar_options, pin_title=pin_title,
         )
         st.session_state["generated_clips"] = generated
         st.session_state["clip_paths"] = [str(item[0].expanduser().resolve()) for item in generated]
@@ -1473,19 +1615,16 @@ def _render_series_maker() -> None:
         st.caption(f"Batch {batch} = Parts {first}–{last}. The whole video is transcribed once, on the first batch.")
     if st.session_state.get("series_layout") not in LAYOUT_LABELS:
         st.session_state["series_layout"] = next(iter(LAYOUT_LABELS))
-    corner = "auto"
+    corner, webinar_options = "auto", None
     with st.expander("Framing (optional)"):
         layout_label = st.selectbox("Layout", list(LAYOUT_LABELS), key="series_layout", help=WEBINAR_HELP)
         if LAYOUT_LABELS[layout_label] == "webinar":
-            corner = WEBCAM_CORNERS[st.selectbox(
-                "Webcam corner", list(WEBCAM_CORNERS), key="series_webcam_corner",
-                help="Where the speaker's webcam is. Automatic finds the live webcam window next to the slides.",
-            )]
+            corner, webinar_options = _webinar_controls("series_")
     pin_title = st.checkbox(PIN_TITLE_LABEL, key="series_pin_title", help=PIN_TITLE_HELP)
     if st.button(f"Make parts {first}–{last}", type="primary", disabled=not can_make):
         _make_series_batch(
             key, url, upload, st.session_state.get("series_title", ""), shortest, longest, batch,
-            LAYOUT_LABELS[layout_label], webcam_corner=corner, pin_title=pin_title,
+            LAYOUT_LABELS[layout_label], webcam_corner=corner, webinar_options=webinar_options, pin_title=pin_title,
         )
     _render_series_results()
 
@@ -1507,7 +1646,7 @@ def _slug(text: str) -> str:
 
 def _make_series_batch(
     key: str, url: str, upload: Any, title_input: str, shortest: int, longest: int, batch: int, layout_mode: str,
-    *, webcam_corner: str = "auto", pin_title: bool = False,
+    *, webcam_corner: str = "auto", webinar_options: dict[str, str] | None = None, pin_title: bool = False,
 ) -> None:
     """Transcribe once (saved per video), plan the parts, render this batch's 3 locally."""
     settings = load_settings()
@@ -1567,6 +1706,7 @@ def _make_series_batch(
             render_selected_clip(
                 source_video, clip, words, settings, output,
                 layout_mode=layout_mode, pin_title=pin_title, webinar_corner=webcam_corner,
+                webinar_options=webinar_options,
             )
             preview = settings.temp_dir / f"series_{key}_part_{number:02d}.preview.mp4"
             make_preview(output, preview)  # small copy for the player (the full file is ~10 MB a minute)
@@ -1702,6 +1842,13 @@ def _render_generated_clips() -> None:
                 st.caption("The Drive link is added after you upload the clips.")
 
 
+def _clip_key(path: str | Path) -> str:
+    """One spelling per clip file, for its saved framing. The clips list holds resolved
+    paths and the render returns the path as written: on a Mac those differ whenever a
+    parent folder is a symlink (/var -> /private/var), and the trim then found nothing."""
+    return str(Path(path).expanduser().resolve())
+
+
 def _render_trim_form(
     index: int,
     clip_path: Path,
@@ -1723,7 +1870,7 @@ def _render_trim_form(
     if not rerender_clicked:
         return
     contexts = st.session_state.get("clip_render_contexts", {})
-    context = contexts.get(str(clip_path))
+    context = contexts.get(_clip_key(clip_path))
     cached_crop = context.get("crop") if context else None
     if context is None or not isinstance(cached_crop, CropBox):
         st.error("This clip's saved framing is gone. Make the clips again before trimming.")
@@ -1758,8 +1905,8 @@ def _render_trim_form(
     updated_clips[index] = (updated_path, updated_clip)
     st.session_state["generated_clips"] = updated_clips
     st.session_state["clip_paths"] = [str(Path(item[0]).expanduser().resolve()) for item in updated_clips]
-    contexts.pop(str(clip_path), None)
-    contexts[str(updated_path)] = {**context, "start_time": adjusted_start, "end_time": adjusted_end}
+    contexts.pop(_clip_key(clip_path), None)
+    contexts[_clip_key(updated_path)] = {**context, "start_time": adjusted_start, "end_time": adjusted_end}
     st.session_state["clip_render_contexts"] = contexts
     clip_path.unlink(missing_ok=True)
     st.rerun()
