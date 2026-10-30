@@ -162,8 +162,14 @@ except P.WeakMoments as exc:
 clips, _e, _s = P.pick_clips_with_agent(words, t, 3, "Chan", "Title")
 check("App (no gate): still 3 clips", len(clips) == 3)
 P.judge_clips = lambda texts: None
-clips, _e, _s = P.pick_clips_with_agent(words, t, 3, "Chan", "Title", min_judge_score=60)
-check("No judge answer -> nothing dropped", len(clips) == 3)
+# Round 17: with the gate on, unscored clips are never sent; the worker pauses and retries.
+try:
+    P.pick_clips_with_agent(words, t, 3, "Chan", "Title", min_judge_score=60)
+    check("No judge answer -> JudgeUnavailable (worker retries later; nothing unscored is sent)", False)
+except P.JudgeUnavailable as exc:
+    check("No judge answer -> JudgeUnavailable (worker retries later; nothing unscored is sent)", exc.service == "judge")
+clips, _e, _s = P.pick_clips_with_agent(words, t, 3, "Chan", "Title")
+check("App (no gate): no judge answer -> nothing dropped", len(clips) == 3)
 
 # ---------- Worker: gate, record data, pass reasons ----------
 import autonomous_worker as W

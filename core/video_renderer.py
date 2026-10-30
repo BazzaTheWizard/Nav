@@ -51,6 +51,7 @@ def _enable_expression(spans: list[tuple[float, float]]) -> str:
 # limits quality, not the encoder. So the fast encoder stays, at a bitrate in line
 # with YouTube's upload guide for 1080p (8 Mbps at 24-30 fps, 12 Mbps at 48-60).
 VIDEO_BITRATE, VIDEO_MAXRATE, VIDEO_BUFSIZE = "10M", "14M", "20M"
+KEYFRAME_INTERVAL = "60"
 AUDIO_SAMPLE_RATE = "48000"  # YouTube's upload guide
 # Loudness: every clip ends up at the same level (EBU R128 two-pass, linear).
 # -14 LUFS is where YouTube normalizes; set AUDIO_TARGET_LUFS=off in .env to skip.
@@ -73,7 +74,10 @@ def _video_encoder_args(ffmpeg: str) -> tuple[str, ...]:
         ).stdout
     except (OSError, subprocess.SubprocessError):
         encoders = ""
-    rate = ("-maxrate", VIDEO_MAXRATE, "-bufsize", VIDEO_BUFSIZE, "-profile:v", "high")
+    # A keyframe every 60 frames (2 s at 30 fps). Without -g, VideoToolbox used FFmpeg's
+    # default of 12: a keyframe every 0.4 s, spending the bitrate on keyframes instead of
+    # picture (measured: 107 keyframes in a 42 s clip).
+    rate = ("-g", KEYFRAME_INTERVAL, "-maxrate", VIDEO_MAXRATE, "-bufsize", VIDEO_BUFSIZE, "-profile:v", "high")
     if "h264_videotoolbox" in encoders:
         return ("-c:v", "h264_videotoolbox", "-b:v", VIDEO_BITRATE, *rate)
     return ("-c:v", "libx264", "-preset", "veryfast", "-crf", "18", *rate)

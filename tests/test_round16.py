@@ -187,7 +187,8 @@ lead = {"channel_id": "UC1", "channel_title": "Coach Dana", "latest_video_title"
 record = W._process_lead(dict(lead), settings)
 check("Worker: the email links to the clip page", record["page_url"] in record["full_email_body"] and DRIVE not in record["full_email_body"]
       and record["page_url"].startswith("https://clips.navstudiolab.com/coach-dana-"), record["page_url"])
-check("Worker: Drive still gets a backup copy", record["drive_link"] == DRIVE and drive_calls == ["check", "upload"])
+# Round 17: with pages set up, Drive is only a backup, so it's not checked before the download.
+check("Worker: Drive still gets a backup copy", record["drive_link"] == DRIVE and drive_calls == ["upload"], str(drive_calls))
 check("Worker: page knows it's an episode", json.loads(r2.objects[f"{record['page_name']}/page.json"][0])["kind"] == "episode")
 
 os.environ["DRIVE_BACKUP"] = "off"
@@ -299,7 +300,9 @@ W._write_json_atomic(W.PENDING_OUTREACH_PATH, pending)
 at = AppTest.from_file(str(wrapper), default_timeout=120).run()
 check("App runs", not at.exception, str([e.value for e in at.exception]))
 links = {getattr(b.proto, "label", "") for b in at.get("link_button")}
-check("Outbox: 'Open their page' and 'Drive backup' buttons", "🌐 Open their page (what they'll see)" in links and "📁 Drive backup" in links, str(links))
+# Round 17: the About page is the big button; their clip page and Drive are the small pair.
+check("Outbox: About page, 'Their clip page' and 'Drive backup' buttons",
+      {"📇 Open their About page", "🌐 Their clip page", "📁 Drive backup"} <= links, str(links))
 check("Sent: shows what they did on the page", any("▶ Played Short 2" in c.value for c in at.caption), str([c.value for c in at.caption][:12]))
 check("System: clip pages on, with the address",
       any("on: https://clips.navstudiolab.com" in str(t.value) for t in at.table))

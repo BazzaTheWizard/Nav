@@ -18,6 +18,7 @@ from core.face_tracker import CropBox, CropPlan, analyze_crop_plan
 from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
 from core.outreach import build_outreach_email, build_subject
+from core.service_pause import ServicePause
 from core.title_card import SEAM_PLACEMENT, TitleOverlay, prepare_title_overlay
 from core.transcriber import (
     Word,
@@ -192,8 +193,10 @@ def pick_clips_with_agent(
 
     ``min_judge_score`` (the worker's quality gate): clips the second AI pass
     scored below this are dropped, and so are filler picks it never scored. With
-    fewer than MIN_CLIPS left, WeakMoments is raised. Without judge scores (no
-    AI answer) nothing is dropped. ``report`` (optional dict) receives
+    fewer than MIN_CLIPS left, WeakMoments is raised. With the gate on, every clip is
+    scored (JudgeUnavailable if the judge can't answer), so evenly spaced filler picks
+    can never be sent unscored. Without the gate (the app), no judge answer means
+    nothing is dropped. ``report`` (optional dict) receives
     "judge_scores": one score (or None) per returned clip.
     """
     result = select_clips_and_draft_pitch(
@@ -216,9 +219,12 @@ def pick_clips_with_agent(
         for rank, item in enumerate(result["clips"])
     ]
     judged: dict[tuple[float, float], int] = {}
-    candidates = rescore_with_judge(prepare_candidates(proposals, words, video_duration), words, count, judged)
+    gate = min_judge_score is not None
+    candidates = rescore_with_judge(
+        prepare_candidates(proposals, words, video_duration), words, count, judged, required=gate
+    )
     clips = choose_clips(candidates, words, video_duration, count)
-    if min_judge_score is not None and judged and clips:
+    if gate:
         good = [clip for clip in clips if judged.get(_clip_key(clip), -1) >= min_judge_score]
         if len(good) < MIN_CLIPS:
             raise WeakMoments(
@@ -271,6 +277,17 @@ def _seam_title(title: TitleOverlay | None) -> tuple[float, int] | None:
     return title.seconds, title.card_top + title.card_height
 
 
+class JudgeUnavailable(ServicePause):
+    """The quality gate is on but the judge gave no scores: try the creator again
+    later rather than send clips nobody scored."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, JUDGE_RETRY_SEC, service="judge")
+
+
+JUDGE_RETRY_SEC = 10 * 60
+
+
 class WeakMoments(Exception):
     """Fewer than MIN_CLIPS clips passed the quality bar; the lead isn't worth sending."""
 
@@ -291,15 +308,22 @@ def rescore_with_judge(
     words: list[Word],
     count: int,
     scores_out: dict[tuple[float, float], int] | None = None,
+    *,
+    required: bool = False,
 ) -> list[ClipResult]:
     """Blend the judge's score into each candidate's rank score (best effort).
 
     ``scores_out`` collects each candidate's own judge score (0-100), keyed by
-    (start_time, end_time), for the quality gate and the Outbox record."""
-    if len(candidates) <= count:
+    (start_time, end_time), for the quality gate and the Outbox record.
+
+    ``required`` (the worker's quality gate): always score, even with nothing to choose
+    between, and raise JudgeUnavailable instead of returning unscored clips."""
+    if not candidates or (len(candidates) <= count and not required):
         return candidates  # nothing to choose between
     scores = judge_clips([clip_text(words, clip.start_time, clip.end_time) for clip in candidates])
     if scores is None:
+        if required:
+            raise JudgeUnavailable("the clip judge gave no usable scores")
         return candidates
     if scores_out is not None:
         for clip, score in zip(candidates, scores):

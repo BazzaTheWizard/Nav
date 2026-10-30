@@ -12,14 +12,19 @@ import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 
-from faster_whisper import BatchedInferencePipeline, WhisperModel
+# faster-whisper (and its own copy of the FFmpeg libraries, via PyAV) loads only when
+# the local model is actually used. Groq is the normal path; loading it next to
+# OpenCV's FFmpeg libraries is what printed the "Class AVFFrameReceiver is
+# implemented in both ..." warning at every worker start.
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
 from youtube_transcript_api import YouTubeTranscriptApi
 
 from config import Settings
@@ -89,6 +94,8 @@ def _load_whisper_model(
     device: str,
     compute_type: str,
 ) -> WhisperModel:
+    from faster_whisper import WhisperModel
+
     return WhisperModel(
         model_name,
         device=device,
@@ -219,6 +226,8 @@ def transcribe_audio(
         settings.whisper_compute_type,
     )
     try:
+        from faster_whisper import BatchedInferencePipeline
+
         pipeline = BatchedInferencePipeline(model=model)
         segments, _info = pipeline.transcribe(
             str(wav_path),
