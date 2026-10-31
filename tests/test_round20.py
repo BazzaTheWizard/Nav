@@ -78,8 +78,9 @@ lead = W.force_lead_to_queue("UCweak")
 queue = W._lead_queue()
 state = W._processed_state()
 record = next(r for r in reversed(state["records"]) if r["channel_id"] == "UCweak")
-check("Forced: at the top of the queue, marked forced, no attempts used",
-      queue[0]["channel_id"] == "UCweak" and queue[0]["forced"] is True and queue[0]["attempts"] == 0)
+check("Forced: at the back of the queue (round 23), marked forced, no attempts used",
+      queue[-1]["channel_id"] == "UCweak" and queue[-1]["forced"] is True and queue[-1]["attempts"] == 0
+      and queue[-1]["waits_for"] == ["UCq"])
 check("...rebuilt from an older record: video link, title looked up once, channel link",
       lead["latest_video_url"] == "https://www.youtube.com/watch?v=vidweak0001" and lead["latest_video_title"] == "Why Most Startups Fail"
       and lead["channel_url"] == "https://www.youtube.com/channel/UCweak" and lead["priority"] == 4 and len(lookups) == 1)
@@ -119,7 +120,7 @@ W._write_json_atomic(W.LEAD_QUEUE_PATH, [
     {"channel_id": "UCforced", "channel_title": "Forced", "priority": 0, "forced": True, "latest_video_url": "https://www.youtube.com/watch?v=vidforc0001"},
     {"channel_id": "UClow", "channel_title": "Low", "priority": 1, "latest_video_url": "https://www.youtube.com/watch?v=vidlow00001"},
 ])
-check("Forced goes first even with a low score", W._pop_fresh_lead()["channel_id"] == "UCforced")
+check("A creator forced before round 23 (no waits_for) still goes first", W._pop_fresh_lead()["channel_id"] == "UCforced")
 W.prioritize_queued_lead("UClow")
 check("'Do next' now really goes next (it only moved the row before)", W._pop_fresh_lead()["channel_id"] == "UClow")
 saved = next(r for r in W._processed_state()["records"] if r["channel_id"] == "UCforced")

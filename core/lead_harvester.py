@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from importlib import import_module
@@ -46,6 +47,43 @@ SHORTS_LAPSED_MIN_TOTAL = 3  # fewer than this ever = "tried", not a lapsed habi
 SHORTS_WORKING_VIEW_RATIO = 1.0
 SHORTS_MIN_AGE_DAYS = 7  # newer videos are still collecting views
 SHORTS_PERFORMANCE_SAMPLE = 10
+
+# --- Who to look for (round 23, from the checks so far) --------------------------
+# Subscriber range. Of 1,254 channels checked, 897 (72%) failed only on this: 469 under
+# 1,000, then 250 at 1,000-5,000 and 79 at 150,000-500,000. 3,000-250,000 keeps the
+# small-to-mid creators you pitch (sent: 7,250-79,100) and adds the near misses.
+# LEAD_MIN_SUBSCRIBERS / LEAD_MAX_SUBSCRIBERS in .env change it.
+DEFAULT_MIN_SUBSCRIBERS = 3_000
+DEFAULT_MAX_SUBSCRIBERS = 250_000
+# Channels turned down only for their size, whose saved count is inside the range now,
+# are checked again at no search cost (channels.list), this many per search round.
+RANGE_RECHECKS_PER_ROUND = 50
+# Search: a lead needs 2+ long videos in the last 30 days, so search only for recent
+# videos of 4+ minutes. Shorts and old uploads filled result slots before and led to
+# channels that then failed "recent long videos" (182 of the checks). The two lengths
+# take turns by query, so a round costs the same quota (100 units a query).
+SEARCH_RECENT_DAYS = 45
+SEARCH_DURATIONS = ("long", "medium")  # YouTube: long = over 20 min, medium = 4-20 min
+
+
+def subscriber_range() -> tuple[int, int]:
+    """(min, max) subscribers for a lead: .env, else the defaults."""
+    def number(name: str, default: int) -> int:
+        try:
+            return max(0, int(str(os.getenv(name, "")).replace(",", "").replace("_", "") or default))
+        except ValueError:
+            return default
+    low = number("LEAD_MIN_SUBSCRIBERS", DEFAULT_MIN_SUBSCRIBERS)
+    high = number("LEAD_MAX_SUBSCRIBERS", DEFAULT_MAX_SUBSCRIBERS)
+    return (low, high) if low <= high else (DEFAULT_MIN_SUBSCRIBERS, DEFAULT_MAX_SUBSCRIBERS)
+
+
+def _in_range_now(check: dict[str, Any]) -> bool:
+    """A channel turned down only for its size, whose saved count fits the range now."""
+    low, high = subscriber_range()
+    count = check.get("subscribers")
+    return check.get("result") == "subscribers_out_of_range" and isinstance(count, int) and low <= count <= high
+
 
 # --- Target video ----------------------------------------------------------------
 LONG_FORM_MIN_SECONDS = 300
@@ -307,6 +345,9 @@ def _recheckable_channel_ids(now: datetime | None = None) -> set[str]:
     for channel_id, check in _read_channel_checks().items():
         if not check.get("soft"):
             continue
+        if _in_range_now(check):
+            ids.add(channel_id)  # the range changed: look again now
+            continue
         try:
             checked_at = datetime.fromisoformat(str(check.get("checked_at")))
         except ValueError:
@@ -418,7 +459,11 @@ def _write_seen_channel_ids(channel_ids: set[str]) -> None:
 def _search_candidates(
     youtube: Any,
     query: str,
+    duration: str = "any",
 ) -> list[dict[str, str]]:
+    """Up to 50 recent videos for ``query`` (``duration``: YouTube's "long", "medium"
+    or "any"), one candidate per video."""
+    published_after = (datetime.now(timezone.utc) - timedelta(days=SEARCH_RECENT_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     response = _execute_youtube_request(
         youtube.search().list(
             part="snippet",
@@ -429,6 +474,8 @@ def _search_candidates(
             # A ranking hint, not a filter: non-English channels are rejected later
             # anyway, so this just wastes fewer of the 100-unit search results.
             relevanceLanguage="en",
+            videoDuration=duration,
+            publishedAfter=published_after,
         )
     )
     search_items = response.get("items", [])
@@ -749,9 +796,17 @@ def discover_channels(
     qualified: list[dict[str, Any]] = []
     checks = _read_channel_checks()
     now = datetime.now(timezone.utc)
+    low_subscribers, high_subscribers = subscriber_range()
+    funnel: Counter[str] = Counter()
+    contacted = _read_contacted_channel_ids()
+    rechecks = [
+        {"channel_id": channel_id, "video_id": "", "channel_title": "", "video_title": ""}
+        for channel_id, check in checks.items() if _in_range_now(check) and channel_id not in contacted
+    ][:RANGE_RECHECKS_PER_ROUND]
 
     def record(channel_id: str, result: str, soft: bool = True, **details: Any) -> None:
         checks[channel_id] = {"checked_at": now.isoformat(), "result": result, "soft": soft, **details}
+        funnel[result] += 1
 
     def views(video: dict[str, Any]) -> int | None:
         try:
@@ -771,10 +826,14 @@ def discover_channels(
                     _search_candidates,
                     _youtube_client(),
                     query.strip(),
+                    SEARCH_DURATIONS[(query_offset + position) % len(SEARCH_DURATIONS)],
                 ): query
-                for query in query_batch
+                for position, query in enumerate(query_batch)
             }
             candidates: dict[str, dict[str, str]] = {}
+            if query_offset == 0:  # turned down for size earlier, inside the range now: no search needed
+                for candidate in rechecks:
+                    candidates.setdefault(candidate["channel_id"], candidate)
             for future in as_completed(search_futures):
                 query = search_futures[future]
                 try:
@@ -816,12 +875,13 @@ def discover_channels(
             eligible_channels: dict[str, tuple[dict[str, str], dict[str, Any], int | None, str]] = {}
             for channel_id, candidate in candidates.items():
                 channel = channel_metadata.get(channel_id)
-                if channel is None:
+                if channel is None:  # deleted or hidden: recorded, so a size re-check isn't retried each round
+                    record(channel_id, "channel_not_found")
                     continue
                 subscriber_count = _channel_subscriber_count(channel)
                 if subscriber_count == -1 or (
                     subscriber_count is not None
-                    and not (5_000 <= subscriber_count <= 150_000)
+                    and not (low_subscribers <= subscriber_count <= high_subscribers)
                 ):
                     record(channel_id, "subscribers_out_of_range", subscribers=subscriber_count)
                     continue
@@ -994,4 +1054,10 @@ def discover_channels(
             # marked as checked); only stop *starting* new batches once there are enough.
             if len(qualified) >= max_results:
                 break
+    if funnel:
+        logger.info(
+            "Search funnel: %d channel(s) checked (%d re-checked for the new size range): %s",
+            sum(funnel.values()), len(rechecks),
+            ", ".join(f"{count} {result.replace('_', ' ')}" for result, count in funnel.most_common()),
+        )
     return qualified

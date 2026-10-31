@@ -279,6 +279,8 @@ def _render_options(item: Any) -> dict[str, Any]:
     options: dict[str, Any] = {}
     if getattr(item, "pin_title", False):
         options["pin_title"] = True
+    if getattr(item, "title_fade_in", True) is False:
+        options["title_fade_in"] = False
     if getattr(item, "webinar", None) is not None:
         from core.webinar import layout_to_dict
 
@@ -398,6 +400,8 @@ def rerender_trim(record_id: str, index: int, new_start: float, new_end: float, 
         kept: dict[str, Any] = {}  # the first render's own options (only when it had them)
         if item.get("pin_title"):
             kept["pin_title"] = True
+        if item.get("title_fade_in") is False:
+            kept["title_fade_in"] = False
         if item.get("webinar"):
             from core.webinar import layout_from_dict
 

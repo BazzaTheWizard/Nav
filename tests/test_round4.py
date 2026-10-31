@@ -176,7 +176,7 @@ class FakeYouTube:
 
 
 H._youtube_client = lambda: FakeYouTube()
-H._search_candidates = lambda youtube, query: [
+H._search_candidates = lambda youtube, query, duration="any": [
     {"channel_id": c, "video_id": f"{c}-hit", "channel_title": c, "video_title": "t"} for c in CHANNELS
 ]
 

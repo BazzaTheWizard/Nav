@@ -96,9 +96,14 @@ CLIPS_PER_LEAD = 3
 MIN_CLIP_SCORE = 60
 DRIVE_SIGN_IN_WAIT_SEC = 10 * 60
 # Below this share of sampled frames with a face, nobody is really on camera
-# (narration, slides, animation): those creators aren't a fit, so they're
+# (narration over a still image, slides, B-roll): those creators aren't a fit, so they're
 # skipped right after download, before any transcribing, AI, rendering or upload.
 MIN_ON_CAMERA_SHARE = 0.25
+# Animated channels (2D, anime, whiteboard, AI cartoon explainers) have no people on camera
+# but characters with faces (core.character_faces). They pass when a face of any kind is in
+# this share of the sampled frames: higher than for people, so the odd face-like chart or
+# icon in a slide deck can't carry a faceless video through.
+MIN_CHARACTER_SHARE = 0.40
 # ⏩ Force to queue (Pipeline tab): the creator's clips are still all scored by the AI,
 # but none is dropped for scoring under MIN_CLIP_SCORE.
 FORCED_MIN_CLIP_SCORE = 0
@@ -1051,20 +1056,46 @@ def _enqueue_leads(leads: list[dict[str, Any]]) -> int:
     return added
 
 
-FIRST_IN_LINE = 1000  # "Do next" and forced creators go before every scored lead
+FIRST_IN_LINE = 1000  # "Do next" (and a forced creator whose turn has come) go before every scored lead
 
 
-def _lead_priority(lead: dict[str, Any]) -> int:
-    """Queue rank. A lead that failed drops back so it doesn't block the queue.
-    "Do next" and ⏩ forced creators come first (the worker takes the highest rank,
-    so moving one to the top of the list alone didn't make it next)."""
+def _lead_rank(lead: dict[str, Any]) -> int:
+    """Rank from the lead alone. A lead that failed drops back so it doesn't block the
+    queue. "Do next" comes first (the worker takes the highest rank, so moving one to
+    the top of the list alone didn't make it next)."""
     try:
         priority = int(lead.get("priority", 0) or 0)
         attempts = int(lead.get("attempts", 0) or 0)
     except (TypeError, ValueError):
         priority, attempts = 0, 0
-    first = FIRST_IN_LINE if lead.get("forced") or lead.get("do_next") else 0
-    return first + priority - 3 * attempts
+    return (FIRST_IN_LINE if lead.get("do_next") else 0) + priority - 3 * attempts
+
+
+def _queue_ranks(queue: list[dict[str, Any]]) -> list[float]:
+    """Each queued lead's rank, in queue order (the worker takes the highest; ties go
+    in list order). A ⏩ forced creator joins the back of the line: while anyone it
+    waits for ("waits_for": who was queued when it was forced) is still queued, it ranks
+    just under the lowest of them, so it comes after all of them, and leads found later
+    slot in by score as usual. Once they're done it goes first. Forced before round 23
+    (no "waits_for"): first."""
+    index_of = {str(lead.get("channel_id")): index for index, lead in enumerate(queue)}
+    ranks: dict[int, float] = {}
+
+    def rank(index: int, visiting: frozenset[int]) -> float:
+        if index in ranks:
+            return ranks[index]
+        lead = queue[index]
+        value: float = _lead_rank(lead)
+        if lead.get("forced") and not lead.get("do_next"):
+            waiting = {index_of[c] for c in map(str, lead.get("waits_for") or []) if c in index_of} - visiting - {index}
+            if waiting:
+                value = min(rank(other, visiting | {index}) for other in waiting) - 0.5
+            else:
+                value += FIRST_IN_LINE
+        ranks[index] = value
+        return value
+
+    return [rank(index, frozenset()) for index in range(len(queue))]
 
 
 def _pop_fresh_lead() -> dict[str, Any] | None:
@@ -1092,8 +1123,8 @@ def _pop_fresh_lead() -> dict[str, Any] | None:
                 valid.append(lead)
         chosen: dict[str, Any] | None = None
         if valid:
-            chosen = max(valid, key=_lead_priority)  # max() keeps the first of equals
-            valid.remove(chosen)
+            ranks = _queue_ranks(valid)
+            chosen = valid.pop(max(range(len(valid)), key=ranks.__getitem__))  # max() keeps the first of equals
         _write_json_atomic(LEAD_QUEUE_PATH, valid)
         if chosen is not None:
             _reserve_lead(state, chosen)
@@ -1104,7 +1135,8 @@ def get_lead_queue() -> list[dict[str, Any]]:
     """Queued creators in the order the worker will take them (for the app)."""
     with _worker_lock():
         queue = _lead_queue()
-    return sorted(queue, key=_lead_priority, reverse=True)  # sorted() is stable
+    ranks = _queue_ranks(queue)
+    return [queue[i] for i in sorted(range(len(queue)), key=ranks.__getitem__, reverse=True)]  # stable: ties keep list order
 
 
 def prioritize_queued_lead(channel_id: str) -> bool:
@@ -1127,11 +1159,59 @@ FORCEABLE_GROUPS = {
 }
 
 
+# 🧹 Clear (Pipeline tab): hides a group's creators up to now. Nothing is deleted: they
+# stay "done", so the harvester never finds them again, and ↩ Restore brings them back.
+CLEARABLE_GROUPS = ("worker", "you")
+
+
+def _cleared_path() -> Path:
+    return STORAGE_DIR / "forceable_cleared.json"
+
+
+def _cleared_cutoffs() -> dict[str, str]:
+    raw = _read_json(_cleared_path(), {})
+    return {str(k): str(v) for k, v in raw.items() if k in CLEARABLE_GROUPS} if isinstance(raw, dict) else {}
+
+
+def _is_cleared(row: dict[str, Any], cutoffs: dict[str, str]) -> bool:
+    cutoff = cutoffs.get(str(row.get("group")))
+    if not cutoff:
+        return False
+    try:
+        return datetime.fromisoformat(str(row.get("updated_at"))) <= datetime.fromisoformat(cutoff)
+    except ValueError:
+        return True  # no usable time: it was there before the clear
+
+
+def clear_forceable_group(group: str) -> int:
+    """🧹 Clear: hide every creator now in ``group`` ("worker": skipped by the worker,
+    "you": passed or skipped by you). Doesn't touch the queue, the Outbox or sent
+    pitches. Returns how many were hidden."""
+    if group not in CLEARABLE_GROUPS:
+        raise ValueError(f"Only these lists can be cleared: {', '.join(CLEARABLE_GROUPS)}.")
+    visible = [row for row in get_forceable_leads() if row["group"] == group and not row["cleared"]]
+    with _worker_lock():
+        cutoffs = _cleared_cutoffs()
+        cutoffs[group] = datetime.now(timezone.utc).isoformat()
+        _write_json_atomic(_cleared_path(), cutoffs)
+    logger.info("Cleared %d creator(s) from '%s'.", len(visible), FORCEABLE_GROUPS[group])
+    return len(visible)
+
+
+def restore_forceable_group(group: str) -> None:
+    """↩ Restore: show a cleared list's creators again."""
+    with _worker_lock():
+        cutoffs = _cleared_cutoffs()
+        cutoffs.pop(group, None)
+        _write_json_atomic(_cleared_path(), cutoffs)
+
+
 def get_forceable_leads() -> list[dict[str, Any]]:
     """Creators that can be forced back into the queue, newest first: ones that didn't
     finish (failed, stuck), ones the worker skipped ("not a fit"), and ones you passed
     or skipped. Not: sent, already in the Outbox or the queue, or being made right now.
-    Each: {channel_id, channel_title, status, reason, group, updated_at, video_url}."""
+    Each: {channel_id, channel_title, status, reason, group, updated_at, video_url,
+    cleared (hidden by 🧹 Clear)}."""
     with _worker_lock():
         records = _processed_state()["records"]
         skipped = _skipped_records()
@@ -1168,6 +1248,9 @@ def get_forceable_leads() -> list[dict[str, Any]]:
             "group": "you", "updated_at": str(record.get("skipped_at") or ""),
             "video_url": str(record.get("latest_video_url") or ""),
         }
+    cutoffs = _cleared_cutoffs()
+    for row in rows.values():
+        row["cleared"] = _is_cleared(row, cutoffs)
     return sorted(rows.values(), key=lambda row: row["updated_at"], reverse=True)
 
 
@@ -1201,12 +1284,12 @@ def _lead_from_saved(channel_id: str, record: dict[str, Any] | None, passed: dic
 
 
 def force_lead_to_queue(channel_id: str) -> dict[str, Any]:
-    """⏩ Force to queue: put a creator back at the top of the queue (one the worker
-    skipped or gave up on, or one you passed or skipped). Their old status, error and
-    pass/skip reason are cleared (kept under "forced_from" for tuning), and they're no
-    longer marked as done, so the worker takes them on its next cycle. Forced creators
-    skip the 'nobody on camera' and 'screen share' checks and the AI score bar. Returns
-    the queued lead."""
+    """⏩ Force to queue: put a creator back in line (one the worker skipped or gave up
+    on, or one you passed or skipped), at the BACK: they're done after every creator
+    already queued, without interrupting anything ("waits_for"). Their old status, error
+    and pass/skip reason are cleared (kept under "forced_from" for tuning), and they're
+    no longer marked as done. Forced creators skip the 'nobody on camera' and 'screen
+    share' checks and the AI score bar. Returns the queued lead."""
     channel_id = channel_id.strip()
     if not channel_id:
         raise ValueError("channel_id must not be empty.")
@@ -1215,11 +1298,15 @@ def force_lead_to_queue(channel_id: str) -> dict[str, Any]:
             raise ValueError("They're already in your Outbox.")
         queue = _lead_queue()
         queued = next((lead for lead in queue if str(lead.get("channel_id")) == channel_id), None)
-        if queued is not None:  # already queued: just move them to the top
-            queue.remove(queued)
-            queue.insert(0, {**queued, "forced": True})
+        if queued is not None:  # already queued: keep their place, just turn the checks off
+            ranks = _queue_ranks(queue)
+            mine = queue.index(queued)
+            ahead = [str(lead.get("channel_id")) for i, lead in enumerate(queue)
+                     if ranks[i] > ranks[mine] or (ranks[i] == ranks[mine] and i < mine)]
+            updated = {**queued, "forced": True, "waits_for": ahead}
+            queue[queue.index(queued)] = updated
             _write_json_atomic(LEAD_QUEUE_PATH, queue)
-            return queue[0]
+            return updated
         record = next((r for r in reversed(_processed_state()["records"]) if str(r.get("channel_id")) == channel_id), None)
         passed = next((r for r in reversed(_skipped_records()) if str(r.get("channel_id")) == channel_id), None)
     if record is not None and record.get("status") in {"sent", "completed"}:
@@ -1254,7 +1341,8 @@ def force_lead_to_queue(channel_id: str) -> dict[str, Any]:
         if len(remaining) != len(skipped):
             _write_json_atomic(SKIPPED_LEADS_PATH, remaining)
         queue = [entry for entry in _lead_queue() if str(entry.get("channel_id")) != channel_id]
-        queue.insert(0, lead)
+        lead["waits_for"] = [str(entry.get("channel_id")) for entry in queue]
+        queue.append(lead)  # the back of the line
         _write_json_atomic(LEAD_QUEUE_PATH, queue)
     logger.info("Forced %s into the queue (was: %s).", lead["channel_title"], (record or passed or {}).get("status"))
     return lead
@@ -1361,6 +1449,7 @@ def _render_selected_clips(
             job_dir / f"clip_{index:02d}.mp4",
             layout_mode="auto",
             work_dir=job_dir,
+            title_fade_in=False,  # the hook is on screen from the very first frame
         )
         for index, clip in enumerate(clips, start=1)
     ]
@@ -1476,7 +1565,12 @@ def _process_lead(
             raise NotAFit(f"{SCREEN_SHARE_PIP}: a screen share with a small webcam in the {camera.pip_corner} corner")
         share = camera.share if camera is not None else None
         if share is not None and share < MIN_ON_CAMERA_SHARE:
-            raise NotAFit(f"no one on camera (a face in {share:.0%} of sampled frames)")
+            characters = camera.character_share
+            if characters is None or characters < MIN_CHARACTER_SHARE:
+                found = f"; cartoon or drawn faces in {characters:.0%}" if characters else ""
+                raise NotAFit(f"no one on camera (a face in {share:.0%} of sampled frames{found})")
+            logger.info("%s: animated characters on screen (%.0f%% of sampled frames); making clips.",
+                        channel_title, characters * 100)
         words = load_cached_transcript(video_id)
         if words is None:
             audio_path = extract_audio_only(source_video, job_dir / "source.wav")

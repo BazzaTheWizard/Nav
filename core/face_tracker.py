@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -305,11 +306,14 @@ PIP_SAME_SPOT = 0.06  # an overlay doesn't move: within this share of the width 
 @dataclass(frozen=True)
 class CameraCheck:
     """``share``: share of sampled frames with a face (None: couldn't tell).
-    ``screen_share_pip``: the only face is a small webcam overlay in ``pip_corner``."""
+    ``screen_share_pip``: the only face is a small webcam overlay in ``pip_corner``.
+    ``character_share``: share of sampled frames with a face of any kind, people or
+    cartoon/anime/drawn characters (core.character_faces); None when not measured."""
 
     share: float | None
     screen_share_pip: bool = False
     pip_corner: str = ""
+    character_share: float | None = None
 
 
 def pip_corner(cx: float, cy: float, area: float) -> str | None:
@@ -365,7 +369,10 @@ def camera_check(video_path: Path, samples: int = ON_CAMERA_SAMPLES) -> CameraCh
         if fps <= 0 or frame_count <= 0:
             return CameraCheck(None)
         duration = frame_count / fps
+        from core.character_faces import has_character_face
+
         frames: list[list[tuple[float, float, float]]] = []
+        characters = 0  # frames with a face of any kind
         for index in range(samples):
             seconds = duration * (0.05 + 0.9 * (index + 0.5) / samples)
             capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.0)
@@ -381,9 +388,13 @@ def camera_check(video_path: Path, samples: int = ON_CAMERA_SAMPLES) -> CameraCh
                 for cx, cy, w, h, _score in detector.detect(frame)
                 if w >= MIN_FACE_WIDTH_RATIO * width
             ])
+            try:
+                characters += bool(frames[-1]) or has_character_face(frame)
+            except cv2.error:
+                logger.warning("Character face check failed on one frame.", exc_info=True)
         if len(frames) < max(1, samples // 2):
             return CameraCheck(None)
-        return classify_camera(frames, len(frames))
+        return dataclasses.replace(classify_camera(frames, len(frames)), character_share=characters / len(frames))
     finally:
         capture.release()
 

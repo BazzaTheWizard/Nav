@@ -22,8 +22,10 @@ from autonomous_worker import (
     LOG_PATH as WORKER_LOG_PATH,
     MAX_PENDING_LEADS,
     MIN_CLIP_SCORE,
+    CLEARABLE_GROUPS,
     FORCEABLE_GROUPS,
     PASS_REASONS,
+    clear_forceable_group,
     force_lead_to_queue,
     get_awaiting_reply,
     get_forceable_leads,
@@ -35,6 +37,7 @@ from autonomous_worker import (
     record_clip_trim,
     remove_pitch_clip,
     drive_backup_on,
+    restore_forceable_group,
     restore_passed_as_sent,
     update_pending_draft,
     get_lead_queue,
@@ -57,6 +60,7 @@ from core.downloader import (
     video_format_sort,
 )
 from core import series
+from core.lead_harvester import subscriber_range
 from core import webinar as webinar_defaults
 from core.clipper import MIN_CLIP_DURATION, rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
@@ -289,18 +293,26 @@ def _render_forceable_leads() -> None:
         return
     if not rows:
         return
+    cleared = [row for row in rows if row.get("cleared")]
+    rows = [row for row in rows if not row.get("cleared")]
+    toast = st.session_state.pop("forceable_toast", None)
+    if toast:
+        st.toast(toast, icon="🧹")
     st.subheader(f"Skipped or unfinished ({len(rows)})")
     st.caption(
-        "**⏩ Force to queue** puts a creator at the top of the queue and clears why they were "
-        "skipped. The worker then makes their clips without the automatic checks (on camera, "
+        "**⏩ Force to queue** puts a creator at the back of the queue (after everyone already in "
+        "it) and clears why they were skipped. The worker then makes their clips without the automatic checks (on camera, "
         "screen share, AI score bar); every clip still gets an AI score, so you can remove weak "
         "ones in the Outbox."
     )
     for group, label in FORCEABLE_GROUPS.items():
         members = [row for row in rows if row["group"] == group]
-        if not members:
+        hidden = sum(1 for row in cleared if row["group"] == group)
+        if not members and not hidden:
             continue
         with st.expander(f"{label} ({len(members)})"):
+            if group in CLEARABLE_GROUPS:
+                _render_clear_controls(group, label, len(members), hidden)
             for row in members[:FORCEABLE_PREVIEW]:
                 channel_id = row["channel_id"]
                 info, action = st.columns([6, 2], vertical_alignment="center")
@@ -322,6 +334,34 @@ def _render_forceable_leads() -> None:
                                 st.rerun()
             if len(members) > FORCEABLE_PREVIEW:
                 st.caption(f"…and {len(members) - FORCEABLE_PREVIEW} older ones.")
+
+
+def _render_clear_controls(group: str, label: str, count: int, hidden: int) -> None:
+    """🧹 Clear (confirmed in a pop-over) and ↩ Restore for one list. Clearing only hides
+    them: the queue, the Outbox and sent pitches don't change, and they stay "done", so
+    the worker never finds them again."""
+    clear_column, restore_column = st.columns(2)
+    with clear_column:
+        if count:
+            with st.popover(f"🧹 Clear ({count})", width="stretch"):
+                st.markdown(
+                    f"Hide all {count} from **{label}**? Nothing is deleted: the queue, the Outbox and sent "
+                    "pitches don't change, they won't be found again, and ↩ Restore brings the list back."
+                )
+                if st.button(f"Yes, clear {count}", key=f"clear_go_{group}", type="primary", width="stretch"):
+                    try:
+                        cleared = clear_forceable_group(group)
+                    except Exception as exc:
+                        logging.exception("Could not clear the list")
+                        st.error(f"Couldn't clear it: {exc}")
+                        return
+                    st.session_state["forceable_toast"] = f"Cleared {cleared} from {label}."
+                    st.rerun()
+    with restore_column:
+        if hidden and st.button(f"↩ Restore {hidden} cleared", key=f"clear_undo_{group}", width="stretch"):
+            restore_forceable_group(group)
+            st.session_state["forceable_toast"] = f"{label}: {hidden} back in the list."
+            st.rerun()
 
 
 LAYOUT_LABELS = {
@@ -1351,7 +1391,7 @@ def _render_contact(record: dict[str, Any]) -> None:
 def _render_pipeline(pending: list[dict[str, Any]]) -> None:
     forced = st.session_state.pop("lead_forced", None)
     if forced:
-        st.success(f"⏩ {forced} is at the top of the queue. The worker takes them next.")
+        st.success(f"⏩ {forced} is at the back of the queue. The worker gets to them after the creators already in it.")
     _render_lead_queue()
     _render_forceable_leads()
     lead_records = _latest_lead_records()
@@ -1974,6 +2014,7 @@ def _render_system() -> None:
             {"Setting": "EMPHASIS_INTENSITY", "Now": os.getenv("EMPHASIS_INTENSITY") or f"{caption_style()['emphasis']} (the caption style's default)"},
             {"Setting": "SOURCE_MAX_HEIGHT", "Now": video_format_sort()[0].removeprefix("res:") + "p"},
             {"Setting": "YouTube sign-in (YTDLP_COOKIES_*)", "Now": sign_in_summary()},
+            {"Setting": "Lead size (LEAD_MIN/MAX_SUBSCRIBERS)", "Now": "{:,}–{:,} subscribers".format(*subscriber_range())},
             {"Setting": "AUDIO_TARGET_LUFS", "Now": "off" if loudness is None else f"{loudness:g} LUFS"},
             {"Setting": "ALLOW_LOCAL_WHISPER", "Now": "on" if local_whisper_allowed() else "off (waits for Groq)"},
             {"Setting": "Clip quality bar", "Now": f"AI score {MIN_CLIP_SCORE}+ (MIN_CLIP_SCORE in autonomous_worker.py)"},

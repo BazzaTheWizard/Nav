@@ -49,6 +49,7 @@ class RenderedClip:
     crop_plan: CropPlan | None
     webinar: WebinarLayout | None = None  # layout "webinar": reused when the clip is trimmed
     pin_title: bool = False  # the title card stayed on for the whole clip
+    title_fade_in: bool = True  # False: the card was on screen from frame 0 (worker clips)
 
 
 def choose_layout(requested: str, plan: CropPlan | None) -> str:
@@ -83,6 +84,7 @@ def render_selected_clip(
     webinar_corner: str = "auto",
     webinar_options: dict[str, str] | None = None,
     webinar_layout: WebinarLayout | None = None,
+    title_fade_in: bool = True,
 ) -> RenderedClip:
     """Subtitles, framing and render for one selected clip.
 
@@ -90,7 +92,8 @@ def render_selected_clip(
     Layout "webinar" only: ``webinar_corner`` is where the speaker's webcam is ("auto"
     finds it); ``webinar_options`` the slide shape and divider (core.webinar.plan_webinar's
     ``slides``, ``divider``, ``accent``); ``webinar_layout`` a layout found before (a
-    trim reuses the first render's)."""
+    trim reuses the first render's). ``title_fade_in``: False shows the title card fully
+    from the first frame (the worker's clips)."""
     work_dir = work_dir or settings.temp_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     subtitle_path = work_dir / f"{output_path.stem}.ass"
@@ -140,6 +143,7 @@ def render_selected_clip(
                 style=settings.hook_title_style,
                 pinned=pin_title,
                 webinar=webinar,
+                fade_in=title_fade_in,
             )
         except Exception:
             logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
@@ -185,6 +189,7 @@ def render_selected_clip(
             crop_plan=plan if layout in CROP_LAYOUTS else None,
             webinar=webinar,
             pin_title=pin_title,
+            title_fade_in=title_fade_in,
         )
     finally:
         subtitle_path.unlink(missing_ok=True)

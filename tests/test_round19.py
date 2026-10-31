@@ -281,13 +281,15 @@ class FakeDetector:
         return [(cx * w, cy * h, fw * w, fh * h, 0.9) for cx, cy, fw, fh in self.faces]
 real_detector = F._face_detector
 F._face_detector = lambda: FakeDetector([(0.88, 0.10, 0.045, 0.08)])  # webcam face, top-right
-check("camera_check: one pass finds the corner webcam", F.camera_check(video) == CameraCheck(1.0, True, "top-right"), str(F.camera_check(video)))
+found = F.camera_check(video)
+check("camera_check: one pass finds the corner webcam", (found.share, found.screen_share_pip, found.pip_corner) == (1.0, True, "top-right"), str(found))
 check("on_camera_share still works the same", F.on_camera_share(video) == 1.0)
 plan = F.analyze_crop_plan(video, 1, 11)
 check("Crop: a corner webcam face never steers the crop (whole frame shown instead)",
       not any(shot.has_face for shot in plan.shots) and plan.full_frame_ranges(1, 11) == [(0.0, 10)], str(plan.shots))
 F._face_detector = lambda: FakeDetector([(0.5, 0.35, 0.12, 0.21)])  # a host on camera
-check("camera_check: a host on camera is not a screen share", F.camera_check(video) == CameraCheck(1.0, False, ""))
+found = F.camera_check(video)
+check("camera_check: a host on camera is not a screen share", (found.share, found.screen_share_pip, found.pip_corner) == (1.0, False, ""), str(found))
 check("Crop: ...and is still followed", all(shot.has_face for shot in F.analyze_crop_plan(video, 1, 11).shots))
 F._face_detector = real_detector
 

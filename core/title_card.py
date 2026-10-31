@@ -82,6 +82,8 @@ class TitleOverlay:
     placement: str
     # 📌 Pinned: on screen for the whole clip, with no fade-out at the end.
     pinned: bool = False
+    # False: fully on screen from frame 0 (the worker's clips); True: fades in and rises.
+    fade_in: bool = True
 
 
 def clean_title(title: str | None) -> str:
@@ -391,11 +393,13 @@ def prepare_title_overlay(
     style: str | None = None,
     pinned: bool = False,
     webinar: WebinarLayout | None = None,
+    fade_in: bool = True,
 ) -> TitleOverlay | None:
     """Render the title card and decide where it goes. None means no title.
 
     ``pinned``: shown for the whole clip (``seconds`` is ignored, even 0).
-    ``webinar``: the webinar layout's geometry (layout "webinar")."""
+    ``webinar``: the webinar layout's geometry (layout "webinar").
+    ``fade_in``: False puts the card fully on screen from the first frame."""
     text = clean_title(title)
     seconds = clip_duration if pinned else min(seconds, clip_duration)
     if seconds <= 0 or text.casefold() in GENERIC_TITLES:
@@ -423,6 +427,7 @@ def prepare_title_overlay(
             card_height=card_height,
             placement=WEBINAR_PLACEMENT,
             pinned=pinned,
+            fade_in=fade_in,
         )
 
     zones: list[list[tuple[float, float]]] = []
@@ -457,6 +462,7 @@ def prepare_title_overlay(
                 card_height=card_height,
                 placement=SEAM_PLACEMENT,
                 pinned=pinned,
+                fade_in=fade_in,
             )
         blocked = []
         if split_time > 0:
@@ -505,6 +511,7 @@ def prepare_title_overlay(
         card_height=card_height,
         placement=label,
         pinned=pinned,
+        fade_in=fade_in,
     )
 
 
@@ -520,16 +527,16 @@ def overlay_filter(
     base_label: str, input_index: int, overlay: TitleOverlay, output_label: str
 ) -> str:
     """FFmpeg filter graph piece: fade the card in (rising slightly), then out. A
-    pinned card has no fade-out: it stays to the clip's last frame."""
-    fade_out = (
-        ""
-        if overlay.pinned
-        else f",fade=t=out:st={max(0.0, overlay.seconds - FADE_OUT):.3f}:d={FADE_OUT}:alpha=1"
-    )
+    pinned card has no fade-out: it stays to the clip's last frame. With
+    ``overlay.fade_in`` False the card is fully there from frame 0 (no fade, no rise)."""
+    steps = []
+    if overlay.fade_in:
+        steps.append(f"fade=t=in:st=0:d={FADE_IN}:alpha=1")
+    if not overlay.pinned:
+        steps.append(f"fade=t=out:st={max(0.0, overlay.seconds - FADE_OUT):.3f}:d={FADE_OUT}:alpha=1")
+    y = f"'{overlay.y}+{SLIDE_PX}*max(0,1-t/{FADE_IN})'" if overlay.fade_in else str(overlay.y)
     return (
-        f"[{input_index}:v]format=rgba,"
-        f"fade=t=in:st=0:d={FADE_IN}:alpha=1{fade_out}[title];"
-        f"[{base_label}][title]overlay=x={overlay.x}:"
-        f"y='{overlay.y}+{SLIDE_PX}*max(0,1-t/{FADE_IN})':"
+        f"[{input_index}:v]format=rgba{''.join(',' + step for step in steps)}[title];"
+        f"[{base_label}][title]overlay=x={overlay.x}:y={y}:"
         f"eof_action={'repeat' if overlay.pinned else 'pass'}[{output_label}]"
     )
