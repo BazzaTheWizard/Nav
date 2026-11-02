@@ -379,3 +379,52 @@ def judge_clips(clip_texts: list[str]) -> list[int] | None:
         except Exception as exc:  # noqa: BLE001 - reported as None, the caller decides
             logger.warning("Clip judge answer unusable (attempt %d/%d): %s", attempt, AI_ATTEMPTS, exc)
     return None
+
+
+# --- 🧾 Finish a long video (Make clips): chapters and title ideas ------------------------
+_CHAPTERS_PROMPT = """You help a creator publish a long YouTube video: a narrated business
+breakdown (company numbers, pricing, financial oddities). From the timed transcript:
+1. Chapters: 4 to 8, where the topic really changes. The first starts at 0. Titles are
+   2-6 plain words a viewer would scan for ("Why the hot dog never changes", not "Part 2").
+2. Three title ideas for the whole video, each under 70 characters: specific (a number,
+   a company, a surprising fact from the transcript), curious, never promising what the
+   video doesn't show, no emoji, no ALL CAPS.
+Return JSON only: {"chapters": [{"start": 0, "title": "..."}, ...], "titles": ["...", "...", "..."]}
+Use start times (seconds) from the transcript."""
+
+
+def suggest_chapters_and_titles(words_or_segments: list[Any]) -> dict[str, Any] | None:
+    """{"chapters": [{"start", "title"}, ...], "titles": [...]} drafted from a long video's
+    transcript (core.long_video checks the chapters against YouTube's rules). None when
+    there's no AI key or no usable answer. A used-up Gemini limit (ServicePause) is passed on."""
+    if not words_or_segments:
+        return None
+    segments = words_or_segments
+    if not isinstance(segments[0], dict):
+        from core.transcriber import transcript_segments
+
+        segments = transcript_segments(words_or_segments)
+    load_dotenv(_PROJECT_ROOT / ".env")
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not gemini_key and not openai_key:
+        return None
+    prompt = _format_transcript_segments(segments)
+    for attempt in range(1, AI_ATTEMPTS + 1):
+        try:
+            if gemini_key:
+                answer = _request_gemini(gemini_key, prompt, _CHAPTERS_PROMPT)
+            else:
+                answer = _request_openai(str(openai_key), prompt, _CHAPTERS_PROMPT)
+            result = _parse_json_response(answer)
+            chapters = [
+                {"start": float(item["start"]), "title": str(item["title"])}
+                for item in result.get("chapters") or [] if isinstance(item, dict)
+            ]
+            titles = [str(title) for title in result.get("titles") or [] if str(title).strip()]
+            return {"chapters": chapters, "titles": titles}
+        except ServicePause:
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported as None, the caller says so
+            logger.warning("Chapter suggestions unusable (attempt %d/%d): %s", attempt, AI_ATTEMPTS, exc)
+    return None

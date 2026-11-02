@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from config import PROJECT_ROOT
-from core.face_tracker import CropBox, CropPlan
+from core import explainer
+from core.face_tracker import CropBox, CropPlan, _probe_display_size
 from core.subtitle_engine import create_ass_subtitles
 from core.title_card import TitleOverlay, prepare_title_overlay, title_above_captions
 from core.transcriber import Word
@@ -104,9 +105,11 @@ def rerender_clip(
     hook_style: str | None = None,
     pin_title: bool = False,
     webinar: WebinarLayout | None = None,
+    title_fade_in: bool = True,
 ) -> Path:
     """``pin_title``: keep the title card on for the whole clip. ``webinar``: the
-    first render's webinar layout (layout "webinar"; found again if missing)."""
+    first render's webinar layout (layout "webinar"; found again if missing).
+    ``title_fade_in``: False shows the title card fully from the first frame."""
     duration = new_end - new_start
     if not MIN_CLIP_DURATION <= duration <= MAX_CLIP_DURATION:
         raise ValueError("Adjusted clip duration must remain between 15 and 90 seconds.")
@@ -185,6 +188,7 @@ def rerender_clip(
                 style=hook_style,
                 pinned=pin_title,
                 webinar=webinar,
+                fade_in=title_fade_in,
             )
         except Exception:
             logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
@@ -198,7 +202,11 @@ def rerender_clip(
             hook_seconds=duration if pin_title else hook_seconds,
             seam_spans=split.spans if split else None,
             seam_title=title_above_captions(title),
-            caption_top=webinar.caption_top if layout_mode == "webinar" and webinar else None,
+            caption_top=(
+                webinar.caption_top if layout_mode == "webinar" and webinar
+                else explainer.caption_top(explainer.safe_box(*_probe_display_size(source)))
+                if layout_mode == "explainer" else None
+            ),
         )
         render_clip(
             source,

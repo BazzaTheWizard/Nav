@@ -12,6 +12,7 @@ from pathlib import Path
 
 from core.face_tracker import CropBox, SplitView, _probe_display_size
 from core.title_card import TitleOverlay, overlay_filter
+from core import explainer
 from core.webinar import WebinarLayout
 
 
@@ -24,6 +25,7 @@ LAYOUT_MODES = (
     "smart_crop",
     "wide_blurred_background",
     "webinar",  # speaker's webcam on top, slides below (core.webinar)
+    "explainer",  # a faceless 16:9 slide video: its center 4:3 box at full width (core.explainer)
 )
 # "auto" is resolved to one of LAYOUT_MODES by core.pipeline before rendering.
 SELECTABLE_LAYOUTS = ("auto", *LAYOUT_MODES)
@@ -146,7 +148,8 @@ def loudness_target() -> float | None:
 
 
 def _measure_loudness(
-    ffmpeg: str, source: Path, start: float, duration: float, target: float, cleanup: str = ""
+    ffmpeg: str, source: Path, start: float, duration: float, target: float, cleanup: str = "",
+    timeout: float = 120,
 ) -> dict[str, str] | None:
     """First loudnorm pass over the clip's audio (after the same cleanup as the second
     pass, so the measurement matches); None if it can't be measured."""
@@ -158,7 +161,7 @@ def _measure_loudness(
                 "-af", f"{cleanup + ',' if cleanup else ''}loudnorm=I={target}:TP={TRUE_PEAK_DB - AAC_OVERSHOOT_DB:g}:LRA={LOUDNESS_RANGE}:print_format=json",
                 "-f", "null", "-",
             ],
-            check=True, capture_output=True, text=True, timeout=120,
+            check=True, capture_output=True, text=True, timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -263,6 +266,9 @@ def render_clip(
         frame = (1920, 1080)
     if layout_mode == "webinar" and webinar is not None:
         filter_complex = webinar.filter_graph(_sharpen(webinar.camera_scale))
+    elif layout_mode == "explainer":
+        box = explainer.safe_box(*frame)
+        filter_complex = explainer.filter_graph(frame, _sharpen(explainer.slide_size(box)[0] / box.width))
     elif layout_mode in {"blurred_background", "wide_blurred_background"}:
         foreground_filter = (
             "[0:v]scale=1080:608:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos"

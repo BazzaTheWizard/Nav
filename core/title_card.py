@@ -412,6 +412,26 @@ def prepare_title_overlay(
     else:
         frame_size = _probe_display_size(source_video)
 
+    if layout == "explainer":
+        # In the band above the slide, its bottom just over the slide's top edge.
+        from core import explainer
+
+        image_path = work_dir / f"{name}_title_{FONT_SIZES[0]}.png"
+        _path, card_width, card_height = render_title_card(text, image_path, style=style, max_font_size=FONT_SIZES[0])
+        card_top = explainer.title_top(card_height)
+        logger.info("Title card: above the slide at y=%d (%d px tall)%s", card_top, card_height, ", pinned" if pinned else "")
+        return TitleOverlay(
+            image_path=image_path,
+            x=(FRAME_WIDTH - card_width) // 2 - SHADOW_MARGIN,
+            y=card_top - SHADOW_MARGIN,
+            seconds=seconds,
+            card_top=card_top,
+            card_height=card_height,
+            placement=explainer.EXPLAINER_PLACEMENT,
+            pinned=pinned,
+            fade_in=fade_in,
+        )
+
     if layout == "webinar" and webinar is not None:
         # Under the slides, where it covers neither the speaker nor a slide.
         image_path = work_dir / f"{name}_title_{FONT_SIZES[0]}.png"

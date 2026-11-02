@@ -261,7 +261,8 @@ wrapper.write_text(textwrap.dedent(f"""
 """))
 at = AppTest.from_file(str(wrapper), default_timeout=180).run()
 check("App runs", not at.exception, str([e.value for e in at.exception]))
-check("Make clips has the two modes", [o for o in at.radio(key="clip_mode").options] == ["🎯 3 highlights", "🎞️ Series: the whole video in order"])
+check("Make clips has its modes (Highlights and Series; Finish and Quote grabber since round 24)",
+      [o for o in at.radio(key="clip_mode").options][:2] == ["🎯 Highlights", "🎞️ Series: the whole video in order"])
 at.radio(key="clip_mode").set_value("🎞️ Series: the whole video in order").run()
 at.text_input(key="series_url").set_value("https://www.youtube.com/watch?v=abcdefghijk").run()
 check("Series controls: title, part length 60–90 s, batch 1", at.slider(key="series_lengths").value == (60, 90)

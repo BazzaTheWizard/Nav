@@ -14,7 +14,8 @@ from config import Settings
 from core.agent_brain import judge_clips, select_clips_and_draft_pitch
 from core.clipper import _center_crop
 from core.downloader import extract_audio_segment, fetch_video_info
-from core.face_tracker import CropBox, CropPlan, analyze_crop_plan
+from core import explainer
+from core.face_tracker import CropBox, CropPlan, _probe_display_size, analyze_crop_plan
 from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
 from core.outreach import build_outreach_email, build_subject, clean_format
@@ -85,6 +86,7 @@ def render_selected_clip(
     webinar_options: dict[str, str] | None = None,
     webinar_layout: WebinarLayout | None = None,
     title_fade_in: bool = True,
+    allow_explainer: bool = False,
 ) -> RenderedClip:
     """Subtitles, framing and render for one selected clip.
 
@@ -93,7 +95,8 @@ def render_selected_clip(
     finds it); ``webinar_options`` the slide shape and divider (core.webinar.plan_webinar's
     ``slides``, ``divider``, ``accent``); ``webinar_layout`` a layout found before (a
     trim reuses the first render's). ``title_fade_in``: False shows the title card fully
-    from the first frame (the worker's clips)."""
+    from the first frame (the worker's clips). ``allow_explainer`` (Make clips): "auto"
+    may choose the explainer layout for a faceless slide video (core.explainer)."""
     work_dir = work_dir or settings.temp_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     subtitle_path = work_dir / f"{output_path.stem}.ass"
@@ -113,6 +116,12 @@ def render_selected_clip(
             except Exception:
                 logger.warning("Framing analysis failed; using a fallback layout.", exc_info=True)
         layout = choose_layout(layout_mode, plan)
+        if layout_mode == "auto" and allow_explainer and layout == "blurred_background":
+            try:
+                if explainer.explainer_fit(source_video, start, end):
+                    layout = "explainer"
+            except Exception:
+                logger.warning("Explainer check failed; using the full frame.", exc_info=True)
         webinar = None
         if layout == "webinar":
             webinar = webinar_layout or plan_webinar(source_video, start, end, webinar_corner, **(webinar_options or {}))
@@ -157,7 +166,7 @@ def render_selected_clip(
             hook_seconds=end - start if pin_title else settings.hook_title_seconds,
             seam_spans=split.spans if split else None,
             seam_title=_seam_title(title),
-            caption_top=webinar.caption_top if webinar else None,
+            caption_top=webinar.caption_top if webinar else _explainer_caption_top(layout, source_video),
         )
         rendered = render_clip(
             source_video,
@@ -196,6 +205,13 @@ def render_selected_clip(
         clip_audio_path.unlink(missing_ok=True)
         if title is not None:
             title.image_path.unlink(missing_ok=True)
+
+
+def _explainer_caption_top(layout: str, source_video: Path) -> int | None:
+    """Explainer layout: captions under the slide (None for every other layout)."""
+    if layout != "explainer":
+        return None
+    return explainer.caption_top(explainer.safe_box(*_probe_display_size(source_video)))
 
 
 def pick_clips_with_agent(

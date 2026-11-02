@@ -60,6 +60,8 @@ from core.downloader import (
     video_format_sort,
 )
 from core import series
+from core import long_video, quotes
+import core.downloader as youtube
 from core.lead_harvester import subscriber_range
 from core import webinar as webinar_defaults
 from core.clipper import MIN_CLIP_DURATION, rerender_clip, rerender_output_path
@@ -74,7 +76,7 @@ from core.outreach import (
     set_greeting,
     subject_for,
 )
-from core.hook_selector import ClipResult, select_clips
+from core.hook_selector import ClipResult, cap_clip_length, select_clips
 from core.pipeline import (
     MIN_CLIPS,
     pick_clips_with_agent,
@@ -103,6 +105,7 @@ from core.storage_manager import (
     storage_usage_bytes,
 )
 from core.transcriber import (
+    Word,
     local_whisper_allowed,
     transcribe_audio,
     youtube_video_id,
@@ -365,12 +368,13 @@ def _render_clear_controls(group: str, label: str, count: int, hidden: int) -> N
 
 
 LAYOUT_LABELS = {
-    "Auto (recommended): face-tracked, split view for two people": "auto",
+    "Auto (recommended): face-tracked, split view for two people, explainer for slide videos": "auto",
     "Face-tracked crop": "smart_crop",
     "Full frame over a blurred background": "blurred_background",
     "Wide video, letterboxed": "wide_blurred_background",
     "Wide shot on top, face below": "stacked",
     "Webinar / screen + speaker: webcam on top, slides below": "webinar",
+    "Explainer: your slide video, its center 4:3 at full width": "explainer",
 }
 # Webinar layout: where the speaker's webcam is ("auto" finds the window by itself).
 WEBCAM_CORNERS = {
@@ -385,8 +389,11 @@ DIVIDER_LABELS = {"Thin dark line": "line", "Accent color line": "accent", "Soft
 PIN_TITLE_LABEL = "📌 Pin title card for full video duration"
 PIN_TITLE_HELP = "Off: the title card shows for the first few seconds. On: it stays on screen until the clip's last frame."
 WEBINAR_HELP = (
-    "For slides, webinars and tutorials with a small webcam in a corner: the webcam goes on top "
-    "(about a quarter of the screen), the whole slide under it, then the title and captions."
+    "Webinar: for slides, webinars and tutorials with a small webcam in a corner: the webcam goes on "
+    "top (about a quarter of the screen), the whole slide under it, then the title and captions.\n\n"
+    "Explainer: for your own 16:9 slide videos (Keynote, Canva) with nobody on camera. The center "
+    "4:3 of each slide (1440×1080 of 1920×1080) fills the phone's width, the title sits above it and "
+    "the captions under it. Auto picks it when the slide margins are nearly empty."
 )
 
 
@@ -617,7 +624,12 @@ def _generate_clips(
     webcam_corner: str = "auto",
     webinar_options: dict[str, str] | None = None,
     pin_title: bool = False,
+    max_seconds: float | None = None,
+    title_fade_in: bool = True,
 ) -> list[tuple[Path, ClipResult]]:
+    """``max_seconds``: no clip longer than this (cut at a sentence end). ``title_fade_in``:
+    False puts the title card fully on screen from the first frame. Layout "auto" may
+    choose the explainer layout for a faceless slide video."""
     settings = load_settings()
     output_dir = render_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -663,19 +675,27 @@ def _generate_clips(
         else:
             if source_video is None or not source_video.is_file():
                 raise ValueError(f"Input video is not a file: {input_path}")
-            extract_audio_only(source_video, audio_path)
             duration = _video_duration(source_video)
+        fingerprint = None if is_url or source_video is None else long_video.file_fingerprint(source_video)
+        words = long_video.load_file_transcript(fingerprint) if fingerprint else None
+        if words is None and source_video is not None and not is_url:
+            extract_audio_only(source_video, audio_path)
         update_progress(0.20, "")
 
-        st.write("**Step 2 of 4: Transcribing speech with Groq**")
-        words = transcribe_audio(
-            audio_path,
-            settings,
-            on_progress=stage_progress(0.20, 0.45),
-        )
+        if words is not None:
+            st.write("**Step 2 of 4: Reusing this file's saved transcript (no Groq call)**")
+        else:
+            st.write("**Step 2 of 4: Transcribing speech with Groq**")
+            words = transcribe_audio(
+                audio_path,
+                settings,
+                on_progress=stage_progress(0.20, 0.45),
+            )
+            if fingerprint:
+                long_video.save_file_transcript(fingerprint, words)
         update_progress(0.45, "")
 
-        st.write("**Step 3 of 4: AI selecting three clip hooks**")
+        st.write("**Step 3 of 4: AI picking the best moments**")
         peaks: list[tuple[float, float, float]] = []
         try:
             video_title, resolved_channel_name, peaks = _get_video_metadata(
@@ -728,6 +748,8 @@ def _generate_clips(
             clips = select_clips(
                 words, duration, clip_count, settings, replay_peaks_hint=peaks
             )[:clip_count]
+        if max_seconds:
+            clips = cap_clip_length(clips, words, max_seconds)
 
         st.session_state["agent_video_title"] = video_title
         st.session_state["agent_channel_name"] = resolved_channel_name
@@ -782,6 +804,8 @@ def _generate_clips(
                     pin_title=pin_title,
                     webinar_corner=webcam_corner,
                     webinar_options=webinar_options,
+                    title_fade_in=title_fade_in,
+                    allow_explainer=layout_mode == "auto",
                 )
             except Exception:
                 output_path.unlink(missing_ok=True)
@@ -794,13 +818,14 @@ def _generate_clips(
                 "crop_plan": result.crop_plan,
                 "webinar": result.webinar,
                 "pin_title": pin_title,
+                "title_fade_in": title_fade_in,
                 "start_time": clip.start_time,
                 "end_time": clip.end_time,
                 "source_duration": duration,
             }
             return result.path, clip
 
-        if len(clips) == 3:
+        if len(clips) > 1:
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = {
                     executor.submit(render_one, index, clip): index
@@ -861,6 +886,7 @@ LAYOUT_NAMES = {
     "blurred_background": "full frame",
     "wide_blurred_background": "full frame",
     "stacked": "stacked",
+    "explainer": "explainer",
 }
 
 
@@ -1405,9 +1431,25 @@ def _render_pipeline(pending: list[dict[str, Any]]) -> None:
 
 # --- 🎬 Make clips: any video, by hand ---------------------------------------------------
 CLIP_MODES = {
-    "🎯 3 highlights": "highlights",
+    "🎯 Highlights": "highlights",
     "🎞️ Series: the whole video in order": "series",
+    "🧾 Finish a long video": "finish",
+    "✂️ Quote grabber": "quote",
 }
+PATH_PLACEHOLDER = "/Users/you/Movies/My video.mp4"
+PATH_HELP = (
+    "For big files (uploads stop at 200 MB). In Finder, right-click the file, hold the Option "
+    "key and choose “Copy … as Pathname”, then paste it here."
+)
+HIGHLIGHT_COUNTS = (3, 4, 5, 6, 7)  # 5-7 for your own long videos (one Short per section)
+CAP_SECONDS = 59.0  # YouTube blocks claimed Shorts over 1 minute (a podcast quote can be claimed)
+CAP_LABEL = "⏱ 59 s max"
+CAP_HELP = (
+    "Keeps every clip at 59 seconds or less, ending on a finished sentence. A Short over one "
+    "minute with a copyright claim (for example a podcast quote) is blocked on YouTube."
+)
+INSTANT_TITLE_LABEL = "⚡ Title on screen from the first frame"
+INSTANT_TITLE_HELP = "Off: the title card fades in over the first 0.2 s, as before."
 
 
 def _render_clip_generator() -> None:
@@ -1415,14 +1457,34 @@ def _render_clip_generator() -> None:
         "Make clips from any YouTube link or video file, outside the worker. Nothing here is "
         "tracked as a pitch: the worker's pitches are in the 📬 Outbox."
     )
+    pending_mode = st.session_state.pop("clip_mode_pending", None)
+    if pending_mode in CLIP_MODES:  # "🎯 Make Shorts from it" after finishing a long video
+        st.session_state["clip_mode"] = pending_mode
     mode = st.radio(
         "Mode", list(CLIP_MODES), key="clip_mode", horizontal=True,
-        help="3 highlights: the AI picks the 3 best moments. Series: Part 1, Part 2, Part 3… "
-        "covering the whole video in order, one batch of 3 at a time.",
+        help="Highlights: the AI picks the best moments (3 to 7). Series: Part 1, Part 2, Part 3… "
+        "covering the whole video in order, one batch of 3 at a time. Finish a long video: clean "
+        "sound, a captions file, chapters and title ideas for your own long video. Quote grabber: "
+        "one exact line from a podcast as a 16:9 clip for your slides.",
     )
     if CLIP_MODES[mode] == "series":
         _render_series_maker()
         return
+    if CLIP_MODES[mode] == "finish":
+        _render_long_video_finisher()
+        return
+    if CLIP_MODES[mode] == "quote":
+        _render_quote_grabber()
+        return
+    st.session_state.setdefault("clip_count", HIGHLIGHT_COUNTS[0])
+    st.session_state.setdefault("cap_59", True)
+    st.session_state.setdefault("instant_title", True)
+    count_column, cap_column = st.columns([3, 2], vertical_alignment="bottom")
+    clip_count = int(count_column.select_slider(
+        "How many clips", options=list(HIGHLIGHT_COUNTS), key="clip_count",
+        help="3 for a creator's video. 5–7 for your own long video: about one Short per section.",
+    ))
+    cap = cap_column.checkbox(CAP_LABEL, key="cap_59", help=CAP_HELP)
     with st.form("clip_generator_form"):
         video_url = st.text_input(
             "YouTube link",
@@ -1434,6 +1496,10 @@ def _render_clip_generator() -> None:
             "Or upload a video file",
             type=["mp4", "mov"],
             key=f"video_upload_{st.session_state.get('video_upload_epoch', 0)}",
+        )
+        local_path = st.text_input(
+            "Or a video file on this Mac (its path)", key="video_path_input", placeholder=PATH_PLACEHOLDER,
+            help=PATH_HELP,
         )
         channel_name = st.text_input(
             "Creator / channel name (optional)",
@@ -1448,12 +1514,15 @@ def _render_clip_generator() -> None:
             st.caption("**Webinar layout only:**")
             webcam_corner, webinar_options = _webinar_controls()
         pin_title = st.checkbox(PIN_TITLE_LABEL, key="pin_title", help=PIN_TITLE_HELP)
-        generate_clicked = st.form_submit_button("Make 3 vertical clips", type="primary")
+        instant_title = st.checkbox(INSTANT_TITLE_LABEL, key="instant_title", help=INSTANT_TITLE_HELP)
+        generate_clicked = st.form_submit_button(f"Make {clip_count} vertical clips", type="primary")
 
     if generate_clicked:
         _make_clips(
             video_url, uploaded_video, channel_name, layout_label,
             webcam_corner=webcam_corner, webinar_options=webinar_options, pin_title=pin_title,
+            clip_count=clip_count, max_seconds=CAP_SECONDS if cap else None, instant_title=instant_title,
+            local_path=local_path,
         )
     _render_generated_clips()
 
@@ -1502,8 +1571,11 @@ def _make_clips(
     webcam_corner: str = "auto",
     webinar_options: dict[str, str] | None = None,
     pin_title: bool = False,
+    clip_count: int = 3,
+    max_seconds: float | None = None,
+    instant_title: bool = False,
+    local_path: str = "",
 ) -> None:
-    clip_count = 3
     try:
         _delete_previous_source_video()
     except OSError:
@@ -1530,8 +1602,8 @@ def _make_clips(
         "agent_channel_name",
     ):
         st.session_state.pop(key, None)
-    if bool(video_url.strip()) == (uploaded_video is not None):
-        st.error("Give either a YouTube link or one video file, not both.")
+    if sum((bool(video_url.strip()), uploaded_video is not None, bool(local_path.strip()))) != 1:
+        st.error("Give one YouTube link, one uploaded file or one file path.")
         return
 
     uploaded_input: Path | None = None
@@ -1547,6 +1619,9 @@ def _make_clips(
             uploaded_input = settings.temp_dir / f"upload_{uuid.uuid4().hex}{suffix}"
             uploaded_input.write_bytes(uploaded_video.getbuffer())
             input_path: str | Path = uploaded_input
+        elif local_path.strip():
+            input_path = _local_video(local_path)
+            video_title_override = input_path.stem.removesuffix(" (finished)")
         else:
             input_value = video_url.strip()
             if not input_value.startswith(("http://", "https://")):
@@ -1557,7 +1632,8 @@ def _make_clips(
         st.session_state["outreach_title_override"] = video_title_override
         generated = _generate_clips(
             input_path, clip_count, LAYOUT_LABELS[layout_label], webcam_corner=webcam_corner,
-            webinar_options=webinar_options, pin_title=pin_title,
+            webinar_options=webinar_options, pin_title=pin_title, max_seconds=max_seconds,
+            title_fade_in=not instant_title,
         )
         st.session_state["generated_clips"] = generated
         st.session_state["clip_paths"] = [str(item[0].expanduser().resolve()) for item in generated]
@@ -1576,6 +1652,212 @@ def _make_clips(
     finally:
         if uploaded_input is not None:
             uploaded_input.unlink(missing_ok=True)
+
+
+def _local_video(text: str) -> Path:
+    """A video file on this Mac, from a pasted path (quotes and a leading ~ are fine)."""
+    path = Path(text.strip().strip("'\"")).expanduser()
+    if not path.is_file():
+        raise ValueError(f"There's no file at {path}. Copy its path again (Option + right-click → Copy as Pathname).")
+    if path.suffix.lower() not in {".mp4", ".mov", ".m4v"}:
+        raise ValueError("The file must be an MP4, MOV or M4V video.")
+    return path.resolve()
+
+
+# --- 🧾 Finish a long video (Make clips) ------------------------------------------------------
+def _render_long_video_finisher() -> None:
+    st.caption(
+        "For your own long video (a Keynote or Canva export with your narration): the same video "
+        "with clean, even sound (the picture isn't touched), a captions file for YouTube, and drafted "
+        "chapters and title ideas. Then make the Shorts from it in one click."
+    )
+    upload = st.file_uploader("Upload the video", type=["mp4", "mov", "m4v"], key="finish_upload")
+    path_text = st.text_input("Or its path on this Mac", key="finish_path", placeholder=PATH_PLACEHOLDER, help=PATH_HELP)
+    if st.button("🧾 Finish it", type="primary", key="finish_go"):
+        _finish_long_video(upload, path_text)
+    result = st.session_state.get("finish_result")
+    if not result:
+        return
+    st.success(f"Saved in {result['folder']}", icon="✅")
+    for problem in result["problems"]:
+        st.warning(problem)
+    st.markdown(f"**Video:** `{result['video']}`")
+    files = st.columns(2)
+    files[0].download_button("⬇ Captions file (.srt)", Path(result["captions"]).read_bytes(),
+                             file_name=Path(result["captions"]).name, key="finish_srt", width="stretch")
+    files[1].download_button("⬇ Chapters and titles (.txt)", Path(result["notes"]).read_bytes(),
+                             file_name=Path(result["notes"]).name, key="finish_notes", width="stretch")
+    if result["titles"]:
+        st.markdown("**Title ideas** (test them with Test & Compare in YouTube Studio):")
+        for number, title in enumerate(result["titles"], start=1):
+            st.markdown(f"{number}. {title}")
+    if result["chapters"]:
+        st.text_area("Chapters: paste into the description", result["chapters"], height=180, key="finish_chapters_text")
+    if st.button("🎯 Make Shorts from it", key="finish_to_shorts", width="stretch",
+                 help="Opens Highlights with this file, 5 clips and Auto layout (explainer for slide videos)."):
+        st.session_state["clip_mode_pending"] = "🎯 Highlights"
+        st.session_state["video_path_input"] = result["video"]
+        st.session_state["video_url_input"] = ""
+        st.session_state["clip_count"] = 5
+        st.session_state["crop_mode"] = next(iter(LAYOUT_LABELS))
+        st.rerun()
+
+
+def _finish_long_video(upload: Any, path_text: str) -> None:
+    if (upload is not None) == bool(path_text.strip()):
+        st.error("Give one uploaded file or one file path.")
+        return
+    settings = load_settings()
+    settings.temp_dir.mkdir(parents=True, exist_ok=True)
+    uploaded: Path | None = None
+    audio_path = settings.temp_dir / f"finish_{uuid.uuid4().hex}.wav"
+    try:
+        if upload is not None:
+            source = settings.temp_dir / Path(upload.name).name
+            source.write_bytes(upload.getbuffer())
+            uploaded = source
+        else:
+            source = _local_video(path_text)
+        with st.status("Finishing the video…", expanded=True) as status:
+            duration = _video_duration(source)
+            fingerprint = long_video.file_fingerprint(source)
+            words = long_video.load_file_transcript(fingerprint)
+            if words is None:
+                st.write("Transcribing with Groq…")
+                extract_audio_only(source, audio_path)
+                words = transcribe_audio(audio_path, settings)
+                long_video.save_file_transcript(fingerprint, words)
+            else:
+                st.write("Reusing this file's saved transcript (no Groq call).")
+            st.write("Cleaning up the sound, writing captions, drafting chapters and titles…")
+            folder = render_output_dir() / "Long videos" / _slug(source.stem.removesuffix(" (finished)"))
+            finished = long_video.finish_long_video(source, folder, words, duration)
+            # The finished file has the same words at the same times: no Groq call for the Shorts.
+            long_video.save_file_transcript(long_video.file_fingerprint(finished.video), words)
+            status.update(label="Finished", state="complete")
+        st.session_state["finish_result"] = {
+            "folder": str(folder), "video": str(finished.video), "captions": str(finished.captions),
+            "notes": str(finished.notes), "titles": finished.titles,
+            "chapters": long_video.chapters_text(finished.chapters), "problems": finished.problems,
+        }
+    except Exception as exc:
+        logging.exception("Finishing the long video failed")
+        st.error(f"Couldn't finish it: {exc}")
+    finally:
+        audio_path.unlink(missing_ok=True)
+        if uploaded is not None:
+            uploaded.unlink(missing_ok=True)
+
+
+# --- ✂️ Quote grabber (Make clips) --------------------------------------------------------------
+def _render_quote_grabber() -> None:
+    st.caption(
+        "One exact line from a podcast or interview, as a 16:9 clip to put on a slide. Search its "
+        "captions, then only that part is downloaded and transcribed. Keep quotes short (under 15 s) "
+        "and credit the show on the slide."
+    )
+    url = st.text_input("YouTube link", key="quote_url", placeholder="https://www.youtube.com/watch?v=...").strip()
+    info = st.session_state.get("quote_info")
+    if info and info.get("url") != url:
+        for key in ("quote_info", "quote_section", "quote_saved"):
+            st.session_state.pop(key, None)
+        info = None
+    if url and info is None and st.button("🔎 Read its captions", key="quote_find"):
+        try:
+            with st.spinner("Reading the captions (nothing is downloaded)…"):
+                details, lines = youtube.fetch_captions(url)
+        except Exception as exc:
+            logging.exception("Could not read the captions")
+            st.error(f"Couldn't read this video: {exc}" + (f"\n\n{exc.hint}" if getattr(exc, "hint", "") else ""))
+            return
+        info = {"url": url, **details, "lines": [list(line) for line in lines]}
+        st.session_state["quote_info"] = info
+    if not info:
+        return
+    st.markdown(f"**{info.get('title') or 'Video'}** · {info.get('channel') or ''}")
+    lines = [tuple(line) for line in info["lines"]]
+    picked: tuple[float, float] | None = None
+    if lines:
+        query = st.text_input("Search the captions", key="quote_query", placeholder="a few words of the line")
+        found = quotes.search_captions(lines, query) if query.strip() else []
+        if query.strip() and not found:
+            st.info("No caption line has all of those words. Try fewer or different words, or type the time below.")
+        if found:
+            labels = [f"{long_video.timestamp(start)} · {text[:110]}" for start, _end, text in found]
+            choice = st.radio("Lines found", labels, key="quote_pick")
+            start, end, _text = found[labels.index(choice)]
+            picked = (start, end)
+    else:
+        st.info("This video has no English captions. Type the time of the line instead (from YouTube's player).")
+    time_text = st.text_input("Or the time in the video (mm:ss)", key="quote_time", placeholder="12:05")
+    if time_text.strip():
+        seconds = quotes.parse_time(time_text)
+        if seconds is None:
+            st.error("Write the time as mm:ss (or h:mm:ss), like 12:05.")
+        else:
+            picked = (seconds, seconds + 10.0)
+    if picked and st.button("⬇ Get this part", key="quote_get", type="primary"):
+        _grab_quote_section(info, picked)
+    section = st.session_state.get("quote_section")
+    if not section:
+        return
+    words = [Word(*row) for row in section["words"]]
+    if not words:
+        st.warning("No speech was found in that part. Pick another line or time.")
+        return
+    labels = [f"{long_video.timestamp(section['start'] + w.start)} {w.text}" for w in words]
+    first, last = section["pick"]
+    chosen = st.select_slider("The quote: drag to its first and last word", options=list(range(len(words))),
+                              value=(first, last), format_func=lambda i: labels[i], key="quote_words")
+    a, b = chosen
+    length = words[b].end - words[a].start + quotes.PRE_ROLL + quotes.POST_ROLL
+    st.markdown(f"> {' '.join(w.text for w in words[a:b + 1])}")
+    st.caption(f"{length:.1f} s" + (" · long for a quote: under 15 s keeps it a quote" if length > 15 else ""))
+    if st.button("✂️ Save quote", key="quote_save", type="primary"):
+        name = f"{_slug(str(info.get('title') or 'quote'))[:40]}-{long_video.timestamp(section['start'] + words[a].start).replace(':', '')}.mp4"
+        try:
+            with st.spinner("Cutting the quote…"):
+                saved = quotes.cut_quote(Path(section["path"]), words[a].start, words[b].end, render_output_dir() / "Quotes" / name)
+        except Exception as exc:
+            logging.exception("Could not cut the quote")
+            st.error(f"Couldn't cut it: {exc}")
+            return
+        st.session_state["quote_saved"] = str(saved)
+    saved = st.session_state.get("quote_saved")
+    if saved and Path(saved).is_file():
+        st.success(f"Saved to {saved}", icon="✅")
+        st.video(saved)
+        st.download_button("⬇ Download the quote", Path(saved).read_bytes(), file_name=Path(saved).name, key="quote_download")
+
+
+def _grab_quote_section(info: dict[str, Any], picked: tuple[float, float]) -> None:
+    settings = load_settings()
+    settings.temp_dir.mkdir(parents=True, exist_ok=True)
+    start, end = quotes.section_for(picked[0], picked[1], info.get("duration"))
+    section = settings.temp_dir / f"quote_{uuid.uuid4().hex}.mp4"
+    audio = section.with_suffix(".wav")
+    try:
+        with st.spinner(f"Downloading {end - start:.0f} s and transcribing them…"):
+            youtube.download_section(info["url"], start, end, section)
+            extract_audio_only(section, audio)
+            words = transcribe_audio(audio, settings)
+    except Exception as exc:
+        logging.exception("Could not get the quote's part")
+        section.unlink(missing_ok=True)
+        st.error(f"Couldn't get that part: {exc}" + (f"\n\n{exc.hint}" if getattr(exc, "hint", "") else ""))
+        return
+    finally:
+        audio.unlink(missing_ok=True)
+    old = st.session_state.get("quote_section")
+    if old:
+        Path(old["path"]).unlink(missing_ok=True)
+    first, last = quotes.words_near(words, picked[0] - start, picked[1] - start)
+    st.session_state["quote_section"] = {
+        "path": str(section), "start": start, "end": end,
+        "words": [[w.text, w.start, w.end] for w in words], "pick": (first, last),
+    }
+    st.session_state.pop("quote_words", None)
+    st.session_state.pop("quote_saved", None)
 
 
 # --- 🎞️ Series mode (Make clips): Part 1, 2, 3… in order -------------------------------------
@@ -1746,7 +2028,7 @@ def _make_series_batch(
             render_selected_clip(
                 source_video, clip, words, settings, output,
                 layout_mode=layout_mode, pin_title=pin_title, webinar_corner=webcam_corner,
-                webinar_options=webinar_options,
+                webinar_options=webinar_options, allow_explainer=layout_mode == "auto",
             )
             preview = settings.temp_dir / f"series_{key}_part_{number:02d}.preview.mp4"
             make_preview(output, preview)  # small copy for the player (the full file is ~10 MB a minute)
@@ -1935,6 +2217,7 @@ def _render_trim_form(
             highlight_active_word=settings.caption_highlight,
             pin_title=bool(context.get("pin_title")),
             webinar=context.get("webinar"),
+            title_fade_in=bool(context.get("title_fade_in", True)),
         )
     except Exception as exc:
         logging.exception("Could not re-render clip %d", index + 1)

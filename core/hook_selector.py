@@ -503,6 +503,30 @@ def choose_clips(
     return sorted(selected[:requested_count], key=lambda clip: clip.start_time)
 
 
+def cap_clip_length(clips: list[ClipResult], words: list[Word], max_seconds: float) -> list[ClipResult]:
+    """Clips longer than ``max_seconds`` end earlier: on the last finished sentence that
+    fits (when that still leaves MIN_CLIP_DURATION), else after the last whole word that
+    fits. Shorter clips are unchanged. (YouTube blocks Shorts over one minute that carry
+    a copyright claim, so Make clips' "59 s max" uses 59.)"""
+    capped: list[ClipResult] = []
+    for clip in clips:
+        if clip.end_time - clip.start_time <= max_seconds:
+            capped.append(clip)
+            continue
+        latest = clip.start_time + max_seconds - POST_ROLL_SECONDS
+        inside = [word for word in words if word.start >= clip.start_time and word.end <= latest]
+        sentence_ends = [
+            word for word in inside
+            if _ends_sentence(word.text) and word.end - clip.start_time >= MIN_CLIP_DURATION - POST_ROLL_SECONDS
+        ]
+        last = (sentence_ends or inside or [None])[-1]
+        end = min(clip.start_time + max_seconds, last.end + POST_ROLL_SECONDS) if last else clip.start_time + max_seconds
+        logger.info("Clip at %.1f s: %.1f s cut to %.1f s (%s max).", clip.start_time,
+                    clip.end_time - clip.start_time, end - clip.start_time, f"{max_seconds:g} s")
+        capped.append(clip.model_copy(update={"end_time": end}))
+    return capped
+
+
 def finalize_candidates(
     proposals: list[ClipResult],
     words: list[Word],
