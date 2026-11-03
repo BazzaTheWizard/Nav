@@ -5,6 +5,7 @@ Uses a simulated YouTube and a temporary storage folder. It never calls YouTube
 and never touches your real storage files.
 """
 import json
+import os
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(root))
+os.environ["LEAD_PROFILE"] = "wide"  # round 25: these checks are about every niche (no B2B filter)
 
 import autonomous_worker as W  # noqa: E402
 import core.lead_harvester as H  # noqa: E402

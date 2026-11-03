@@ -35,9 +35,15 @@ from core.face_tracker import camera_check
 from core.storage_manager import prune_stale_files
 from core.hook_selector import ClipResult
 from core.outreach import (
+    FOLLOW_UP_DAYS,
+    FOLLOW_UP_LABELS,
     LEGACY_SITE_URL,
     SITE_URL,
-    build_follow_up,
+    build_follow_up_step,
+    clean_first_name,
+    build_outreach_email,
+    build_yes_reply,
+    follow_up_steps,
     fill_drive_link,
     greeting_name_of,
     is_old_template,
@@ -54,6 +60,7 @@ from core.lead_harvester import (
     YouTubeQuotaExceededError,
     discover_channels,
     generate_search_queries,
+    lead_profile,
 )
 from core.hook_selector import replay_peaks
 from core.pipeline import (
@@ -612,6 +619,7 @@ def get_pending_outreach() -> list[dict[str, Any]]:
                     str(record.get("video_title") or ""),
                     shorts_status=str(record.get("shorts_status") or ""),
                     clip_count=len(clips) or 3,
+                    facts=record.get("pitch") if isinstance(record.get("pitch"), dict) else None,
                 )
                 old_subject = str(record.get("subject") or "")
                 record["subject"] = modern_subject(old_subject) if old_subject else subject_for(record["full_email_body"])
@@ -632,51 +640,113 @@ def get_pending_outreach() -> list[dict[str, Any]]:
         ]
 
 
-FOLLOW_UP_AFTER_DAYS = 4
+FOLLOW_UP_AFTER_DAYS = FOLLOW_UP_DAYS["bump"]  # the first follow-up (kept for older code)
+
+
+def _link_in_first_email(record: dict[str, Any]) -> bool:
+    """True for pitches sent before round 25: their first email had the clip link."""
+    body = str(record.get("full_email_body") or "")
+    link = clip_link(record)
+    return (bool(link) and link in body) or "://" in body
+
+
+def _follow_ups_sent(record: dict[str, Any]) -> list[str]:
+    """When each follow-up went out (oldest first). Older records only have
+    "followed_up_at" (one follow-up)."""
+    sent = record.get("follow_ups")
+    if isinstance(sent, list):
+        return [str(item) for item in sent]
+    return [str(record["followed_up_at"])] if record.get("followed_up_at") else []
+
+
+def _content_format_of(record: dict[str, Any]) -> str:
+    facts = record.get("pitch") if isinstance(record.get("pitch"), dict) else {}
+    if facts.get("format"):
+        return str(facts["format"])
+    return "episode" if str(record.get("subject") or "").rstrip().endswith(" episode") else "video"
+
+
+def _clip_count_of(record: dict[str, Any]) -> int:
+    clips = [clip for clip in record.get("clips") or [] if isinstance(clip, dict)]
+    return len(clips) or 3
+
+
+def _first_name_of(record: dict[str, Any]) -> str:
+    """The first name the pitch greeted ('' for 'Hi there' or a channel name)."""
+    name = str(record.get("greeting_name") or "")
+    return clean_first_name(name)
+
+
+def next_follow_up(record: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """Where a sent pitch is in its follow-ups: {"step": "bump"/"show"/"last"/
+    "bump_link" or None when all are sent, "number": 1.., "total": steps,
+    "due": bool, "due_on": ISO date}."""
+    now = now or datetime.now(timezone.utc)
+    steps = follow_up_steps(_link_in_first_email(record))
+    done = len(_follow_ups_sent(record))
+    if done >= len(steps):
+        return {"step": None, "number": done, "total": len(steps), "due": False, "due_on": ""}
+    step = steps[done]
+    try:
+        sent_at = datetime.fromisoformat(str(record.get("sent_at")))
+    except ValueError:
+        return {"step": None, "number": done, "total": len(steps), "due": False, "due_on": ""}
+    due_at = sent_at + timedelta(days=FOLLOW_UP_DAYS[step])
+    return {
+        "step": step,
+        "number": done + 1,
+        "total": len(steps),
+        "due": now >= due_at,
+        "due_on": due_at.date().isoformat(),
+    }
+
+
+def _with_follow_up(record: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """The record plus its next follow-up (text ready to send once it's due)."""
+    body = str(record.get("full_email_body") or "")
+    plan = next_follow_up(record, now)
+    item = {
+        **record,
+        "follow_up_due": plan["due"],
+        "follow_up_step": plan["step"],
+        "follow_up_number": plan["number"],
+        "follow_up_total": plan["total"],
+        "follow_up_on": plan["due_on"],
+        "follow_ups_sent": len(_follow_ups_sent(record)),
+    }
+    if plan["step"]:
+        facts = record.get("pitch") if isinstance(record.get("pitch"), dict) else {}
+        item["follow_up_label"] = FOLLOW_UP_LABELS[plan["step"]]
+        item["follow_up_subject"] = f"Re: {record.get('subject') or subject_for(body)}"
+        item["follow_up_body"] = build_follow_up_step(
+            plan["step"],
+            _first_name_of(record),
+            clip_link(record),
+            _clip_count_of(record),
+            _content_format_of(record),
+            video_title=str(record.get("video_title") or ""),
+            video_topic=topic_from_email(body) or str(facts.get("topic") or ""),
+        )
+    return item
 
 
 def get_follow_ups_due(now: datetime | None = None) -> list[dict[str, Any]]:
-    """Sent pitches with no follow-up yet, sent at least FOLLOW_UP_AFTER_DAYS ago.
+    """Sent pitches with a follow-up due now (see FOLLOW_UP_DAYS in core/outreach.py).
 
     Each comes with a ready "follow_up_body". Mark a creator as replied in the app
-    (or by sending the follow-up) and they drop off this list.
+    (or mark the follow-up sent) and they drop off this list until the next one.
     """
-    now = now or datetime.now(timezone.utc)
-    with _worker_lock():
-        records = _pending_records()
-    due: list[dict[str, Any]] = []
-    for record in records:
-        if record.get("status") != "sent" or record.get("followed_up_at") or record.get("replied_at"):
-            continue
-        try:
-            sent_at = datetime.fromisoformat(str(record.get("sent_at")))
-        except ValueError:
-            continue
-        if now - sent_at < timedelta(days=FOLLOW_UP_AFTER_DAYS):
-            continue
-        body = str(record.get("full_email_body") or "")
-        due.append(
-            {
-                **record,
-                "follow_up_subject": f"Re: {record.get('subject') or subject_for(body)}",
-                "follow_up_body": build_follow_up(
-                    str(record.get("greeting_name") or record.get("channel_title") or ""),
-                    video_title=str(record.get("video_title") or ""),
-                    video_topic=topic_from_email(body),
-                    drive_link=clip_link(record),
-                ),
-            }
-        )
-    return due
+    return [item for item in get_awaiting_reply(now) if item["follow_up_due"]]
 
 
 AWAITING_REPLY_DAYS = 30  # sent emails older than this drop off the "waiting" list
 
 
 def get_awaiting_reply(now: datetime | None = None) -> list[dict[str, Any]]:
-    """Sent pitches with no reply yet (newest first). "follow_up_due" is True once
-    FOLLOW_UP_AFTER_DAYS passed without a follow-up, with "follow_up_subject" and
-    "follow_up_body" ready to send.
+    """Sent pitches with no reply yet (newest first), each with its next follow-up:
+    "follow_up_due", "follow_up_step", "follow_up_number"/"follow_up_total",
+    "follow_up_on" (date it's due) and, while there's one left, "follow_up_subject"
+    and "follow_up_body".
     """
     now = now or datetime.now(timezone.utc)
     with _worker_lock():
@@ -689,25 +759,49 @@ def get_awaiting_reply(now: datetime | None = None) -> list[dict[str, Any]]:
             sent_at = datetime.fromisoformat(str(record.get("sent_at")))
         except ValueError:
             continue
-        age = now - sent_at
-        if age > timedelta(days=AWAITING_REPLY_DAYS):
+        if now - sent_at > timedelta(days=AWAITING_REPLY_DAYS):
             continue
-        body = str(record.get("full_email_body") or "")
-        item = {
-            **record,
-            "follow_up_due": not record.get("followed_up_at") and age >= timedelta(days=FOLLOW_UP_AFTER_DAYS),
-        }
-        if item["follow_up_due"]:
-            item["follow_up_subject"] = f"Re: {record.get('subject') or subject_for(body)}"
-            item["follow_up_body"] = build_follow_up(
-                str(record.get("greeting_name") or record.get("channel_title") or ""),
-                video_title=str(record.get("video_title") or ""),
-                video_topic=topic_from_email(body),
-                drive_link=clip_link(record),
-            )
-        waiting.append(item)
+        waiting.append(_with_follow_up(record, now))
     waiting.sort(key=lambda item: str(item.get("sent_at")), reverse=True)
     return waiting
+
+
+REPLY_OUTCOMES = {
+    "yes": "Said yes",
+    "no": "Not interested",
+    "other": "Other reply",
+}
+REPLIES_SHOWN_DAYS = 60
+
+
+def get_replies(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Pitches that got a reply in the last REPLIES_SHOWN_DAYS (newest reply first).
+    "reply" is "yes", "no" or "other" (older replies, marked before round 25, are
+    "other"). A "yes" comes with "yes_reply_body": your email with the link and offer."""
+    now = now or datetime.now(timezone.utc)
+    with _worker_lock():
+        records = _pending_records()
+    replies: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("status") != "sent" or not record.get("replied_at"):
+            continue
+        try:
+            replied_at = datetime.fromisoformat(str(record["replied_at"]))
+        except ValueError:
+            continue
+        if now - replied_at > timedelta(days=REPLIES_SHOWN_DAYS):
+            continue
+        reply = str(record.get("reply") or "other")
+        item = {**record, "reply": reply if reply in REPLY_OUTCOMES else "other"}
+        if item["reply"] == "yes":
+            body = str(record.get("full_email_body") or "")
+            item["yes_reply_subject"] = f"Re: {record.get('subject') or subject_for(body)}"
+            item["yes_reply_body"] = build_yes_reply(
+                _first_name_of(record), clip_link(record), _clip_count_of(record), _content_format_of(record)
+            )
+        replies.append(item)
+    replies.sort(key=lambda item: str(item.get("replied_at")), reverse=True)
+    return replies
 
 
 def update_pending_draft(
@@ -814,13 +908,38 @@ def restore_passed_as_sent(record_id: str) -> bool:
 
 
 def mark_follow_up(record_id: str, outcome: str) -> bool:
-    """outcome: "followed_up" (second email sent) or "replied" (no follow-up needed)."""
-    field = {"followed_up": "followed_up_at", "replied": "replied_at"}[outcome]
+    """outcome: "followed_up" (the next follow-up was sent), "yes" / "no" / "other"
+    (they replied; "replied" is the same as "other"), or "client" (a "yes" became a
+    trial or a paying client)."""
+    if outcome not in {"followed_up", "replied", "client", *REPLY_OUTCOMES}:
+        raise KeyError(outcome)
+    now = datetime.now(timezone.utc).isoformat()
+    with _worker_lock():
+        records = _pending_records()
+        for record in records:
+            if record.get("record_id") != record_id or record.get("status") != "sent":
+                continue
+            if outcome == "followed_up":
+                record["follow_ups"] = _follow_ups_sent(record) + [now]
+                record.setdefault("followed_up_at", now)
+            elif outcome == "client":
+                record["client_at"] = now
+            else:
+                record["replied_at"] = now
+                record["reply"] = "other" if outcome == "replied" else outcome
+            _write_json_atomic(PENDING_OUTREACH_PATH, records)
+            return True
+    return False
+
+
+def undo_reply(record_id: str) -> bool:
+    """Marked a reply by mistake: back to "waiting for a reply"."""
     with _worker_lock():
         records = _pending_records()
         for record in records:
             if record.get("record_id") == record_id and record.get("status") == "sent":
-                record[field] = datetime.now(timezone.utc).isoformat()
+                for key in ("replied_at", "reply", "client_at"):
+                    record.pop(key, None)
                 _write_json_atomic(PENDING_OUTREACH_PATH, records)
                 return True
     return False
@@ -925,15 +1044,73 @@ def remove_pitch_clip(record_id: str, index: int) -> dict[str, Any]:
         if current is None:
             raise ValueError("This pitch isn't in the Outbox any more.")
         clips = current.get("clips")
+        removed: Any = None
         if isinstance(clips, list) and len(clips) >= index:
             # Kept for tuning: which clips you took out (their scores and framing).
-            current.setdefault("removed_clips", []).append(clips.pop(index - 1))
-        body, email_updated = set_clip_count(str(current.get("full_email_body") or ""), count - 1)
+            removed = clips.pop(index - 1)
+            current.setdefault("removed_clips", []).append(removed)
+        body = str(current.get("full_email_body") or "")
+        email_updated, named_clip_removed = False, False
+        facts = current.get("pitch") if isinstance(current.get("pitch"), dict) else None
+        if facts and isinstance(removed, dict) and _same_moment(removed.get("start"), facts.get("at")):
+            # The email names the moment you took out. If it's still the email the app
+            # wrote, it now names the best clip left; if you edited it, the app tells you.
+            unedited = body == _email_from_facts(current, facts, count)
+            if unedited:
+                _name_best_remaining(facts, clips if isinstance(clips, list) else [])
+                body, email_updated = _email_from_facts(current, facts, count - 1), True
+            else:
+                named_clip_removed = True
+        if not email_updated:
+            body, email_updated = set_clip_count(body, count - 1)
         current["full_email_body"] = body
         current["subject"] = set_subject_count(str(current.get("subject") or ""), count - 1)
         _write_json_atomic(PENDING_OUTREACH_PATH, pending)
     logger.info("Removed clip %d from the pitch for %s; %d left.", index, record.get("channel_title"), count - 1)
-    return {"count": count - 1, "email_updated": email_updated, "drive_failed": drive_failed}
+    return {
+        "count": count - 1,
+        "email_updated": email_updated,
+        "drive_failed": drive_failed,
+        "named_clip_removed": named_clip_removed,
+    }
+
+
+def _same_moment(first: Any, second: Any) -> bool:
+    try:
+        return abs(float(first) - float(second)) <= 1.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _email_from_facts(record: dict[str, Any], facts: dict[str, Any], count: int) -> str:
+    """The first email the app writes for this pitch, from its saved moment."""
+    at = facts.get("at")
+    return build_outreach_email(
+        str(record.get("channel_title") or ""),
+        video_title=str(record.get("video_title") or ""),
+        video_topic=str(facts.get("topic") or ""),
+        clip_count=count,
+        opening_at=float(at) if isinstance(at, (int, float)) else None,
+        key_point=str(facts.get("point") or ""),
+        greeting_name=greeting_name_of(str(record.get("full_email_body") or "")),
+        content_format=str(facts.get("format") or ""),
+        business=bool(facts.get("business")),
+    )
+
+
+def _name_best_remaining(facts: dict[str, Any], clips: list[Any]) -> None:
+    """Point the saved moment at the best clip left that has a point (by AI score);
+    with none, the email falls back to 'I watched your recent ...'."""
+    candidates = [clip for clip in clips if isinstance(clip, dict) and clip.get("point")]
+    best = max(candidates, key=lambda clip: clip.get("judge") or 0, default=None)
+    if best is None:
+        facts.update(at=None, point="", seconds=None)
+        return
+    try:
+        seconds = round(float(best["end"]) - float(best["start"]), 1)
+    except (KeyError, TypeError, ValueError):
+        seconds = None
+    facts.update(at=best.get("start"), point=str(best["point"]), seconds=seconds)
 
 
 # Why you passed on a pitch (Outbox buttons). Saved on the record so the lead
@@ -1603,6 +1780,7 @@ def _process_lead(
                 # is dropped for a low score; remove weak ones in the Outbox.
                 min_judge_score=FORCED_MIN_CLIP_SCORE if forced else MIN_CLIP_SCORE,
                 report=report,
+                business=bool(lead.get("business_offer")),
             )
         except WeakMoments as exc:
             raise NotAFit(f"weak moments: {exc}") from exc
@@ -1678,13 +1856,19 @@ def _process_lead(
                     "end": round(clip.end_time, 1),
                     "judge": score,
                     "layout": layout,
+                    **({"point": point} if point else {}),
                 }
-                for clip, score, layout in zip(
+                for clip, score, layout, point in zip(
                     clips,
                     report.get("judge_scores") or [None] * len(clips),
                     layouts or [None] * len(clips),
+                    report.get("clip_points") or [""] * len(clips),
                 )
             ],
+            # Round 25: the moment the email names, for follow-ups and LinkedIn messages.
+            **({"pitch": report["pitch_facts"]} if isinstance(report.get("pitch_facts"), dict) else {}),
+            **({"business_offer": lead["business_offer"]} if lead.get("business_offer") else {}),
+            **({"linkedin_url": lead["linkedin_url"]} if lead.get("linkedin_url") else {}),
             "subscriber_count": lead.get("subscriber_count"),
             "video_seconds": round(duration),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1888,7 +2072,8 @@ def _setup_logging() -> None:
 
 
 def _discover_leads(max_results: int) -> list[dict[str, Any]]:
-    queries = generate_search_queries(category="All", count=5)
+    # Round 25: B2B experts by default (LEAD_PROFILE=wide in .env: every niche).
+    queries = generate_search_queries(category="B2B" if lead_profile() == "b2b" else "All", count=5)
     leads = discover_channels(queries, max_results=max_results)
     set_youtube_quota_exhausted(False)
     return leads

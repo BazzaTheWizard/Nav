@@ -46,7 +46,7 @@ titles = [c.viral_title for c in clips]
 check("Best non-overlapping picks kept in rank order", titles == ["Best", "Second", "Third"], str(titles))
 check("Every pick is 30–60 s", all(30 <= c.end_time - c.start_time <= 60 for c in clips),
       str([round(c.end_time - c.start_time, 1) for c in clips]))
-check("Outreach email still produced", "Chan" in email)
+check("Outreach email still produced", "Want me to send them over?" in email)
 sent = {}
 A._request_openai = lambda key, prompt: (sent.update(json.loads(prompt)), json.dumps({"clips": cands, "channel_content_summary": "s", "specific_moment_reference": "m"}))[1]
 P.pick_clips_with_agent(words, duration, 3, "Chan", "Title", [(410.0, 420.0, 0.9)])

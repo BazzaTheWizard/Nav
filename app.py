@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import functools
+import json
 import logging
 import os
 import re
@@ -27,7 +28,9 @@ from autonomous_worker import (
     PASS_REASONS,
     clear_forceable_group,
     force_lead_to_queue,
+    REPLY_OUTCOMES,
     get_awaiting_reply,
+    get_replies,
     get_forceable_leads,
     get_cached_leads,
     get_recently_passed,
@@ -49,6 +52,7 @@ from autonomous_worker import (
     skip_queued_lead,
     start_worker,
     stop_worker,
+    undo_reply,
 )
 from config import load_settings
 from core.downloader import (
@@ -62,17 +66,19 @@ from core.downloader import (
 from core import series
 from core import long_video, quotes
 import core.downloader as youtube
-from core.lead_harvester import subscriber_range
+from core.lead_harvester import lead_profile, subscriber_range
 from core import webinar as webinar_defaults
 from core.clipper import MIN_CLIP_DURATION, rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
 from core.drive_uploader import replace_clip_in_drive, upload_clips_to_drive
 from core.outreach import (
     SUBJECT,
+    build_linkedin_messages,
     build_outreach_email,
     build_subject,
     fill_drive_link,
     greeting_name_of,
+    is_shared_inbox,
     set_greeting,
     subject_for,
 )
@@ -464,7 +470,7 @@ def _generate_outreach_pitch(
     )
 
 
-def _render_copy_email_button(email_body: str) -> None:
+def _render_copy_email_button(email_body: str, label: str = "📋 Copy email") -> None:
     encoded_email = base64.b64encode(email_body.encode("utf-8")).decode("ascii")
     st.iframe(
         f"""
@@ -472,7 +478,7 @@ def _render_copy_email_button(email_body: str) -> None:
         <button id="copy-email" aria-live="polite" style="width: 100%; height: 40px; cursor: pointer;
           border: 1px solid rgba(49, 51, 63, 0.2); border-radius: 8px; background: #fff;
           color: #31333f; font: 400 14px 'Source Sans Pro', 'Source Sans 3', sans-serif;">
-          📋 Copy email
+          {label}
         </button>
         <script>
           const bytes = Uint8Array.from(atob("{encoded_email}"), c => c.charCodeAt(0));
@@ -497,7 +503,7 @@ def _render_copy_email_button(email_body: str) -> None:
             }} catch (error) {{
               button.textContent = "Copy failed: select the text";
             }}
-            setTimeout(() => {{ button.textContent = "📋 Copy email"; }}, 2500);
+            setTimeout(() => {{ button.textContent = {json.dumps(label)}; }}, 2500);
           }});
         </script>
         """,
@@ -1018,9 +1024,14 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
                 key=name_key,
                 on_change=_on_greeting_change,
                 args=(record_id, name_key, body_key),
-                help="Who you're writing to, e.g. Marcela. The email opens with it: 'Marcela — I cut ...'. "
+                help="Who you're writing to, e.g. Marcela. The email opens with it: 'Hi Marcela,'. "
                 "Until you type one it says 'Hi there'.",
             )
+            if not str(st.session_state.get(name_key) or "").strip():
+                st.caption(
+                    "⚠️ No first name yet. 'Hi there' reads like a mass email: find the host's name "
+                    "on their About page, in the video, or on LinkedIn."
+                )
         with subject_column:
             st.text_input(
                 "Subject",
@@ -1063,6 +1074,36 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
                         st.warning("This pitch is no longer pending. Refresh the page.")
         with pass_column:
             _render_pass_menu(channel_id, f"skip_lead_{record_id}")
+        _render_linkedin_messages(record, str(st.session_state.get(name_key) or ""))
+
+
+def _render_linkedin_messages(record: dict[str, Any], first_name: str) -> None:
+    """The same pitch as three LinkedIn messages, for hosts who live on LinkedIn."""
+    facts = record.get("pitch") if isinstance(record.get("pitch"), dict) else {}
+    clips = [clip for clip in record.get("clips") or [] if isinstance(clip, dict)]
+    messages = build_linkedin_messages(
+        first_name,
+        short_topic=str(facts.get("short_topic") or ""),
+        key_point=str(facts.get("point") or ""),
+        clip_seconds=facts.get("seconds") if isinstance(facts.get("seconds"), (int, float)) else None,
+        clip_count=len(clips) or 3,
+        content_format=str(facts.get("format") or ""),
+        business=bool(facts.get("business") or record.get("business_offer")),
+    )
+    linkedin = str(record.get("linkedin_url") or "")
+    with st.expander("💼 LinkedIn messages (the same pitch, for hosts active on LinkedIn)"):
+        if linkedin:
+            st.link_button("Open their LinkedIn", linkedin, width="stretch")
+        st.caption("1. Connection note (fits the 200-character limit). Copy with the icon in the corner.")
+        st.code(messages["connect"], language=None, wrap_lines=True)
+        st.caption("2. Once they accept:")
+        st.code(messages["after_accept"], language=None, wrap_lines=True)
+        st.caption("3. After they say yes: send the clip file, then:")
+        st.code(messages["close"], language=None, wrap_lines=True)
+        st.caption(
+            "Sent it on LinkedIn instead of email? Still click **✅ Mark as Sent**, so the follow-ups "
+            "and numbers in 📨 Sent include it."
+        )
 
 
 def _render_pitch_clips(record: dict[str, Any]) -> None:
@@ -1315,8 +1356,13 @@ def _render_remove_clip(record: dict[str, Any], index: int, count: int) -> None:
         st.session_state.pop(f"poster_at_{record_id}_{number}", None)
     st.session_state[f"draft_refresh_{record_id}"] = True
     note = f"Clip {index} removed. {result['count']} clips left; the email and subject say {result['count']}."
-    if not result["email_updated"]:
-        note = f"Clip {index} removed. Your email doesn't use the usual 'I cut N highlight moments' line: check the number in it."
+    if result.get("named_clip_removed"):
+        note = (
+            f"Clip {index} removed. Your email still names that moment ('Your point at ...'): "
+            "change that line to one of the clips you kept."
+        )
+    elif not result["email_updated"]:
+        note = f"Clip {index} removed. You rewrote the email, so check the number of clips in it."
     if result["drive_failed"]:
         note += " The Drive backup couldn't be updated (their page is fine)."
     st.session_state[f"pitch_toast_{record_id}"] = note
@@ -1403,6 +1449,8 @@ def _render_contact(record: dict[str, Any]) -> None:
     contact = str(record.get("contact_email") or "")
     if "@" in contact and not contact.startswith(("http://", "https://")):
         st.markdown(f"✉️ [{contact}](mailto:{contact})")
+        if is_shared_inbox(contact):
+            st.caption("⚠️ A shared inbox (staff read it, or no one). The host's own email or LinkedIn works better.")
     else:
         st.caption("No email found yet: it's usually on their About page.")
     about = _about_url(record)
@@ -2297,6 +2345,9 @@ def _render_system() -> None:
             {"Setting": "EMPHASIS_INTENSITY", "Now": os.getenv("EMPHASIS_INTENSITY") or f"{caption_style()['emphasis']} (the caption style's default)"},
             {"Setting": "SOURCE_MAX_HEIGHT", "Now": video_format_sort()[0].removeprefix("res:") + "p"},
             {"Setting": "YouTube sign-in (YTDLP_COOKIES_*)", "Now": sign_in_summary()},
+            {"Setting": "LEAD_PROFILE", "Now": (
+                "b2b: experts who sell a service (LEAD_PROFILE=wide for every niche)"
+                if lead_profile() == "b2b" else "wide: every niche")},
             {"Setting": "Lead size (LEAD_MIN/MAX_SUBSCRIBERS)", "Now": "{:,}–{:,} subscribers".format(*subscriber_range())},
             {"Setting": "AUDIO_TARGET_LUFS", "Now": "off" if loudness is None else f"{loudness:g} LUFS"},
             {"Setting": "ALLOW_LOCAL_WHISPER", "Now": "on" if local_whisper_allowed() else "off (waits for Groq)"},
@@ -2460,49 +2511,151 @@ def _page_activity() -> dict[str, dict[str, Any]] | None:
 
 
 def _render_sent_pitches() -> None:
-    """Sent pitches waiting for a reply, with a short follow-up once due."""
+    """Sent pitches: the numbers, the replies, then each pitch's next follow-up."""
     try:
         waiting = get_awaiting_reply()
+        replies = get_replies()
     except Exception as exc:
         st.error(f"Could not load sent pitches: {exc}")
         return
+    records = waiting + replies
+    activity = _page_activity() if any(record.get("page_name") for record in records) else {}
+    if activity is None:
+        st.caption("Couldn't check who opened their clip page just now.")
+        activity = {}
+    if records:
+        _render_outreach_numbers(waiting, replies, activity)
+    if replies:
+        _render_replies(replies, activity)
     due_count = sum(1 for record in waiting if record.get("follow_up_due"))
     st.subheader(f"Sent: waiting for a reply ({len(waiting)})")
     if not waiting:
         st.caption(
-            "Pitches you mark as sent show up here, with a short follow-up after 4 days "
-            "without an answer."
+            "Pitches you mark as sent show up here, with follow-ups on day 3, 7 and 12 "
+            "(sent as replies in the same thread)."
         )
         return
     if due_count:
         st.caption(f"{due_count} follow-up(s) due.")
-    activity = _page_activity() if any(record.get("page_name") for record in waiting) else {}
-    if activity is None:
-        st.caption("Couldn't check who opened their clip page just now.")
-        activity = {}
-    for record in waiting:
-        record_id = str(record["record_id"])
-        title = str(record.get("channel_title") or "Creator")
-        with st.container(border=True):
-            label = " · follow-up due" if record.get("follow_up_due") else ""
-            st.markdown(f"**{title}** · sent {str(record.get('sent_at', ''))[:10]}{label}")
-            if record.get("page_name"):
-                st.caption(clip_pages.describe_activity(activity.get(str(record["page_name"]))))
-            if record.get("follow_up_due"):
-                st.text_input("Follow-up subject", value=record["follow_up_subject"], key=f"follow_subject_{record_id}")
-                st.text_area("Follow-up", value=record["follow_up_body"], height=180, key=f"follow_body_{record_id}")
-                _render_copy_email_button(record["follow_up_body"])
-            sent_col, replied_col = st.columns(2)
-            with sent_col:
-                if record.get("follow_up_due") and st.button(
-                    "Follow-up sent", key=f"followed_{record_id}", use_container_width=True
+    played_only = st.toggle(
+        "Only show who played a clip",
+        key="sent_played_only",
+        help="People who pressed play on their clip page have seen your work: follow up with them first.",
+    )
+    shown = [record for record in waiting if not played_only or _played(record, activity)]
+    shown.sort(key=lambda record: not record.get("follow_up_due"))  # due first; newest first within each
+    if played_only and not shown:
+        st.caption("No one waiting for a reply has played a clip yet.")
+    for record in shown:
+        _render_waiting_pitch(record, activity)
+
+
+def _played(record: dict[str, Any], activity: dict[str, dict[str, Any]]) -> bool:
+    page = activity.get(str(record.get("page_name") or ""))
+    return bool(page and page.get("played"))
+
+
+def _opened(record: dict[str, Any], activity: dict[str, dict[str, Any]]) -> bool:
+    page = activity.get(str(record.get("page_name") or ""))
+    return bool(page and (page.get("opens") or page.get("played") or page.get("downloaded")))
+
+
+def _render_outreach_numbers(
+    waiting: list[dict[str, Any]], replies: list[dict[str, Any]], activity: dict[str, dict[str, Any]]
+) -> None:
+    """The test's numbers: how many were sent, followed up, opened, played and answered."""
+    records = waiting + replies
+    followed = sum(
+        1 for record in records if record.get("follow_ups") or record.get("followed_up_at")
+    )
+    with_page = [record for record in records if record.get("page_name")]
+    yes = sum(1 for record in replies if record.get("reply") == "yes")
+    no = sum(1 for record in replies if record.get("reply") == "no")
+    clients = sum(1 for record in replies if record.get("client_at"))
+    sent_col, followed_col, opened_col, played_col, replies_col = st.columns(5)
+    sent_col.metric("Sent", len(records), border=True, help="Pitches sent in the last 30 days, plus replies from the last 60.")
+    followed_col.metric("Followed up", followed, border=True)
+    opened_col.metric(
+        "Opened their page", f"{sum(_opened(r, activity) for r in with_page)} / {len(with_page)}", border=True,
+        help="Your own previews and email link scanners count as opens too. Plays are the signal to trust.",
+    )
+    played_col.metric("Played a clip", f"{sum(_played(r, activity) for r in with_page)} / {len(with_page)}", border=True)
+    replies_col.metric(
+        "Replies", len(replies), border=True,
+        delta=f"{yes} yes · {no} no" + (f" · {clients} client{'s' if clients != 1 else ''}" if clients else ""),
+        delta_color="off", delta_arrow="off",
+    )
+    st.caption(
+        "Since round 25 the first email has no link, so a clip page only gets real visits after your "
+        "day-7 follow-up or your reply to a yes."
+    )
+
+
+def _render_replies(replies: list[dict[str, Any]], activity: dict[str, dict[str, Any]]) -> None:
+    """Who answered. A "yes" gets your reply (the link, then the offer) ready to copy."""
+    open_yes = sum(1 for record in replies if record.get("reply") == "yes" and not record.get("client_at"))
+    with st.expander(f"💬 Replies ({len(replies)})", expanded=bool(open_yes)):
+        for record in replies:
+            record_id = str(record["record_id"])
+            title = str(record.get("channel_title") or "Creator")
+            outcome = REPLY_OUTCOMES.get(str(record.get("reply")), "Other reply")
+            with st.container(border=True):
+                client = " · 🤝 trial or client" if record.get("client_at") else ""
+                st.markdown(f"**{title}** · {outcome} · {str(record.get('replied_at', ''))[:10]}{client}")
+                if record.get("page_name"):
+                    st.caption(clip_pages.describe_activity(activity.get(str(record["page_name"]))))
+                if record.get("reply") == "yes" and not record.get("client_at"):
+                    st.caption("Send them this as a reply in the same thread. The price is set in core/outreach.py.")
+                    st.text_input("Subject", value=record["yes_reply_subject"], key=f"yes_subject_{record_id}")
+                    st.text_area("Your reply", value=record["yes_reply_body"], height=300, key=f"yes_body_{record_id}")
+                    _render_copy_email_button(st.session_state.get(f"yes_body_{record_id}") or record["yes_reply_body"])
+                buttons = st.columns(2)
+                if record.get("reply") == "yes" and not record.get("client_at"):
+                    if buttons[0].button("🤝 They started a trial or signed", key=f"client_{record_id}", use_container_width=True):
+                        mark_follow_up(record_id, "client")
+                        st.rerun()
+                if buttons[1].button(
+                    "↩ Undo (back to waiting)", key=f"undo_reply_{record_id}", use_container_width=True,
+                    help="Marked the wrong button? This puts the pitch back in the waiting list.",
                 ):
-                    mark_follow_up(record_id, "followed_up")
+                    undo_reply(record_id)
                     st.rerun()
-            with replied_col:
-                if st.button("They replied", key=f"replied_{record_id}", use_container_width=True):
-                    mark_follow_up(record_id, "replied")
-                    st.rerun()
+
+
+def _render_waiting_pitch(record: dict[str, Any], activity: dict[str, dict[str, Any]]) -> None:
+    record_id = str(record["record_id"])
+    title = str(record.get("channel_title") or "Creator")
+    with st.container(border=True):
+        number, total = record.get("follow_up_number"), record.get("follow_up_total")
+        if record.get("follow_up_due"):
+            label = f" · follow-up {number} of {total} due"
+        elif record.get("follow_up_step"):
+            label = f" · follow-up {number} of {total} on {record.get('follow_up_on')}"
+        else:
+            label = " · all follow-ups sent"
+        st.markdown(f"**{title}** · sent {str(record.get('sent_at', ''))[:10]}{label}")
+        if record.get("page_name"):
+            st.caption(clip_pages.describe_activity(activity.get(str(record["page_name"]))))
+        if record.get("follow_up_due"):
+            st.caption(f"{record.get('follow_up_label')}. Send it as a reply in the same thread.")
+            st.text_input("Follow-up subject", value=record["follow_up_subject"], key=f"follow_subject_{record_id}")
+            st.text_area("Follow-up", value=record["follow_up_body"], height=180, key=f"follow_body_{record_id}")
+            _render_copy_email_button(st.session_state.get(f"follow_body_{record_id}") or record["follow_up_body"])
+        sent_col, yes_col, no_col, other_col = st.columns(4)
+        with sent_col:
+            if record.get("follow_up_due") and st.button(
+                "Follow-up sent", key=f"followed_{record_id}", use_container_width=True
+            ):
+                mark_follow_up(record_id, "followed_up")
+                st.rerun()
+        for column, outcome, label in (
+            (yes_col, "yes", "👍 Said yes"),
+            (no_col, "no", "👎 Not interested"),
+            (other_col, "other", "💬 Other reply"),
+        ):
+            if column.button(label, key=f"reply_{outcome}_{record_id}", use_container_width=True):
+                mark_follow_up(record_id, outcome)
+                st.rerun()
 
 
 if __name__ == "__main__":

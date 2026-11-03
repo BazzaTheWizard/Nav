@@ -18,7 +18,14 @@ from core import explainer
 from core.face_tracker import CropBox, CropPlan, _probe_display_size, analyze_crop_plan
 from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
-from core.outreach import build_outreach_email, build_subject, clean_format
+from core.outreach import (
+    build_outreach_email,
+    build_subject,
+    clean_format,
+    clean_key_point,
+    clean_short_topic,
+    clean_topic,
+)
 from core.service_pause import ServicePause
 from core.title_card import TitleOverlay, prepare_title_overlay, title_above_captions
 from core.transcriber import (
@@ -225,6 +232,7 @@ def pick_clips_with_agent(
     *,
     min_judge_score: int | None = None,
     report: dict[str, Any] | None = None,
+    business: bool = False,
 ) -> tuple[list[ClipResult], str, str]:
     """Gemini/OpenAI picks (ranked) + outreach email and subject, snapped like
     every other clip. Returns (clips, email, subject).
@@ -240,7 +248,10 @@ def pick_clips_with_agent(
     scored (JudgeUnavailable if the judge can't answer), so evenly spaced filler picks
     can never be sent unscored. Without the gate (the app), no judge answer means
     nothing is dropped. ``report`` (optional dict) receives
-    "judge_scores": one score (or None) per returned clip.
+    "judge_scores": one score (or None) per returned clip, "clip_points": the AI's
+    point for each returned clip, and "pitch_facts": the moment the email names
+    (time, point, topic, format), saved on the pitch for follow-ups and LinkedIn.
+    ``business``: the creator sells a service (B2B lead), so the email mentions LinkedIn.
     """
     result = select_clips_and_draft_pitch(
         transcript_segments=transcript_segments(words),
@@ -288,6 +299,17 @@ def pick_clips_with_agent(
     # (if the AI gave none, its opening words are quoted instead).
     best = max(clips, key=lambda clip: clip.virality_score)
     picked = _ai_pick_for(best, result["clips"])
+    if report is not None:
+        report["clip_points"] = [clean_key_point(_ai_pick_for(clip, result["clips"]).get("point")) for clip in clips]
+        report["pitch_facts"] = {
+            "at": round(best.start_time, 1),
+            "point": clean_key_point(picked.get("point")),
+            "seconds": round(best.end_time - best.start_time, 1),
+            "topic": clean_topic(result.get("video_topic")),
+            "short_topic": clean_short_topic(short_topic),
+            "format": clean_format(content_format),
+            "business": bool(business),
+        }
     email = build_outreach_email(
         channel_name,
         video_title=video_title,
@@ -300,6 +322,7 @@ def pick_clips_with_agent(
         greeting_name=str(result.get("host_first_name") or ""),
         usual_take=str(picked.get("usual_take") or ""),
         content_format=content_format,
+        business=business,
     )
     return clips, email, build_subject(short_topic, content_format, len(clips))
 

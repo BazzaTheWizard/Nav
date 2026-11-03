@@ -256,7 +256,7 @@ titles = [c.viral_title for c in clips]
 check("Final 3 never include the ad", "Ad" not in titles, str(titles))
 check("Final clips have no moment problems",
       all(H.moment_problem(H.clip_text(words, c.start_time, c.end_time)) is None for c in clips))
-check("Picker still returns 3 clips and an email", len(clips) == 3 and "Worth exploring?" in email)
+check("Picker still returns 3 clips and an email", len(clips) == 3 and "Want me to send them over?" in email)
 
 # Judge failing must not change anything versus no judge
 A._request_openai = lambda key, prompt, system_prompt=A._SYSTEM_PROMPT: (

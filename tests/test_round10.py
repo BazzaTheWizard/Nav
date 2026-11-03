@@ -41,27 +41,33 @@ report = {}
 clips, email, subject = P.pick_clips_with_agent(words, duration, 3, "Coach Dana", "Knee Pain Fixes", report=report)
 best = max(clips, key=lambda clip: clip.virality_score)
 check("Three clips, an email and a subject come back", len(clips) == 3 and email and subject)
-# Round 18: Barry's template names the channel, not a clip's point or time.
-check("Email is the round 18 template for this channel",
-      email.startswith("Dana — I cut 3 highlight moments from your recent Coach Dana upload into vertical 9:16 clips"), email[:120])
-check("No clip points or timestamps in it", best.viral_title == "Best" and "weak hips" not in email
-      and O.format_timestamp(best.start_time) not in email and "rest days" not in email and "warm-up" not in email)
+# Round 25: the email names the best clip's moment again (its time and point), no link.
+check("Email names the best clip's time and point (round 25)",
+      email.startswith(f"Hi Dana,\n\nYour point at {O.format_timestamp(best.start_time)} about knee pain coming from weak hips "),
+      email[:160])
+check("Only the best clip's point", best.viral_title == "Best" and "rest days" not in email and "warm-up" not in email)
+check("The moment is saved on the report for follow-ups and LinkedIn",
+      report["pitch_facts"]["point"] == "knee pain coming from weak hips"
+      and report["pitch_facts"]["at"] == round(best.start_time, 1) and report["pitch_facts"]["format"] == "episode"
+      and report["clip_points"][0] in {"knee pain coming from weak hips", "why rest days matter more than extra sets", "the one warm-up that actually helps"},
+      str(report.get("pitch_facts")))
 check("Podcast -> marked an episode (the clip page and subject use it)", report["format"] == "episode", str(report))
-check("Greets the host by first name", email.startswith("Dana — "))
+check("Greets the host by first name", email.startswith("Hi Dana,\n"))
 check("Subject names the topic", subject == "3 shorts from your knee pain episode", subject)
 check("Subject length is in the 36–50 target here", 36 <= len(subject) <= 50, str(len(subject)))
-check("Drive placeholder until the upload", O.DRIVE_LINK_PLACEHOLDER in email and DRIVE in O.fill_drive_link(email, DRIVE))
+check("No link or placeholder in the first email", O.DRIVE_LINK_PLACEHOLDER not in email and "://" not in email)
 
-# The best clip's point is missing: the email doesn't change (it never names a moment).
+# The best clip's point is missing: the email says what it watched instead.
 answer["clips"] = [dict(picks[0], point=""), *picks[1:]]
 _, email2, _ = P.pick_clips_with_agent(words, duration, 3, "Coach Dana", "Knee Pain Fixes")
-check("No point for the best clip -> same email", email2 == email)
+check("No point for the best clip -> 'I watched your recent episode'",
+      email2.startswith("Hi Dana,\n\nI watched your recent episode") and "Your point at" not in email2, email2[:120])
 
 # Solo upload, no topic: still a clean subject.
 answer.update(clips=picks, short_topic="", format="video")
 _, email3, subject3 = P.pick_clips_with_agent(words, duration, 3, "Coach Dana", "Knee Pain Fixes")
 check("Solo upload -> a plain subject",
-      "Worth exploring?" in email3 and subject3 == "3 shorts from your recent video", subject3)
+      "Want me to send them over?" in email3 and subject3 == "3 shorts from your recent video", subject3)
 
 # Matching a final clip back to the AI's pick when the title differs.
 moved = ClipResult(start_time=108.0, end_time=140.0, viral_title="Renamed", caption="", hashtags=[], virality_score=90)

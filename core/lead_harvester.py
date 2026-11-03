@@ -66,16 +66,39 @@ SEARCH_RECENT_DAYS = 45
 SEARCH_DURATIONS = ("long", "medium")  # YouTube: long = over 20 min, medium = 4-20 min
 
 
+# Round 25: which creators the worker looks for. "b2b" (the default): experts who sell
+# a service (a booking link, "work with me", consulting, coaching...), not
+# institutions, news, gaming, music or sports. "wide": every niche, as before.
+# Set LEAD_PROFILE=wide in .env to go back.
+LEAD_PROFILES = ("b2b", "wide")
+B2B_MIN_SUBSCRIBERS = 1_000  # B2B podcasts are often small; the business behind them matters more
+B2B_MAX_SUBSCRIBERS = 100_000
+
+
+def lead_profile() -> str:
+    """'b2b' (default) or 'wide', from LEAD_PROFILE in .env."""
+    value = os.getenv("LEAD_PROFILE", "").strip().lower()
+    return "wide" if value in {"wide", "all", "any", "off"} else "b2b"
+
+
+def default_subscriber_range() -> tuple[int, int]:
+    if lead_profile() == "b2b":
+        return B2B_MIN_SUBSCRIBERS, B2B_MAX_SUBSCRIBERS
+    return DEFAULT_MIN_SUBSCRIBERS, DEFAULT_MAX_SUBSCRIBERS
+
+
 def subscriber_range() -> tuple[int, int]:
-    """(min, max) subscribers for a lead: .env, else the defaults."""
+    """(min, max) subscribers for a lead: .env, else the lead profile's defaults."""
+    default_low, default_high = default_subscriber_range()
+
     def number(name: str, default: int) -> int:
         try:
             return max(0, int(str(os.getenv(name, "")).replace(",", "").replace("_", "") or default))
         except ValueError:
             return default
-    low = number("LEAD_MIN_SUBSCRIBERS", DEFAULT_MIN_SUBSCRIBERS)
-    high = number("LEAD_MAX_SUBSCRIBERS", DEFAULT_MAX_SUBSCRIBERS)
-    return (low, high) if low <= high else (DEFAULT_MIN_SUBSCRIBERS, DEFAULT_MAX_SUBSCRIBERS)
+    low = number("LEAD_MIN_SUBSCRIBERS", default_low)
+    high = number("LEAD_MAX_SUBSCRIBERS", default_high)
+    return (low, high) if low <= high else (default_low, default_high)
 
 
 def _in_range_now(check: dict[str, Any]) -> bool:
@@ -138,6 +161,11 @@ _CATEGORY_GUIDANCE = {
     ),
     "Niche Education": (
         "specialist educators, professional training, and practical niche tutorials"
+    ),
+    "B2B": (
+        "B2B founders, agency owners, consultants, coaches, fractional executives, "
+        "commercial real estate investors and keynote speakers who host interview podcasts "
+        "or long-form talks on sales, marketing, leadership, operations and investing"
     ),
 }
 
@@ -275,6 +303,81 @@ def _channel_contacts(description: str, video_descriptions: list[str] | None = N
     email = _best_email([description, *(video_descriptions or [])])
     social_links = list(dict.fromkeys(_URL_PATTERN.findall(description)))
     return email, social_links
+
+
+# --- Round 25: does the host sell something? -----------------------------------------
+_OFFER_HOSTS = (
+    "calendly.com", "cal.com/", "tidycal.com", "savvycal.com", "acuityscheduling.com",
+    "meetings.hubspot.com", "zcal.co", "youcanbook.me", "oncehub.com", "typeform.com",
+    "skool.com", "kajabi.com", "mykajabi.com", "teachable.com", "thinkific.com", "stan.store",
+    "podia.com", "systeme.io", "clickfunnels.com",
+)
+_OFFER_PHRASES = re.compile(
+    r"\b(?:book (?:a|your|an) (?:(?:free|quick|short|discovery|strategy|intro|introductory|\d+[- ]?min(?:ute)?) ){0,2}"
+    r"(?:call|consult\w*|session|meeting|demo)"
+    r"|(?:strategy|discovery|sales) call|free consultation|work with (?:me|us)|hire (?:me|us)"
+    r"|our services|done[- ]for[- ]you|mastermind|coaching program(?:me)?|1[:-]1 coaching"
+    r"|one[- ]on[- ]one coaching|consulting (?:services|firm|agency)|we help \w+"
+    r"|apply (?:now|here|to work)|free (?:audit|assessment)|speaking (?:inquiries|engagements)"
+    r"|book (?:me|us) to speak|keynote speaker|fractional (?:cfo|cmo|coo|cto|executive))\b",
+    re.IGNORECASE,
+)
+_INSTITUTION = re.compile(
+    r"\b(?:university|college|school district|high school|public schools?|institute of|department of"
+    r"|ministry of|government|county|city of|state of|public library|museum|hospital|health system"
+    r"|church|parish|diocese|newsroom|news network|official channel|tv network|radio station"
+    r"|federation|association of|society of|chamber of commerce|non-?profit|charity)\b",
+    re.IGNORECASE,
+)
+_NEWS_TITLE = re.compile(r"\bnews\b", re.IGNORECASE)
+# YouTube categories that aren't B2B experts: Film, Autos, Music, Pets, Sports, Gaming,
+# Comedy, News & Politics, Nonprofits.
+OFF_TOPIC_CATEGORY_IDS = frozenset({"1", "2", "10", "15", "17", "20", "23", "25", "29"})
+OFF_TOPIC_MAX_SHARE = 0.5
+
+
+def business_offer(description: str, video_descriptions: list[str] | None = None) -> list[str]:
+    """Signs that the host sells a service, from their channel and recent video
+    descriptions: booking links ('calendly.com') and phrases ('book a call',
+    'work with me'). Empty when there are none."""
+    found: list[str] = []
+    for text in [description, *(video_descriptions or [])[:6]]:
+        lower = str(text or "").lower()
+        for host in _OFFER_HOSTS:
+            label = host.rstrip("/")
+            if host in lower and label not in found:
+                found.append(label)
+        for match in _OFFER_PHRASES.finditer(lower):
+            phrase = " ".join(match.group(0).split())
+            if phrase not in found:
+                found.append(phrase)
+    return found[:5]
+
+
+def institution_match(title: str, description: str) -> str:
+    """The word that marks a channel as an institution or news outlet ('university',
+    'news'), or ''. Reads the title and the start of the description."""
+    match = _INSTITUTION.search(f"{title}\n{str(description or '')[:300]}")
+    if match:
+        return match.group(0).lower()
+    match = _NEWS_TITLE.search(title or "")
+    return match.group(0).lower() if match else ""
+
+
+def off_topic_share(videos: list[dict[str, Any]]) -> float:
+    """Share of the videos in a non-B2B YouTube category (gaming, music, sports...)."""
+    categories = [str((video.get("snippet") or {}).get("categoryId") or "") for video in videos]
+    categories = [category for category in categories if category]
+    if not categories:
+        return 0.0
+    return sum(category in OFF_TOPIC_CATEGORY_IDS for category in categories) / len(categories)
+
+
+def linkedin_url(links: list[str]) -> str:
+    """Their LinkedIn from the channel's links (a person's page before a company's)."""
+    people = [link for link in links if "linkedin.com/in/" in link.lower()]
+    companies = [link for link in links if "linkedin.com/company/" in link.lower()]
+    return (people or companies or [""])[0].rstrip(".,")
 
 
 def _is_quota_error(error: Exception) -> bool:
@@ -794,6 +897,7 @@ def discover_channels(
         raise ValueError("max_results must be between 1 and 50.")
 
     qualified: list[dict[str, Any]] = []
+    b2b = lead_profile() == "b2b"
     checks = _read_channel_checks()
     now = datetime.now(timezone.utc)
     low_subscribers, high_subscribers = subscriber_range()
@@ -988,6 +1092,22 @@ def discover_channels(
                     record(channel_id, "mostly_very_long_videos")
                     continue
 
+                snippet = channel.get("snippet") or {}
+                channel_description = str(snippet.get("description") or "")
+                video_descriptions = [str((video.get("snippet") or {}).get("description") or "") for video in recent_videos]
+                offer = business_offer(channel_description, video_descriptions)
+                if b2b:
+                    institution = institution_match(str(snippet.get("title") or candidate["channel_title"]), channel_description)
+                    if institution:
+                        record(channel_id, "institution_or_news", soft=False, matched=institution)
+                        continue
+                    if off_topic_share(recent_videos) > OFF_TOPIC_MAX_SHARE:
+                        record(channel_id, "off_topic_category")
+                        continue
+                    if not offer:
+                        record(channel_id, "no_business_offer")  # soft: they may add a booking link later
+                        continue
+
                 profile = profiles.get(channel_id) or {"status": "unknown", "summary": "Shorts: couldn't check"}
                 if needs_short_views(profile):
                     short_views = {
@@ -1015,12 +1135,8 @@ def discover_channels(
                     record(channel_id, "no_suitable_video")
                     continue
 
-                snippet = channel.get("snippet") or {}
                 channel_title = str(snippet.get("title") or candidate["channel_title"])
-                email, social_links = _channel_contacts(
-                    str(snippet.get("description") or ""),
-                    [str((video.get("snippet") or {}).get("description") or "") for video in recent_videos],
-                )
+                email, social_links = _channel_contacts(channel_description, video_descriptions)
                 channel_about_url = f"https://www.youtube.com/channel/{channel_id}/about"
                 target_snippet = target_video.get("snippet") or {}
                 target_seconds = _duration_seconds((target_video.get("contentDetails") or {}).get("duration"))
@@ -1045,6 +1161,8 @@ def discover_channels(
                         "shorts": profile,
                         "shorts_summary": str(profile["summary"]),
                         "priority": priority,
+                        "business_offer": offer,
+                        "linkedin_url": linkedin_url(social_links),
                     }
                 )
                 record(channel_id, "qualified", shorts=profile, priority=priority, has_email=bool(email))

@@ -152,7 +152,7 @@ judge_with([90, 85, 40, 30, 20, 10, 10, 10])
 report = {}
 clips, email, subject = P.pick_clips_with_agent(words, t, 3, "Chan", "Title", min_judge_score=60, report=report)
 check("Weak third clip dropped: 2 clips sent", len(clips) == 2 and report["judge_scores"] == [90, 85], str(report))
-check("Email and subject say two", "I cut 2 highlight moments" in email and subject.startswith("2 shorts"), subject)
+check("Email and subject say two", "I've already cut it, plus 1 more from the same video" in email and subject.startswith("2 shorts"), subject)
 judge_with([90, 40, 30, 20, 10, 10, 10, 10])
 try:
     P.pick_clips_with_agent(words, t, 3, "Chan", "Title", min_judge_score=60)

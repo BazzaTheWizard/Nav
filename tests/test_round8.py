@@ -105,15 +105,15 @@ check("...and its follow-up is due (passed 5 days ago)", due.get("s_recent", {})
 check("clean_first_name", (O.clean_first_name("marcela"), O.clean_first_name("Jean-Luc"), O.clean_first_name("Host"),
                            O.clean_first_name("Dr. Carl"), O.clean_first_name("")) == ("Marcela", "Jean-Luc", "", "", ""))
 named = O.build_outreach_email("Marcela Collier From HIC Parenting Education", "T", "t", DRIVE, greeting_name="Marcela")
-check("Greeting uses the first name when known", named.startswith("Marcela — I cut 3 highlight moments"))
-check("set_greeting swaps the name", O.set_greeting(body, "Marcela").startswith("Marcela — I cut") and O.greeting_name_of(O.set_greeting(body, "Marcela")) == "Marcela")
+check("Greeting uses the first name when known", named.startswith("Hi Marcela,\n"))
+check("set_greeting swaps the name", O.set_greeting(body, "Marcela").startswith("Hi Marcela,\n") and O.greeting_name_of(O.set_greeting(body, "Marcela")) == "Marcela")
 W._write_json_atomic(W.PENDING_OUTREACH_PATH, [
     {"record_id": "f1", "channel_title": "Long Channel Name", "greeting_name": "Sam", "drive_link": DRIVE, "full_email_body": named,
      "subject": O.SUBJECT, "status": "sent", "sent_at": (now - timedelta(days=5)).isoformat()},
 ])
-check("Follow-up greets the same first name", W.get_awaiting_reply()[0]["follow_up_body"].startswith("Hi Sam,\n"))
+check("Follow-up greets the same first name", W.get_awaiting_reply()[0]["follow_up_body"].startswith("Hi Sam, quick bump"))
 keep = O.rewrite_old_draft(O.set_greeting(O.build_outreach_email("C", "T", "t", DRIVE, key_point="the three habits that matter"), "Dana"), "C", DRIVE)
-check("Upgrading a draft keeps its greeting", keep.startswith("Dana — I cut 3 highlight moments"), keep[:160])
+check("Upgrading a draft keeps its greeting", keep.startswith("Hi Dana,\n"), keep[:160])
 check("Quote fallback doesn't claim the host said it", "you said" not in O.build_outreach_email("X", "T", "t", DRIVE, opening_line="Marcela, I try to take deep breaths now"))
 
 import core.agent_brain as A
@@ -122,10 +122,10 @@ segments = [{"start": float(i * 5), "end": float(i * 5 + 4.8), "text": f"Sentenc
 clips = [{"start_time": s, "end_time": s + 40, "hook_title": "h", "reason": "r"} for s in (100, 300, 600)]
 A._request_openai = lambda key, prompt, system_prompt=None: json.dumps({"clips": clips, "video_topic": "anger for parents", "host_first_name": "marcela"})
 result = A.select_clips_and_draft_pitch(segments, "Marcela Collier From HIC Parenting Education", "T")
-check("AI host name -> 'Marcela — I cut ...'", result["outreach_email"].startswith("Marcela — I cut") and result["host_first_name"] == "Marcela")
+check("AI host name -> 'Hi Marcela,'", result["outreach_email"].startswith("Hi Marcela,\n") and result["host_first_name"] == "Marcela")
 A._request_openai = lambda key, prompt, system_prompt=None: json.dumps({"clips": clips, "host_first_name": "Host"})
 check("Unclear name -> 'Hi there' (the channel name is in the next words)",
-      A.select_clips_and_draft_pitch(segments, "Chan", "T")["outreach_email"].startswith("Hi there — I cut 3 highlight moments from your recent Chan upload"))
+      A.select_clips_and_draft_pitch(segments, "Chan", "T")["outreach_email"].startswith("Hi there,\n\nI watched your recent video"))
 check("The AI is asked for the host's first name", '"host_first_name"' in A._SYSTEM_PROMPT)
 
 # ---------- App ----------
@@ -172,9 +172,10 @@ name_box = at.text_input(key="pending_name_p2")
 check("Name box starts empty when the email still says 'Hi there'", name_box.value == "", name_box.value)
 name_box.set_value("Marcela").run()
 check("Typing a first name updates the email and saves it",
-      at.text_area(key="pending_pitch_p2").value.startswith("Marcela — I cut")
-      and json.loads(W.PENDING_OUTREACH_PATH.read_text())[0]["full_email_body"].startswith("Marcela — I cut"))
-edited = at.text_area(key="pending_pitch_p2").value.replace("Worth exploring?", "Worth a quick chat?")
+      at.text_area(key="pending_pitch_p2").value.startswith("Hi Marcela,\n")
+      and json.loads(W.PENDING_OUTREACH_PATH.read_text())[0]["full_email_body"].startswith("Hi Marcela,\n"))
+edited = at.text_area(key="pending_pitch_p2").value.replace("Want me to send them over?", "Want them?")
+assert edited != at.text_area(key="pending_pitch_p2").value
 at.text_area(key="pending_pitch_p2").set_value(edited).run()
 check("Editing the email saves it", json.loads(W.PENDING_OUTREACH_PATH.read_text())[0]["full_email_body"] == edited)
 at.button(key="mark_sent_p2").click().run()

@@ -29,25 +29,25 @@ def check(name, cond, detail=""):
 DRIVE = "https://drive.google.com/drive/folders/abc123"
 SIGN_OFF = "Best,\nBarry Navan\nNav Studios | " + O.site_host()
 
-# --- the template (round 18: Barry's wording) ----------------------------------------------
+# --- the template (round 25: ask first, the link comes after a yes) ------------------------
 email = O.build_outreach_email(
     "Coach Dana", "How to Squat Pain-Free", "squatting pain-free with knee arthritis", DRIVE,
     opening_at=754.6, key_point="squatting below parallel being fine for healthy knees",
     usual_take="deep squats", content_format="episode", greeting_name="dana", shorts_status="lapsed",
 )
 expected = (
-    "Dana — I cut 3 highlight moments from your recent Coach Dana upload into vertical 9:16 clips with captions:\n\n"
-    f"{DRIVE}\n\n"
-    "They’re completely yours to post across Shorts, Reels, or TikTok—unwatermarked, no strings attached.\n\n"
-    "If you like how they perform, I’d love to produce your clips for the next week completely free "
-    "to help you drive more reach.\n\n"
-    "Worth exploring?\n\n"
+    "Hi Dana,\n\n"
+    "Your point at 12:34 about squatting below parallel being fine for healthy knees would make a strong "
+    "vertical clip for Shorts and Reels.\n\n"
+    "I've already cut it, plus 2 more from the same episode, captioned and ready to post. "
+    "Free, and yours to keep either way.\n\n"
+    "Want me to send them over?\n\n"
     + SIGN_OFF
 )
 check("Email matches the template exactly", email == expected, email)
 lower = email.lower()
 paragraphs = email.split("\n\n")
-check("Link on its own line", paragraphs[1] == DRIVE)
+check("No link in the first email (it goes in the reply to a yes)", DRIVE not in email and "://" not in email)
 check("Signature: Barry Navan, Nav Studios | site", email.endswith(SIGN_OFF) and "Barry Navan\nNav Studios | " in email)
 check("Signature shows the site without https:// or a slash", "https://" not in SIGN_OFF and not SIGN_OFF.endswith("/"))
 check("No claims the site doesn't make (retention, marketing)",
@@ -55,24 +55,30 @@ check("No claims the site doesn't make (retention, marketing)",
 check("No aspiring / student / beginner / entrepreneur wording",
       not any(word in lower for word in ("aspiring", "student", "beginner", "entrepreneur")))
 check("Phone number removed", "201-466" not in email)
-check("No first name yet -> 'Hi there —' (type the name in the Outbox)",
-      O.build_outreach_email("Coach Dana", drive_link=DRIVE).startswith(
-          "Hi there — I cut 3 highlight moments from your recent Coach Dana upload into"))
-check("Emoji left out of the channel name",
-      "your recent Leighton Grey - Grey Matter upload" in O.build_outreach_email("Leighton Grey - Grey Matter 🇨🇦", drive_link=DRIVE))
-check("No channel name -> 'your recent upload'", "from your recent upload into" in O.build_outreach_email("", drive_link=DRIVE))
+check("Under 80 words before the signature", len("\n\n".join(paragraphs[:-1]).split()) < 80)
+check("No first name yet -> 'Hi there,' (type the name in the Outbox)",
+      O.build_outreach_email("Coach Dana", drive_link=DRIVE).startswith("Hi there,\n\nI watched your recent video"))
+check("Channel names (emoji and all) stay out of the email",
+      "Leighton" not in O.build_outreach_email("Leighton Grey - Grey Matter 🇨🇦", drive_link=DRIVE))
+check("No topic or title -> 'your recent video'",
+      "I watched your recent video and cut 3 vertical clips" in O.build_outreach_email("", drive_link=DRIVE))
 no_link = O.build_outreach_email("Coach Dana", "How_to_Squat_Pain-Free.mp4", "", "")
-check("Before upload a placeholder marks the link", O.DRIVE_LINK_PLACEHOLDER in no_link)
-check("The link fills the placeholder", DRIVE in O.fill_drive_link(no_link, DRIVE) and O.DRIVE_LINK_PLACEHOLDER not in O.fill_drive_link(no_link, DRIVE))
+check("No point: the video title names it", 'your recent video "How to Squat Pain-Free" and cut 3' in no_link, no_link)
+check("No placeholder to fill any more", O.DRIVE_LINK_PLACEHOLDER not in no_link and O.fill_drive_link(no_link, DRIVE) == no_link)
 one = O.build_outreach_email("X", drive_link=DRIVE, clip_count=1)
-check("1 clip reads correctly",
-      "I cut 1 highlight moment from your recent X upload into a vertical 9:16 clip with captions:" in one
-      and "It’s completely yours to post" in one and "If you like how it performs," in one, one)
+check("1 clip reads correctly", "cut 1 vertical clip from it" in one and "Want me to send it over?" in one, one)
+one_point = O.build_outreach_email("X", clip_count=1, opening_at=5, key_point="three habits that matter most")
+check("1 clip with a point reads correctly", "I've already cut it, captioned" in one_point and "Want me to send it over?" in one_point)
 two = O.build_outreach_email("X", drive_link=DRIVE, clip_count=2)
-check("2 clips reads correctly", "I cut 2 highlight moments" in two and "They’re completely yours" in two and "how they perform" in two)
+check("2 clips reads correctly", "cut 2 vertical clips" in two and "send them over" in two)
+check("B2B creator: LinkedIn is named", ", on LinkedIn as much as Shorts." in O.build_outreach_email(
+    "X", opening_at=5, key_point="three habits that matter most", business=True))
 check("Greeting name read back from the email", O.greeting_name_of(email) == "Dana" and O.greeting_name_of(no_link) == "")
-check("Typing a name replaces 'Hi there'", O.set_greeting(no_link, "Marcela").startswith("Marcela — I cut 3 highlight moments"))
-check("...and replaces a name", O.set_greeting(email, "Sam").startswith("Sam — I cut") and O.set_greeting(email, " ") == email)
+check("Typing a name replaces 'Hi there'", O.set_greeting(no_link, "Marcela").startswith("Hi Marcela,\n\nI watched"))
+check("...and replaces a name", O.set_greeting(email, "Sam").startswith("Hi Sam,\n") and O.set_greeting(email, " ") == email)
+check("Round 18 'Dana — I cut' drafts still work",
+      O.set_greeting("Dana — I cut 3 highlight moments", "Sam") == "Sam — I cut 3 highlight moments"
+      and O.greeting_name_of("Dana — I cut 3") == "Dana" and O.greeting_name_of("Hi there — I cut 3") == "")
 check("Older 'Hi Dana,' drafts still work", O.set_greeting("Hi Dana,\n\nBody", "Sam") == "Hi Sam,\n\nBody"
       and O.greeting_name_of("Hi Dana,\n\nBody") == "Dana")
 check("Key point cleanup", O.clean_key_point("Your point about deep squats being safe.") == "deep squats being safe"
@@ -112,11 +118,12 @@ result = A.select_clips_and_draft_pitch(segments, "Coach Sam", "Squat Tips")
 check("AI path: subject from the short topic", result["subject"] == "3 shorts from your knee pain episode", result["subject"])
 check("AI path: each clip's point and usual take are kept (cleaned)",
       result["clips"][0]["point"] == "knee pain coming from weak hips" and result["clips"][0]["usual_take"] == "knee pain")
-check("AI path email is the new template",
-      "highlight moments from your recent Coach Sam upload into vertical 9:16 clips with captions:" in result["outreach_email"])
+check("AI path email is the new template (first draft, before the clips are final)",
+      "I watched your recent episode on fixing knee pain when squatting and cut 3 vertical clips" in result["outreach_email"],
+      result["outreach_email"][:160])
 A._request_openai = lambda key, prompt: json.dumps({"clips": [{k: v for k, v in c.items() if k not in ("point", "usual_take")} for c in clips]})
 result = A.select_clips_and_draft_pitch(segments, "Coach Sam", "Squat Tips")
-check("Missing topic no longer fails the lead", "Worth exploring?" in result["outreach_email"] and result["subject"] == O.SUBJECT)
+check("Missing topic no longer fails the lead", "Want me to send them over?" in result["outreach_email"] and result["subject"] == O.SUBJECT)
 check("Missing point/usual take -> empty, not an error", result["clips"][0]["point"] == "" and result["clips"][0]["usual_take"] == "")
 check("Prompt asks for the phrases, not an email",
       all(f'"{field}"' in A._SYSTEM_PROMPT for field in ("video_topic", "short_topic", "format", "point", "usual_take"))
@@ -156,14 +163,14 @@ W._write_json_atomic(W.PENDING_OUTREACH_PATH, [
 ])
 pending = W.get_pending_outreach()
 saved = json.loads(W.PENDING_OUTREACH_PATH.read_text())
-check("Very old unsent draft rewritten with the new email",
-      pending[0]["full_email_body"].startswith("Hi there — I cut 3 highlight moments from your recent Coach Dana upload")
-      and DRIVE in pending[0]["full_email_body"], pending[0]["full_email_body"][:200])
-check("…and it is saved, so it happens once", "Worth exploring?" in saved[0]["full_email_body"] and saved[0]["subject"] == O.SUBJECT)
+check("Very old unsent draft rewritten with the new email (no link: it's saved on the pitch)",
+      pending[0]["full_email_body"].startswith("Hi there,\n\nI watched your recent video and cut 3 vertical clips")
+      and DRIVE not in pending[0]["full_email_body"], pending[0]["full_email_body"][:200])
+check("…and it is saved, so it happens once", "Want me to send them over?" in saved[0]["full_email_body"] and saved[0]["subject"] == O.SUBJECT)
 upgraded = next(r for r in saved if r["record_id"] == "d")
-check("Round 10-17 draft in the Outbox: the new email, same name, clip count and page link",
-      upgraded["full_email_body"].startswith("Dana — I cut 2 highlight moments from your recent Coach Dana upload")
-      and PAGE in upgraded["full_email_body"] and DRIVE not in upgraded["full_email_body"], upgraded["full_email_body"][:160])
+check("Round 10-17 draft in the Outbox: the new email, same name and clip count",
+      upgraded["full_email_body"].startswith("Hi Dana,\n\nI watched your recent video and cut 2 vertical clips")
+      and PAGE not in upgraded["full_email_body"] and upgraded["page_url"] == PAGE, upgraded["full_email_body"][:160])
 check("…its subject keeps the topic, in the new style", upgraded["subject"] == "2 shorts from your knee pain episode"
       and upgraded["greeting_name"] == "Dana", upgraded["subject"])
 check("Sent emails are left exactly as they were", saved[1]["full_email_body"] == old_body)
@@ -191,9 +198,10 @@ record = W._process_lead(
      "latest_video_url": "https://www.youtube.com/watch?v=abc"},
     settings,
 )
-check("Worker draft gets the real Drive link", DRIVE in record["full_email_body"] and O.DRIVE_LINK_PLACEHOLDER not in record["full_email_body"])
+check("Worker saves the Drive link on the pitch, not in the first email",
+      record["drive_link"] == DRIVE and DRIVE not in record["full_email_body"] and O.DRIVE_LINK_PLACEHOLDER not in record["full_email_body"])
 check("Worker draft is the new email with its own subject and video title saved",
-      "Worth exploring?" in record["full_email_body"] and record["subject"] == "3 shorts from your knee pain video"
+      "Want me to send them over?" in record["full_email_body"] and record["subject"] == "3 shorts from your knee pain video"
       and record["video_title"] == "Knee Pain Fixes", record["subject"])
 
 # --- app fallback + Outbox --------------------------------------------------------------
@@ -201,7 +209,7 @@ import app  # noqa: E402
 
 pitch = app._generate_outreach_pitch("How to Squat Pain-Free.mp4", DRIVE, 3, "Coach Dana")
 check("App fallback email uses the same template",
-      "Worth exploring?" in pitch.body and DRIVE in pitch.body and pitch.subject == "3 shorts from your recent video")
+      "Want me to send them over?" in pitch.body and DRIVE not in pitch.body and pitch.subject == "3 shorts from your recent video")
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
@@ -210,7 +218,7 @@ check("App runs", not at.exception, str([e.value for e in at.exception]))
 outbox_bodies = [t.value for t in at.text_area if (t.key or "").startswith("pending_pitch_")]
 outbox_subjects = [t.value for t in at.text_input if (t.key or "").startswith("pending_subject_")]
 check("Outbox shows the new email and its subject line",
-      bool(outbox_bodies) and "Worth exploring?" in outbox_bodies[0]
+      bool(outbox_bodies) and "Want me to send them over?" in outbox_bodies[0]
       and outbox_subjects == ["3 shorts from your knee pain video"], str(outbox_subjects))
 
 print("\nAll checks passed." if not fails else f"\n{fails} check(s) failed.")

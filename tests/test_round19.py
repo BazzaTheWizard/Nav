@@ -22,7 +22,7 @@ from core import outreach as O  # noqa: E402
 # ---------- The email and subject follow the clip count ----------
 email = O.build_outreach_email("Coach Dana", drive_link="https://clips.navstudiolab.com/coach-dana-k7m2qx", greeting_name="Dana")
 two, found = O.set_clip_count(email, 2)
-check("Email: 'I cut 2 highlight moments', the rest unchanged",
+check("Email: 'cut 2 vertical clips', the rest unchanged",
       found and two == O.build_outreach_email("Coach Dana", drive_link="https://clips.navstudiolab.com/coach-dana-k7m2qx",
                                                greeting_name="Dana", clip_count=2))
 one, _ = O.set_clip_count(email, 1)
@@ -211,8 +211,8 @@ result = W.remove_pitch_clip("a", 2)
 record = json.loads(W.PENDING_OUTREACH_PATH.read_text())[0]
 check("Outbox: their page and Drive are told 'clip 2 of 3'", calls == [("page", NAME, 2, 3), ("drive", 2, 3)], str(calls))
 check("Outbox: 2 clips left, and the email and subject say 2",
-      result == {"count": 2, "email_updated": True, "drive_failed": False}
-      and "I cut 2 highlight moments" in record["full_email_body"] and record["subject"] == "2 shorts from your knee pain video")
+      result == {"count": 2, "email_updated": True, "drive_failed": False, "named_clip_removed": False}
+      and "cut 2 vertical clips" in record["full_email_body"] and record["subject"] == "2 shorts from your knee pain video")
 check("Outbox: the record keeps clips 1 and 3, and notes the removed one (for tuning)",
       [c["start"] for c in record["clips"]] == [100.0, 300.0] and record["removed_clips"][0]["judge"] == 64)
 check("Outbox: this Mac's files match", [c["start"] for c in PF.load_pitch.__wrapped__("a")["clips"]] == [100.0, 300.0]
@@ -234,7 +234,7 @@ try:
 except RuntimeError:
     rec = json.loads(W.PENDING_OUTREACH_PATH.read_text())[0]
     check("Outbox: the page can't be changed -> nothing on this Mac changes (try again)",
-          len(rec["clips"]) == 3 and "I cut 3" in rec["full_email_body"]
+          len(rec["clips"]) == 3 and "cut 3 vertical clips" in rec["full_email_body"]
           and len(json.loads((pitches / "b" / "pitch.json").read_text())["clips"]) == 3)
 W.clip_pages.remove_clip = lambda name, index, count: count - 1
 def drive_down(*a):
@@ -347,7 +347,7 @@ check("Each clip has a Remove clip confirm button", all(any(b.key == f"remove_cl
 next(b for b in at.button if b.key == "remove_clip_p9_2").click().run()
 check("After removing: 2 clips, and the email and subject boxes say 2",
       next(t for t in at.text_input if t.key == "pending_subject_p9").value == "2 shorts from your knee pain video"
-      and "I cut 2 highlight moments" in next(t for t in at.text_area if t.key == "pending_pitch_p9").value
+      and "cut 2 vertical clips" in next(t for t in at.text_area if t.key == "pending_pitch_p9").value
       and not any(b.key == "remove_clip_p9_3" for b in at.button))
 check("...a pop-up says so", any("Clip 2 removed" in t.value for t in at.toast))
 check("...and with 2 left, Remove is off (Pass the creator to send fewer)",

@@ -23,10 +23,10 @@ DRIVE = "https://drive.google.com/drive/folders/abc123"
 email = O.build_outreach_email("Coach Dana", "Knee Pain Fixes", "fixing knee pain when squatting", DRIVE,
                                key_point="squatting below parallel being fine for healthy knees", shorts_status="none")
 body = email.split("\n\n", 1)[1].rsplit("\n\nBest,", 1)[0]
-check("Ends on one interest question", body.endswith("Worth exploring?") and body.count("?") == 1)
-check("No-strings line", "unwatermarked, no strings attached." in body)
-check("Drive link is the only link", email.count("http") == 1 and DRIVE in email)
-check("Round 18 offer: a free week of clips", "produce your clips for the next week completely free" in body)
+check("Ends on one question", body.endswith("Want me to send them over?") and body.count("?") == 1)
+check("Free, no-strings line", "Free, and yours to keep either way." in body)
+check("No link in the first email (round 25)", "http" not in email and DRIVE not in email)
+check("No offer in the first email (it's in the reply to a yes)", "next week" not in body and "$" not in body)
 check("The AI is asked for a key point", '"key_point"' in __import__("core.agent_brain", fromlist=["x"])._SYSTEM_PROMPT)
 # Round 10: the template no longer mentions their Shorts habits, for any status.
 check("No 'aren't posting' line for any Shorts status", not any(
@@ -44,10 +44,10 @@ softer = ('Hi Coach,\n\nI run Nav Studios, a small editing studio that turns lon
 check("Round 5 'marketing agency' draft is recognised", O.is_old_template(marketing))
 check("Round 5 softer draft is recognised", O.is_old_template(softer))
 redone = O.rewrite_old_draft(marketing, "Tristan", "https://drive.google.com/x")
-check("Rewrite gives the current email for that channel",
-      redone.startswith("Hi there — I cut 3 highlight moments from your recent Tristan upload"), redone[:300])
-check("Rewrite puts the Drive link in", "https://drive.google.com/x" in redone)
-check("Rewrite of the softer draft is the current email too", "Worth exploring?" in O.rewrite_old_draft(softer, "Coach", "https://drive.google.com/x"))
+check("Rewrite gives the current email",
+      redone.startswith("Hi there,\n\nI watched your recent video and cut 3 vertical clips"), redone[:300])
+check("Rewrite keeps the link out of the first email", "https://drive.google.com/x" not in redone)
+check("Rewrite of the softer draft is the current email too", "Want me to send them over?" in O.rewrite_old_draft(softer, "Coach", "https://drive.google.com/x"))
 check("New email is not seen as old", not O.is_old_template(redone) and not O.is_old_template(email))
 
 # ---------- Website address: one line, unsent drafts follow it ----------
@@ -94,7 +94,8 @@ ids = [w["record_id"] for w in waiting]
 check("Waiting list: sent, no reply, last 30 days, newest first", ids == ["fresh", "due", "followed"], str(ids))
 by_id = {w["record_id"]: w for w in waiting}
 check("Follow-up due only after 4 days and only once", by_id["due"]["follow_up_due"] and not by_id["fresh"]["follow_up_due"] and not by_id["followed"]["follow_up_due"])
-check("Due item has a 'Re:' follow-up with the Drive link", by_id["due"]["follow_up_subject"] == "Re: " + O.SUBJECT and DRIVE in by_id["due"]["follow_up_body"])
+check("Due item has a 'Re:' follow-up: the short bump (the link comes on day 7)",
+      by_id["due"]["follow_up_subject"] == "Re: " + O.SUBJECT and by_id["due"]["follow_up_step"] == "bump" and DRIVE not in by_id["due"]["follow_up_body"])
 W.mark_follow_up("fresh", "replied")
 check("'They replied' removes it from the list", "fresh" not in [w["record_id"] for w in W.get_awaiting_reply()])
 
@@ -121,8 +122,8 @@ wrapper = tmp / "run_app.py"; wrapper.write_text(script)
 at = AppTest.from_file(str(wrapper), default_timeout=120).run()
 check("App runs", not at.exception, str([e.value for e in at.exception]))
 keys = {t.key: t.value for t in at.text_area if t.key}
-check("Outbox card shows the email", "Worth exploring?" in keys.get("pending_pitch_draft", ""), str(list(keys)))
-check("Waiting section shows the follow-up", "Open to having me do this" in keys.get("follow_body_due", "") and DRIVE in keys.get("follow_body_due", ""))
+check("Outbox card shows the email", "Want me to send them over?" in keys.get("pending_pitch_draft", ""), str(list(keys)))
+check("Waiting section shows the follow-up (day 3: the short bump)", "quick bump on this" in keys.get("follow_body_due", ""))
 check("Waiting section heading", any("Sent: waiting for a reply (1)" in str(h.value) for h in at.subheader))
 
 # ---------- Framing: full-frame shots inside a cropped clip ----------

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(ROOT))
 os.environ["NAV_NO_CLIP_PAGES"] = "1"
+os.environ["LEAD_PROFILE"] = "wide"  # round 25: these checks are about the wide (every niche) defaults
 for name in ("LEAD_MIN_SUBSCRIBERS", "LEAD_MAX_SUBSCRIBERS"):
     os.environ.pop(name, None)  # your .env must not change what these tests expect
 

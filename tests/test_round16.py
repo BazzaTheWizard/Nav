@@ -189,7 +189,8 @@ lead = {"channel_id": "UC1", "channel_title": "Coach Dana", "latest_video_title"
         "latest_video_url": "https://www.youtube.com/watch?v=abc"}
 
 record = W._process_lead(dict(lead), settings)
-check("Worker: the email links to the clip page", record["page_url"] in record["full_email_body"] and DRIVE not in record["full_email_body"]
+check("Worker: the pitch keeps the clip page link (round 25: not in the first email)",
+      record["page_url"] not in record["full_email_body"] and DRIVE not in record["full_email_body"]
       and record["page_url"].startswith("https://clips.navstudiolab.com/coach-dana-"), record["page_url"])
 # Round 17: with pages set up, Drive is only a backup, so it's not checked before the download.
 check("Worker: Drive still gets a backup copy", record["drive_link"] == DRIVE and drive_calls == ["upload"], str(drive_calls))
@@ -199,13 +200,13 @@ os.environ["DRIVE_BACKUP"] = "off"
 drive_calls.clear()
 record2 = W._process_lead(dict(lead, channel_id="UC2"), settings)
 check("DRIVE_BACKUP=off: no Drive check or upload, page link only", drive_calls == [] and record2["drive_link"] == ""
-      and record2["page_url"] in record2["full_email_body"])
+      and W.clip_link(record2) == record2["page_url"])
 
 real_publish = C.publish_page
 C.publish_page = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("R2 down"))
 os.environ["DRIVE_BACKUP"] = "on"
 record3 = W._process_lead(dict(lead, channel_id="UC3"), settings)
-check("Page fails -> the email uses the Drive link", record3["page_url"] is None and DRIVE in record3["full_email_body"])
+check("Page fails -> the pitch uses the Drive link", record3["page_url"] is None and W.clip_link(record3) == DRIVE)
 os.environ["DRIVE_BACKUP"] = "off"
 try:
     W._process_lead(dict(lead, channel_id="UC4"), settings)
@@ -233,7 +234,17 @@ for r in pending:
         r["status"], r["sent_at"] = "sent", (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
 W._write_json_atomic(W.PENDING_OUTREACH_PATH, pending)
 waiting = [r for r in W.get_awaiting_reply() if r["record_id"] == record["record_id"]]
-check("Follow-up email links to the page", waiting and waiting[0]["follow_up_due"] and record["page_url"] in waiting[0]["follow_up_body"])
+check("Day 3+: the first follow-up is a short bump, no link",
+      waiting and waiting[0]["follow_up_due"] and waiting[0]["follow_up_step"] == "bump" and "://" not in waiting[0]["follow_up_body"])
+W.mark_follow_up(record["record_id"], "followed_up")
+pending = json.loads(W.PENDING_OUTREACH_PATH.read_text())
+for r in pending:
+    if r["record_id"] == record["record_id"]:
+        r["sent_at"] = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+W._write_json_atomic(W.PENDING_OUTREACH_PATH, pending)
+waiting = [r for r in W.get_awaiting_reply() if r["record_id"] == record["record_id"]]
+check("Day 7+: the second follow-up links to the page", waiting and waiting[0]["follow_up_due"]
+      and waiting[0]["follow_up_step"] == "show" and record["page_url"] in waiting[0]["follow_up_body"])
 W.skip_lead("UC2", pass_reason=next(iter(W.PASS_REASONS)))
 check("Pass keeps the page for now ('Passed recently' can still restore it)",
       any(k.startswith(record2["page_name"] + "/") for k in r2.objects)

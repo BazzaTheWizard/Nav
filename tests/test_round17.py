@@ -270,13 +270,13 @@ record = W._process_lead(dict(lead), settings)
 check("The retry reuses it: no audio extraction, no Groq call", "groq" not in calls and "audio" not in calls, str(calls))
 check("...and drops it once the pitch is made", not transcript_file.exists())
 check("Clip page first; a Drive failure doesn't block the pitch",
-      record["page_url"] == PAGE and PAGE in record["full_email_body"] and record["drive_link"] == "")
+      record["page_url"] == PAGE and W.clip_link(record) == PAGE and record["drive_link"] == "")
 check("With pages set up, Drive isn't checked before the download", "drive check" not in calls, str(calls))
 
 W._write_json_atomic(W.PENDING_OUTREACH_PATH, [])
 calls.clear(); drive["fail"] = False; page_state["fail"] = True
 record = W._process_lead(dict(lead, channel_id="UC2"), settings)
-check("Page fails -> the Drive link is used", record["page_url"] is None and "drive.google.com" in record["full_email_body"])
+check("Page fails -> the Drive link is used", record["page_url"] is None and "drive.google.com" in W.clip_link(record))
 drive["fail"] = True
 try:
     W._process_lead(dict(lead, channel_id="UC3"), settings)
