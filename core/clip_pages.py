@@ -172,14 +172,17 @@ def publish_page(
     video_title: str,
     clips: list[dict[str, Any]],
     kind: str = "video",
+    slug: str = "",
 ) -> tuple[str, str]:
     """Upload a pitch's clips and make its page. ``clips``: [{"path", "start", "end"}]
     in order. Returns (page name, page address). The page appears only once every
-    file is up (page.json goes last)."""
+    file is up (page.json goes last). ``slug``: words for the address instead of the
+    channel name (round 26, Make clips); a random end is always added, so two pages
+    never share an address."""
     if not 1 <= len(clips) <= 9:
         raise ValueError("A clip page needs 1 to 9 clips.")
     settings, client = _require()
-    name = make_page_name(channel_title)
+    name = make_page_name(slug.strip() or channel_title)
     try:
         for index, clip in enumerate(clips, start=1):
             _upload_clip(client, settings, name, index, Path(clip["path"]))
@@ -199,6 +202,40 @@ def publish_page(
         _delete_prefixes(client, settings, [f"{name}/"])
         raise
     return name, page_url(name, settings)
+
+
+# --- Pages published from 🎬 Make clips (round 26) -----------------------------------
+# The worker's pages are kept on their pitch records; these are kept here, so the app
+# can list them with what each visitor did (the same page_activity() as the worker's).
+MANUAL_PAGES_PATH = Path(__file__).resolve().parents[1] / "storage" / "manual_pages.json"
+
+
+def manual_pages() -> list[dict[str, Any]]:
+    """Pages you published from Make clips, newest first."""
+    try:
+        pages = json.loads(MANUAL_PAGES_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    pages = [page for page in pages if isinstance(page, dict) and page.get("page_name")]
+    return sorted(pages, key=lambda page: str(page.get("created_at")), reverse=True)
+
+
+def record_manual_page(name: str, url: str, channel_title: str, video_title: str, clip_count: int) -> dict[str, Any]:
+    """Save a page published from Make clips (storage/manual_pages.json)."""
+    entry = {
+        "page_name": name,
+        "page_url": url,
+        "channel_title": channel_title,
+        "video_title": video_title,
+        "clips": clip_count,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    pages = [page for page in manual_pages() if page.get("page_name") != name]
+    MANUAL_PAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = MANUAL_PAGES_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps([entry, *pages], indent=2), encoding="utf-8")
+    temporary.replace(MANUAL_PAGES_PATH)
+    return entry
 
 
 def replace_clip(

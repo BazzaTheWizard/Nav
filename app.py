@@ -582,6 +582,7 @@ def _discard_generated_clips() -> None:
 
     for key in (
         "generated_clips",
+        "published_page",
         "clip_paths",
         "active_clip_run_id",
         "clip_render_contexts",
@@ -1573,6 +1574,7 @@ def _render_clip_generator() -> None:
             local_path=local_path,
         )
     _render_generated_clips()
+    _render_manual_pages()
 
 
 def _webinar_controls(prefix: str = "") -> tuple[str, dict[str, str]]:
@@ -1684,6 +1686,7 @@ def _make_clips(
             title_fade_in=not instant_title,
         )
         st.session_state["generated_clips"] = generated
+        st.session_state.pop("published_page", None)  # new clips: a new page
         st.session_state["clip_paths"] = [str(item[0].expanduser().resolve()) for item in generated]
         if generated:
             st.session_state["outreach_input_path"] = str(input_path)
@@ -2173,6 +2176,8 @@ def _render_generated_clips() -> None:
                         st.markdown(" ".join(f"#{tag.lstrip('#')}" for tag in clip.hashtags))
             _render_trim_form(index, clip_path, clip, generated_clips, settings)
 
+    _render_publish_page(generated_clips)
+
     if st.session_state.get("drive_folder_link"):
         st.info("These clips are in Google Drive. Discarding only removes the copies on this Mac.")
     approve_column, discard_column = st.columns(2)
@@ -2210,6 +2215,91 @@ def _render_generated_clips() -> None:
             _render_copy_email_button(st.session_state.get("outreach_email_body", ""))
             if not drive_folder_link:
                 st.caption("The Drive link is added after you upload the clips.")
+
+
+def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
+    """🌐 Publish the clips to a client preview page: the same R2 page as the worker's
+    pitches, with the same open/play/download tracking."""
+    st.subheader("🌐 Client preview page")
+    if not clip_pages.configured():
+        st.caption("Clip pages aren't set up (R2 settings in .env). Setup: claude_review/round16/README.md")
+        return
+    published = st.session_state.get("published_page")
+    if published:
+        st.success(f"Published: {published['page_url']}", icon="🌐")
+        copy_column, open_column = st.columns(2)
+        with copy_column:
+            _render_copy_email_button(published["page_url"], label="📋 Copy Preview Link")
+        with open_column:
+            st.link_button("Open the page", published["page_url"], width="stretch")
+        st.caption(
+            "Opens, plays and downloads show under 'Published preview pages' below. "
+            "Trimmed a clip after publishing? Publish again for a new page."
+        )
+        if st.button("Publish again (new address)", key="publish_again"):
+            st.session_state.pop("published_page", None)
+            st.rerun()
+        return
+    clips = [
+        {"path": str(Path(path).expanduser().resolve()), "start": clip.start_time, "end": clip.end_time}
+        for path, clip in generated_clips
+        if Path(path).expanduser().is_file()
+    ][:9]
+    channel_default = str(
+        st.session_state.get("agent_channel_name") or st.session_state.get("outreach_channel_override") or ""
+    )
+    title_default = str(
+        st.session_state.get("agent_video_title") or st.session_state.get("outreach_title_override") or ""
+    )
+    with st.form("publish_page_form", border=False):
+        name_column, title_column = st.columns(2)
+        channel = name_column.text_input("Client / channel name", value=channel_default)
+        title = title_column.text_input("Episode title", value=title_default)
+        slug = st.text_input(
+            "Custom slug / prospect name (optional)",
+            placeholder="e.g. dana-growth",
+            help="Words for the address. A random 6-character end is always added, so no one can guess "
+            "another page's address and no page is ever overwritten. Empty: the channel name is used.",
+        )
+        episode = st.toggle("Podcast or interview (the page says 'episode')", value=True)
+        publish = st.form_submit_button(
+            "🌐 Publish to Client Preview Page", type="primary", use_container_width=True, disabled=not clips,
+        )
+    if not publish:
+        return
+    if not channel.strip():
+        st.error("Add the client or channel name first: the page greets them by it.")
+        return
+    with st.spinner(f"Uploading {len(clips)} clip(s) and making the page…"):
+        try:
+            name, url = clip_pages.publish_page(
+                channel.strip(), title.strip(), clips, kind="episode" if episode else "video", slug=slug,
+            )
+            entry = clip_pages.record_manual_page(name, url, channel.strip(), title.strip(), len(clips))
+        except Exception as exc:
+            logging.exception("Could not publish the clip page")
+            st.error(f"Couldn't publish the page: {exc}")
+            return
+    st.session_state["published_page"] = entry
+    st.rerun()
+
+
+def _render_manual_pages() -> None:
+    """Pages published from Make clips, with what each visitor did."""
+    pages = clip_pages.manual_pages() if clip_pages.configured() else []
+    if not pages:
+        return
+    activity = _page_activity()
+    with st.expander(f"🌐 Published preview pages ({len(pages)})"):
+        if activity is None:
+            st.caption("Couldn't check who opened them just now.")
+            activity = {}
+        for page in pages[:30]:
+            st.markdown(
+                f"**{page.get('channel_title') or 'Clips'}** · {str(page.get('created_at', ''))[:10]} · "
+                f"[{page['page_url']}]({page['page_url']})"
+            )
+            st.caption(clip_pages.describe_activity(activity.get(str(page["page_name"]))))
 
 
 def _clip_key(path: str | Path) -> str:
