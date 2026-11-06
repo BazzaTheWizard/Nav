@@ -299,7 +299,7 @@ wrapper.write_text(textwrap.dedent(f"""
     P.pick_clips_with_agent = lambda *a, **k: ([ClipResult(start_time=10.0 * i, end_time=10.0 * i + 30, viral_title=f"Clip {{i}}",
                                                 caption="why", hashtags=[], virality_score=90) for i in (1, 2, 3)], "email", "subject")
     def render(source, clip, words, settings, output, **kw):
-        note("render", title=clip.viral_title, **kw)
+        note("render", title=clip.viral_title, **{{k: v for k, v in kw.items() if k != "graphics"}})
         Path(output).parent.mkdir(parents=True, exist_ok=True); Path(output).write_bytes(b"clip")
         return P.RenderedClip(path=Path(output), clip=clip, layout_mode=kw.get("layout_mode"), crop=CropBox(0, 0, 2, 2),
                               crop_plan=None, webinar="LAYOUT" if kw.get("layout_mode") == "webinar" else None)

@@ -27,6 +27,8 @@ class Settings:
     hook_title_style: str = "light"
     # Colour the word being spoken inside each caption card.
     caption_highlight: bool = True
+    # Round 28: the graphics director adds each clip's graphics automatically.
+    auto_graphics: bool = True
 
 
 def _float_env(name: str, default: float) -> float:
@@ -54,6 +56,7 @@ def load_settings() -> Settings:
         hook_title_style=os.getenv("HOOK_TITLE_STYLE", "light").strip().lower() or "light",
         caption_highlight=os.getenv("CAPTION_HIGHLIGHT", "1").strip().lower()
         not in {"0", "false", "no", "off"},
+        auto_graphics=os.getenv("AUTO_GRAPHICS", "1").strip().lower() not in {"0", "false", "no", "off"},
     )
     for directory in (settings.raw_dir, settings.temp_dir, settings.output_dir):
         directory.mkdir(parents=True, exist_ok=True)

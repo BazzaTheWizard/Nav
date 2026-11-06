@@ -228,7 +228,7 @@ email = O.build_outreach_email("Coach Dana", "Knee Pain Fixes", "fixing knee pai
 pick_args = {}
 def good_pick(*a, **k):
     pick_args["peaks"] = a[5] if len(a) > 5 else k.get("peaks"); return picked, email, "3 Shorts"
-def render(source, clips_, job_dir, settings, words_, layouts_out=None, rendered_out=None):
+def render(source, clips_, job_dir, settings, words_, layouts_out=None, rendered_out=None, graphics=None):
     paths = [job_dir / f"clip_{i:02d}.mp4" for i in range(1, len(clips_) + 1)]
     for path in paths:
         path.write_bytes(b"clip")

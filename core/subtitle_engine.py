@@ -278,14 +278,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     # After the spoken word: back to the plain style (keeping the soft edge).
     restore = f"{{\\r{blur}}}"
 
-    def add_event(start_cs: int, end_cs: int, text: str, style: str = "ShortForm", layer: int = 0) -> None:
+    def add_event(start_cs: int, end_cs: int, text: str, style: str = "ShortForm", layer: int = 0,
+                  line_start_cs: int | None = None) -> None:
         middle = (start_cs + end_cs) / 2
+        # A caption line keeps one position until it ends: one that starts under the title
+        # stays there (it never jumps up mid-line when the title leaves).
+        under = (start_cs if line_start_cs is None else line_start_cs) < title_until_cs
         if style == "ShortForm":
             text = soften + text
             if caption_top is not None:
-                text = (under_title if start_cs < title_until_cs else f"{{\\an8\\pos(540,{caption_top})}}") + text
+                text = (under_title if under else f"{{\\an8\\pos(540,{caption_top})}}") + text
             elif any(a <= middle < b for a, b in seams):
-                text = (under_title if start_cs < title_until_cs else SEAM_POSITION) + text
+                text = (under_title if under else SEAM_POSITION) + text
         if end_cs > start_cs:
             events.append(
                 f"Dialogue: {layer},{_ass_time(start_cs / 100)},"
@@ -335,7 +339,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     f"{{\\c{HIGHLIGHT_COLOUR}{pulse}}}{token}{restore}" if i == word_index else token
                     for i, token in enumerate(tokens)
                 )
-                add_event(boundaries[word_index], boundaries[word_index + 1], text)
+                add_event(boundaries[word_index], boundaries[word_index + 1], text, line_start_cs=event_start_cs)
         previous_end_cs = event_end_cs
 
     destination = Path(output_path)

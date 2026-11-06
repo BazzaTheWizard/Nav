@@ -79,7 +79,7 @@ except ValueError:
 
 # ---------- Re-render a trim (render faked: checks what it's asked to do) ----------
 asked = {}
-def fake_render(source, clip, words, settings, output, *, layout_mode, work_dir):
+def fake_render(source, clip, words, settings, output, *, layout_mode, work_dir, graphics=None):
     asked.update(source=source, start=clip.start_time, end=clip.end_time, title=clip.viral_title, layout=layout_mode,
                  first_word=words[0], n=len(words))
     output.write_bytes(rendered_clip.read_bytes())
@@ -174,7 +174,7 @@ W.transcribe_audio = lambda audio, settings: words
 W._video_duration = lambda path: 120.0
 W.video_info_and_peaks = lambda url: ({}, [])
 W.pick_clips_with_agent = lambda *a, **k: ([clip], O.build_outreach_email("Dana", "Ep", "knees"), "3 Shorts from your knee video")
-def fake_render_clips(source, clips, job_dir, settings, words, layouts_out=None, rendered_out=None):
+def fake_render_clips(source, clips, job_dir, settings, words, layouts_out=None, rendered_out=None, graphics=None):
     out = job_dir / "clip_01.mp4"; out.write_bytes(rendered_clip.read_bytes())
     layouts_out.append("smart_crop"); rendered_out.append(SimpleNamespace(path=out, clip=clip, layout_mode="smart_crop"))
     return [out]

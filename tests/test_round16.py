@@ -178,7 +178,7 @@ def episode_pick(*a, **k):
     k["report"]["format"] = "episode"  # what pick_clips_with_agent reports for a podcast (round 18)
     return picked, O.build_outreach_email("Coach Dana", "Knee Pain Fixes", "fixing knee pain", content_format="episode"), "3 shorts"
 W.pick_clips_with_agent = episode_pick
-def fake_render(source, clips_, job_dir, settings, words, layouts_out=None, rendered_out=None):
+def fake_render(source, clips_, job_dir, settings, words, layouts_out=None, rendered_out=None, graphics=None):
     paths = []
     for i, clip in enumerate(clips_, start=1):
         out = job_dir / f"clip_{i:02d}.mp4"; out.write_bytes(clips[i - 1]["path"].read_bytes()); paths.append(out)

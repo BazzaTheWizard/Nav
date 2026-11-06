@@ -66,10 +66,10 @@ from core.downloader import (
     video_format_sort,
 )
 from core import series
-from core import long_video, quotes
-import core.downloader as youtube
+from core import long_video
 from core.lead_harvester import lead_profile, subscriber_range
 from core.card_checks import LIMITS as CARD_LIMITS, check_edit
+from core.graphics_director import VideoInfo
 from core.cards import CANVAS as CARD_CANVAS, MIN_CONTRAST, contrast
 from core.dynamic_layout import render_with_cards
 from core.edl import (
@@ -129,7 +129,6 @@ from core.storage_manager import (
     storage_usage_bytes,
 )
 from core.transcriber import (
-    Word,
     local_whisper_allowed,
     transcribe_audio,
     youtube_video_id,
@@ -428,11 +427,14 @@ def _get_video_metadata(
 ) -> tuple[str, str, list[tuple[float, float, float]]]:
     """Title, channel and YouTube "Most replayed" peaks (empty for local files)."""
     source_value = str(input_path)
+    st.session_state["agent_video_description"] = ""
     if not source_value.startswith(("http://", "https://")):
         title = video_title_override.strip() or Path(input_path).stem
         return title, channel_name_override.strip() or "your channel", []
 
     metadata, peaks = video_info_and_peaks(source_value)
+    # Round 28: the graphics director takes the guest's name card only from the title or this.
+    st.session_state["agent_video_description"] = str(metadata.get("description") or "")
     title = video_title_override.strip() or metadata.get("title")
     channel = channel_name_override.strip() or metadata.get("channel")
     if not isinstance(title, str) or not title.strip():
@@ -602,7 +604,7 @@ def _discard_generated_clips() -> None:
         "generated_clips",
         "published_page",
         "card_drafts",
-        "card_clips",
+        "cards_changed",
         "clip_paths",
         "active_clip_run_id",
         "clip_render_contexts",
@@ -813,6 +815,10 @@ def _generate_clips(
 
         rendered_by_index: dict[int, tuple[Path, ClipResult]] = {}
         render_contexts: dict[str, dict[str, object]] = {}
+        graphics_drafts: dict[str, list[dict[str, Any]]] = {}
+        # Read here: the renders run in threads, which can't read the session.
+        video_info = VideoInfo(title=str(video_title or ""), channel=str(resolved_channel_name or ""),
+                               description=str(st.session_state.get("agent_video_description") or ""))
 
         st.write("**Step 4 of 4: Rendering selected clips**")
 
@@ -833,10 +839,12 @@ def _generate_clips(
                     webinar_options=webinar_options,
                     title_fade_in=title_fade_in,
                     allow_explainer=layout_mode == "auto",
+                    graphics=video_info,
                 )
             except Exception:
                 output_path.unlink(missing_ok=True)
                 raise
+            graphics_drafts[_clip_key(result.path)] = [asdict(card) for card in result.graphics.cards] if result.graphics else []
             render_contexts[_clip_key(result.path)] = {
                 "source_path": str(source_video),
                 "words": words,
@@ -849,6 +857,7 @@ def _generate_clips(
                 "start_time": clip.start_time,
                 "end_time": clip.end_time,
                 "source_duration": duration,
+                "graphics_notes": list(result.graphics_notes),
             }
             return result.path, clip
 
@@ -886,6 +895,7 @@ def _generate_clips(
             rendered_by_index[index] for index in sorted(rendered_by_index)
         ]
         st.session_state["clip_render_contexts"] = render_contexts
+        st.session_state["card_drafts"] = graphics_drafts
         st.session_state["clip_source_path"] = str(source_video)
         st.session_state["active_clip_run_id"] = run_id
         return rendered_clips
@@ -943,6 +953,7 @@ def main() -> None:
         _render_recently_passed()
     with pipeline_tab:
         _render_pipeline(pending)
+        _render_manual_pages()  # at the very bottom: out of the way of making clips
     with clips_tab:
         _render_clip_generator()
     with system_tab:
@@ -1502,8 +1513,6 @@ def _render_pipeline(pending: list[dict[str, Any]]) -> None:
 CLIP_MODES = {
     "🎯 Highlights": "highlights",
     "🎞️ Series: the whole video in order": "series",
-    "🧾 Finish a long video": "finish",
-    "✂️ Quote grabber": "quote",
 }
 PATH_PLACEHOLDER = "/Users/you/Movies/My video.mp4"
 PATH_HELP = (
@@ -1526,24 +1535,16 @@ def _render_clip_generator() -> None:
         "Make clips from any YouTube link or video file, outside the worker. Nothing here is "
         "tracked as a pitch: the worker's pitches are in the 📬 Outbox."
     )
-    pending_mode = st.session_state.pop("clip_mode_pending", None)
-    if pending_mode in CLIP_MODES:  # "🎯 Make Shorts from it" after finishing a long video
-        st.session_state["clip_mode"] = pending_mode
+    if st.session_state.get("clip_mode") not in CLIP_MODES:
+        st.session_state["clip_mode"] = next(iter(CLIP_MODES))
     mode = st.radio(
         "Mode", list(CLIP_MODES), key="clip_mode", horizontal=True,
-        help="Highlights: the AI picks the best moments (3 to 7). Series: Part 1, Part 2, Part 3… "
-        "covering the whole video in order, one batch of 3 at a time. Finish a long video: clean "
-        "sound, a captions file, chapters and title ideas for your own long video. Quote grabber: "
-        "one exact line from a podcast as a 16:9 clip for your slides.",
+        help="Highlights: the AI picks the best moments (3 to 7), with graphics added where a number "
+        "carries the point. Series: Part 1, Part 2, Part 3… covering the whole video in order, one "
+        "batch of 3 at a time.",
     )
     if CLIP_MODES[mode] == "series":
         _render_series_maker()
-        return
-    if CLIP_MODES[mode] == "finish":
-        _render_long_video_finisher()
-        return
-    if CLIP_MODES[mode] == "quote":
-        _render_quote_grabber()
         return
     st.session_state.setdefault("clip_count", HIGHLIGHT_COUNTS[0])
     st.session_state.setdefault("cap_59", True)
@@ -1594,7 +1595,6 @@ def _render_clip_generator() -> None:
             local_path=local_path,
         )
     _render_generated_clips()
-    _render_manual_pages()
 
 
 def _webinar_controls(prefix: str = "") -> tuple[str, dict[str, str]]:
@@ -1707,8 +1707,7 @@ def _make_clips(
         )
         st.session_state["generated_clips"] = generated
         st.session_state.pop("published_page", None)  # new clips: a new page
-        st.session_state.pop("card_drafts", None)
-        st.session_state.pop("card_clips", None)
+        st.session_state.pop("cards_changed", None)
         st.session_state["clip_paths"] = [str(item[0].expanduser().resolve()) for item in generated]
         if generated:
             st.session_state["outreach_input_path"] = str(input_path)
@@ -1735,202 +1734,6 @@ def _local_video(text: str) -> Path:
     if path.suffix.lower() not in {".mp4", ".mov", ".m4v"}:
         raise ValueError("The file must be an MP4, MOV or M4V video.")
     return path.resolve()
-
-
-# --- 🧾 Finish a long video (Make clips) ------------------------------------------------------
-def _render_long_video_finisher() -> None:
-    st.caption(
-        "For your own long video (a Keynote or Canva export with your narration): the same video "
-        "with clean, even sound (the picture isn't touched), a captions file for YouTube, and drafted "
-        "chapters and title ideas. Then make the Shorts from it in one click."
-    )
-    upload = st.file_uploader("Upload the video", type=["mp4", "mov", "m4v"], key="finish_upload")
-    path_text = st.text_input("Or its path on this Mac", key="finish_path", placeholder=PATH_PLACEHOLDER, help=PATH_HELP)
-    if st.button("🧾 Finish it", type="primary", key="finish_go"):
-        _finish_long_video(upload, path_text)
-    result = st.session_state.get("finish_result")
-    if not result:
-        return
-    st.success(f"Saved in {result['folder']}", icon="✅")
-    for problem in result["problems"]:
-        st.warning(problem)
-    st.markdown(f"**Video:** `{result['video']}`")
-    files = st.columns(2)
-    files[0].download_button("⬇ Captions file (.srt)", Path(result["captions"]).read_bytes(),
-                             file_name=Path(result["captions"]).name, key="finish_srt", width="stretch")
-    files[1].download_button("⬇ Chapters and titles (.txt)", Path(result["notes"]).read_bytes(),
-                             file_name=Path(result["notes"]).name, key="finish_notes", width="stretch")
-    if result["titles"]:
-        st.markdown("**Title ideas** (test them with Test & Compare in YouTube Studio):")
-        for number, title in enumerate(result["titles"], start=1):
-            st.markdown(f"{number}. {title}")
-    if result["chapters"]:
-        st.text_area("Chapters: paste into the description", result["chapters"], height=180, key="finish_chapters_text")
-    if st.button("🎯 Make Shorts from it", key="finish_to_shorts", width="stretch",
-                 help="Opens Highlights with this file, 5 clips and Auto layout (explainer for slide videos)."):
-        st.session_state["clip_mode_pending"] = "🎯 Highlights"
-        st.session_state["video_path_input"] = result["video"]
-        st.session_state["video_url_input"] = ""
-        st.session_state["clip_count"] = 5
-        st.session_state["crop_mode"] = next(iter(LAYOUT_LABELS))
-        st.rerun()
-
-
-def _finish_long_video(upload: Any, path_text: str) -> None:
-    if (upload is not None) == bool(path_text.strip()):
-        st.error("Give one uploaded file or one file path.")
-        return
-    settings = load_settings()
-    settings.temp_dir.mkdir(parents=True, exist_ok=True)
-    uploaded: Path | None = None
-    audio_path = settings.temp_dir / f"finish_{uuid.uuid4().hex}.wav"
-    try:
-        if upload is not None:
-            source = settings.temp_dir / Path(upload.name).name
-            source.write_bytes(upload.getbuffer())
-            uploaded = source
-        else:
-            source = _local_video(path_text)
-        with st.status("Finishing the video…", expanded=True) as status:
-            duration = _video_duration(source)
-            fingerprint = long_video.file_fingerprint(source)
-            words = long_video.load_file_transcript(fingerprint)
-            if words is None:
-                st.write("Transcribing with Groq…")
-                extract_audio_only(source, audio_path)
-                words = transcribe_audio(audio_path, settings)
-                long_video.save_file_transcript(fingerprint, words)
-            else:
-                st.write("Reusing this file's saved transcript (no Groq call).")
-            st.write("Cleaning up the sound, writing captions, drafting chapters and titles…")
-            folder = render_output_dir() / "Long videos" / _slug(source.stem.removesuffix(" (finished)"))
-            finished = long_video.finish_long_video(source, folder, words, duration)
-            # The finished file has the same words at the same times: no Groq call for the Shorts.
-            long_video.save_file_transcript(long_video.file_fingerprint(finished.video), words)
-            status.update(label="Finished", state="complete")
-        st.session_state["finish_result"] = {
-            "folder": str(folder), "video": str(finished.video), "captions": str(finished.captions),
-            "notes": str(finished.notes), "titles": finished.titles,
-            "chapters": long_video.chapters_text(finished.chapters), "problems": finished.problems,
-        }
-    except Exception as exc:
-        logging.exception("Finishing the long video failed")
-        st.error(f"Couldn't finish it: {exc}")
-    finally:
-        audio_path.unlink(missing_ok=True)
-        if uploaded is not None:
-            uploaded.unlink(missing_ok=True)
-
-
-# --- ✂️ Quote grabber (Make clips) --------------------------------------------------------------
-def _render_quote_grabber() -> None:
-    st.caption(
-        "One exact line from a podcast or interview, as a 16:9 clip to put on a slide. Search its "
-        "captions, then only that part is downloaded and transcribed. Keep quotes short (under 15 s) "
-        "and credit the show on the slide."
-    )
-    url = st.text_input("YouTube link", key="quote_url", placeholder="https://www.youtube.com/watch?v=...").strip()
-    info = st.session_state.get("quote_info")
-    if info and info.get("url") != url:
-        for key in ("quote_info", "quote_section", "quote_saved"):
-            st.session_state.pop(key, None)
-        info = None
-    if url and info is None and st.button("🔎 Read its captions", key="quote_find"):
-        try:
-            with st.spinner("Reading the captions (nothing is downloaded)…"):
-                details, lines = youtube.fetch_captions(url)
-        except Exception as exc:
-            logging.exception("Could not read the captions")
-            st.error(f"Couldn't read this video: {exc}" + (f"\n\n{exc.hint}" if getattr(exc, "hint", "") else ""))
-            return
-        info = {"url": url, **details, "lines": [list(line) for line in lines]}
-        st.session_state["quote_info"] = info
-    if not info:
-        return
-    st.markdown(f"**{info.get('title') or 'Video'}** · {info.get('channel') or ''}")
-    lines = [tuple(line) for line in info["lines"]]
-    picked: tuple[float, float] | None = None
-    if lines:
-        query = st.text_input("Search the captions", key="quote_query", placeholder="a few words of the line")
-        found = quotes.search_captions(lines, query) if query.strip() else []
-        if query.strip() and not found:
-            st.info("No caption line has all of those words. Try fewer or different words, or type the time below.")
-        if found:
-            labels = [f"{long_video.timestamp(start)} · {text[:110]}" for start, _end, text in found]
-            choice = st.radio("Lines found", labels, key="quote_pick")
-            start, end, _text = found[labels.index(choice)]
-            picked = (start, end)
-    else:
-        st.info("This video has no English captions. Type the time of the line instead (from YouTube's player).")
-    time_text = st.text_input("Or the time in the video (mm:ss)", key="quote_time", placeholder="12:05")
-    if time_text.strip():
-        seconds = quotes.parse_time(time_text)
-        if seconds is None:
-            st.error("Write the time as mm:ss (or h:mm:ss), like 12:05.")
-        else:
-            picked = (seconds, seconds + 10.0)
-    if picked and st.button("⬇ Get this part", key="quote_get", type="primary"):
-        _grab_quote_section(info, picked)
-    section = st.session_state.get("quote_section")
-    if not section:
-        return
-    words = [Word(*row) for row in section["words"]]
-    if not words:
-        st.warning("No speech was found in that part. Pick another line or time.")
-        return
-    labels = [f"{long_video.timestamp(section['start'] + w.start)} {w.text}" for w in words]
-    first, last = section["pick"]
-    chosen = st.select_slider("The quote: drag to its first and last word", options=list(range(len(words))),
-                              value=(first, last), format_func=lambda i: labels[i], key="quote_words")
-    a, b = chosen
-    length = words[b].end - words[a].start + quotes.PRE_ROLL + quotes.POST_ROLL
-    st.markdown(f"> {' '.join(w.text for w in words[a:b + 1])}")
-    st.caption(f"{length:.1f} s" + (" · long for a quote: under 15 s keeps it a quote" if length > 15 else ""))
-    if st.button("✂️ Save quote", key="quote_save", type="primary"):
-        name = f"{_slug(str(info.get('title') or 'quote'))[:40]}-{long_video.timestamp(section['start'] + words[a].start).replace(':', '')}.mp4"
-        try:
-            with st.spinner("Cutting the quote…"):
-                saved = quotes.cut_quote(Path(section["path"]), words[a].start, words[b].end, render_output_dir() / "Quotes" / name)
-        except Exception as exc:
-            logging.exception("Could not cut the quote")
-            st.error(f"Couldn't cut it: {exc}")
-            return
-        st.session_state["quote_saved"] = str(saved)
-    saved = st.session_state.get("quote_saved")
-    if saved and Path(saved).is_file():
-        st.success(f"Saved to {saved}", icon="✅")
-        st.video(saved)
-        st.download_button("⬇ Download the quote", Path(saved).read_bytes(), file_name=Path(saved).name, key="quote_download")
-
-
-def _grab_quote_section(info: dict[str, Any], picked: tuple[float, float]) -> None:
-    settings = load_settings()
-    settings.temp_dir.mkdir(parents=True, exist_ok=True)
-    start, end = quotes.section_for(picked[0], picked[1], info.get("duration"))
-    section = settings.temp_dir / f"quote_{uuid.uuid4().hex}.mp4"
-    audio = section.with_suffix(".wav")
-    try:
-        with st.spinner(f"Downloading {end - start:.0f} s and transcribing them…"):
-            youtube.download_section(info["url"], start, end, section)
-            extract_audio_only(section, audio)
-            words = transcribe_audio(audio, settings)
-    except Exception as exc:
-        logging.exception("Could not get the quote's part")
-        section.unlink(missing_ok=True)
-        st.error(f"Couldn't get that part: {exc}" + (f"\n\n{exc.hint}" if getattr(exc, "hint", "") else ""))
-        return
-    finally:
-        audio.unlink(missing_ok=True)
-    old = st.session_state.get("quote_section")
-    if old:
-        Path(old["path"]).unlink(missing_ok=True)
-    first, last = quotes.words_near(words, picked[0] - start, picked[1] - start)
-    st.session_state["quote_section"] = {
-        "path": str(section), "start": start, "end": end,
-        "words": [[w.text, w.start, w.end] for w in words], "pick": (first, last),
-    }
-    st.session_state.pop("quote_words", None)
-    st.session_state.pop("quote_saved", None)
 
 
 # --- 🎞️ Series mode (Make clips): Part 1, 2, 3… in order -------------------------------------
@@ -2277,12 +2080,6 @@ CARD_ROWS = {"kinetic_range": 1, "buckets": 3, "timeline": 3, "metric_bars": 3, 
 NAME_CARD_SECONDS = 3.3
 
 
-def _card_clip_path(path: str | Path) -> Path | None:
-    """The version of this clip with graphics, if you made one."""
-    made = st.session_state.get("card_clips", {}).get(_clip_key(path))
-    return Path(made) if made and Path(made).is_file() else None
-
-
 def _render_brand_kit() -> None:
     brand = load_brand_kit()
     with st.expander(f"🎨 Accent color: {brand.accent}"):
@@ -2372,16 +2169,76 @@ def _new_card(template: str, key: str, clip: Any, spans: list[tuple[float, float
                 rows=rows, source=source.strip(), data_path=data_path)
 
 
+def _render_clip_version(
+    clip: Any, context: dict[str, Any], drafts: list[dict[str, Any]], output: Path, settings: Any
+) -> tuple[Path, list[str]]:
+    """Render the clip (its saved framing, ``clip``'s start and end) with these graphics,
+    or plain when there are none. Returns (the new file, graphics left out and why)."""
+    words = context["words"]
+    clip_words = [w for w in words if clip.start_time <= float(w.start) < clip.end_time]
+    cached_crop = context.get("crop")
+    work_dir = settings.temp_dir / "graphics" / output.stem
+
+    def render(kept_words: list[Any], destination: Path, pin: bool) -> Path:
+        return Path(rerender_clip(
+            source_path=str(context["source_path"]), new_start=clip.start_time, new_end=clip.end_time,
+            transcript_words=kept_words, output_path=destination,
+            cached_crop_x=cached_crop.x if isinstance(cached_crop, CropBox) else None,
+            cached_crop=cached_crop if isinstance(cached_crop, CropBox) else None,
+            layout_mode=str(context["layout_mode"]), source_duration=context.get("source_duration"),
+            crop_plan=context.get("crop_plan"), hook_title=clip.viral_title, hook_seconds=settings.hook_title_seconds,
+            highlight_active_word=settings.caption_highlight, pin_title=pin, webinar=context.get("webinar"),
+            title_fade_in=bool(context.get("title_fade_in", True)),
+        ))
+
+    problems: list[str] = []
+    if drafts:
+        edit = ClipEdit(start=clip.start_time, end=clip.end_time, cards=[Card(**draft) for draft in drafts],
+                        brand=load_brand_kit())
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            # The title shows for the opening only, so it never sits under a graphic.
+            made, checks = render_with_cards(
+                Path(context["source_path"]), edit, clip_words, output, work_dir,
+                lambda kept: render(kept, work_dir / "base.mp4", False),
+                hook_seconds=settings.hook_title_seconds,
+            )
+            problems = [f"Graphic {n + 1}: {e}" for n, c in enumerate(checks) for e in c.errors]
+            if made is not None:
+                return Path(made), problems
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+    return render(words, output, bool(context.get("pin_title"))), problems
+
+
+def _swap_clip(index: int, old_path: Path, new_path: Path, new_clip: Any, context: dict[str, Any]) -> None:
+    """Put a re-rendered clip in place of the old one (list, framing, graphics)."""
+    generated = list(st.session_state.get("generated_clips", []))
+    generated[index] = (new_path, new_clip)
+    st.session_state["generated_clips"] = generated
+    st.session_state["clip_paths"] = [str(Path(item[0]).expanduser().resolve()) for item in generated]
+    contexts = st.session_state.get("clip_render_contexts", {})
+    contexts.pop(_clip_key(old_path), None)
+    contexts[_clip_key(new_path)] = {**context, "start_time": new_clip.start_time, "end_time": new_clip.end_time}
+    st.session_state["clip_render_contexts"] = contexts
+    drafts = st.session_state.get("card_drafts", {})
+    if _clip_key(old_path) in drafts:
+        drafts[_clip_key(new_path)] = drafts.pop(_clip_key(old_path))
+    st.session_state.get("cards_changed", set()).discard(_clip_key(old_path))
+    st.session_state.pop("published_page", None)  # a page should show the new version
+    if Path(old_path).resolve() != Path(new_path).resolve():
+        Path(old_path).unlink(missing_ok=True)
+
+
 def _render_data_cards(generated_clips: list[tuple[Any, Any]]) -> None:
-    """📊 Graphics (optional): a number, boxes, a name card or one chart, each checked against
-    the transcript and shown on the word it's said. Never part of picking the clips."""
+    """📊 Graphics: added automatically by the graphics director (Round 28), every number
+    checked against the transcript. Here you check them, remove any, or add your own."""
     contexts = st.session_state.get("clip_render_contexts", {})
     choices = [k for k, (path, _) in enumerate(generated_clips) if _clip_key(path) in contexts]
     st.subheader("📊 Graphics")
     st.caption(
-        "Optional, for the moments where a number or a name carries the point. Every number is checked against "
-        "the transcript and appears on the word it's said. At most 1 chart, 2 numbers or boxes and 1 name card "
-        "per clip."
+        "Added automatically where a number or a name carries the point; every number is checked against "
+        "the transcript. Give them a last look: remove any you don't want, or add your own."
     )
     if not choices:
         st.caption("Make clips first.")
@@ -2402,6 +2259,9 @@ def _render_data_cards(generated_clips: list[tuple[Any, Any]]) -> None:
         st.caption("No words found in this clip.")
         return
     drafts: list[dict[str, Any]] = st.session_state.setdefault("card_drafts", {}).setdefault(key, [])
+    changed: set[str] = st.session_state.setdefault("cards_changed", set())
+    if not drafts:
+        st.caption("No graphics in this clip.")
     for number, draft in enumerate(drafts):
         left, right = st.columns([5, 1])
         left.markdown(f"**{number + 1}.** {TEMPLATE_LABELS[draft['template']]} · "
@@ -2409,9 +2269,14 @@ def _render_data_cards(generated_clips: list[tuple[Any, Any]]) -> None:
                       f"{_card_summary(draft)}")
         if right.button("Remove", key=f"card_remove_{key}_{number}"):
             drafts.pop(number)
-            st.session_state.get("card_clips", {}).pop(key, None)
+            changed.add(key)
             st.rerun()
-    with st.expander("➕ Add a graphic", expanded=not drafts):
+    notes = context.get("graphics_notes") or []
+    if notes:
+        with st.expander("Why these graphics"):
+            for note in notes:
+                st.caption(note)
+    with st.expander("➕ Add a graphic"):
         template = st.selectbox("Kind", TEMPLATES, format_func=TEMPLATE_LABELS.get, key=f"card_template_{key}")
         if CARD_GUIDE[template][0]:
             st.caption(CARD_GUIDE[template][0])
@@ -2426,57 +2291,32 @@ def _render_data_cards(generated_clips: list[tuple[Any, Any]]) -> None:
             else:
                 drafts.append(asdict(edit.cards[-1]))
                 drafts.sort(key=lambda d: d["start"])
-                st.session_state.get("card_clips", {}).pop(key, None)
+                changed.add(key)
                 for field_key in [k for k in st.session_state if str(k).startswith(("card_rows_", "card_title_"))]:
                     del st.session_state[field_key]
                 st.rerun()
-    if drafts and st.button("🎬 Render this clip with its graphics", type="primary", key=f"card_render_{key}"):
-        edit = ClipEdit(start=clip.start_time, end=clip.end_time, cards=[Card(**draft) for draft in drafts],
-                        brand=load_brand_kit())
-        output = Path(path).with_name(Path(path).stem + "_graphics.mp4")
-        work_dir = settings.temp_dir / "graphics" / Path(path).stem
-        cached_crop = context.get("crop")
-
-        def render_base(kept_words: list[Any]) -> Path:
-            # Same framing as the clip; no bold captions while a graphic is up; the title
-            # shows for the opening only, so it never sits under a graphic.
-            return Path(rerender_clip(
-                source_path=str(context["source_path"]), new_start=clip.start_time, new_end=clip.end_time,
-                transcript_words=kept_words, output_path=work_dir / "base.mp4",
-                cached_crop_x=cached_crop.x if isinstance(cached_crop, CropBox) else None,
-                cached_crop=cached_crop if isinstance(cached_crop, CropBox) else None,
-                layout_mode=str(context["layout_mode"]), source_duration=context.get("source_duration"),
-                crop_plan=context.get("crop_plan"), hook_title=clip.viral_title, hook_seconds=settings.hook_title_seconds,
-                highlight_active_word=settings.caption_highlight, pin_title=False, webinar=context.get("webinar"),
-                title_fade_in=bool(context.get("title_fade_in", True)),
-            ))
-
-        with st.spinner("Drawing the graphics and adding them to the clip…"):
-            try:
-                work_dir.mkdir(parents=True, exist_ok=True)
-                made, checks = render_with_cards(Path(context["source_path"]), edit, words, output, work_dir,
-                                                 render_base, hook_seconds=hook)
-            except ModuleNotFoundError:
-                st.error("Graphics need Playwright. In Terminal: .venv/bin/pip install playwright && "
-                         ".venv/bin/playwright install chromium")
-                return
-            except Exception as exc:
-                logging.exception("Graphics failed")
-                st.error(f"Couldn't add the graphics: {exc}")
-                return
-        problems = [f"Graphic {n + 1}: {e}" for n, c in enumerate(checks) for e in c.errors]
-        if problems:
-            st.error("Left out:\n\n" + "\n".join(f"- {p}" for p in problems))
-        if made:
-            st.session_state.setdefault("card_clips", {})[key] = str(made)
-            st.session_state.pop("published_page", None)  # the page should show the new version
+    if key in changed:
+        label = (f"🎬 Render this clip again with {len(drafts)} graphic{'s' if len(drafts) != 1 else ''}"
+                 if drafts else "🎬 Render this clip again without graphics")
+        if st.button(label, type="primary", key=f"card_render_{key}"):
+            with st.spinner("Rendering the clip…"):
+                try:
+                    made, problems = _render_clip_version(clip, context, drafts, rerender_output_path(Path(path)), settings)
+                except ModuleNotFoundError:
+                    st.error("Graphics need Playwright. In Terminal: .venv/bin/pip install playwright && "
+                             ".venv/bin/playwright install chromium")
+                    return
+                except Exception as exc:
+                    logging.exception("Graphics failed")
+                    st.error(f"Couldn't render the clip: {exc}")
+                    return
+            if problems:
+                st.session_state["graphics_problems"] = problems
+            _swap_clip(index, Path(path), made, clip, context)
             st.rerun()
-    made = _card_clip_path(path)
-    if made:
-        st.video(str(made))
-        st.download_button("Download the version with graphics", data=functools.partial(made.read_bytes),
-                           file_name=made.name, mime="video/mp4", key=f"card_download_{key}", on_click="ignore")
-        st.caption("A published preview page uses this version for this clip.")
+    problems = st.session_state.pop("graphics_problems", None)
+    if problems:
+        st.error("Left out:\n\n" + "\n".join(f"- {p}" for p in problems))
 
 
 def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
@@ -2495,7 +2335,7 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
         with open_column:
             st.link_button("Open the page", published["page_url"], width="stretch")
         st.caption(
-            "Opens, plays and downloads show under 'Published preview pages' below. "
+            "Opens, plays and downloads show under 'Published preview pages' at the bottom of 🧭 Pipeline. "
             "Trimmed a clip after publishing? Publish again for a new page."
         )
         if st.button("Publish again (new address)", key="publish_again"):
@@ -2503,8 +2343,7 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
             st.rerun()
         return
     clips = [
-        {"path": str(_card_clip_path(path) or Path(path).expanduser().resolve()), "start": clip.start_time,
-         "end": clip.end_time}
+        {"path": str(Path(path).expanduser().resolve()), "start": clip.start_time, "end": clip.end_time}
         for path, clip in generated_clips
         if Path(path).expanduser().is_file()
     ][:9]
@@ -2601,43 +2440,22 @@ def _render_trim_form(
     adjusted_start = max(0.0, float(context["start_time"]) + start_shift)
     adjusted_end = float(context["end_time"]) + end_shift
     replacement_path = rerender_output_path(clip_path)
+    updated_clip = clip.model_copy(update={"start_time": adjusted_start, "end_time": adjusted_end})
+    drafts = st.session_state.get("card_drafts", {}).get(_clip_key(clip_path), [])
     try:
-        updated_path = rerender_clip(
-            source_path=str(context["source_path"]),
-            new_start=adjusted_start,
-            new_end=adjusted_end,
-            transcript_words=context["words"],
-            output_path=replacement_path,
-            cached_crop_x=cached_crop.x,
-            cached_crop=cached_crop,
-            layout_mode=str(context["layout_mode"]),
-            source_duration=float(context["source_duration"]),
-            crop_plan=context.get("crop_plan"),
-            hook_title=clip.viral_title,
-            hook_seconds=settings.hook_title_seconds,
-            highlight_active_word=settings.caption_highlight,
-            pin_title=bool(context.get("pin_title")),
-            webinar=context.get("webinar"),
-            title_fade_in=bool(context.get("title_fade_in", True)),
-        )
+        # The clip's graphics come along: checked again against the new start and end.
+        with st.spinner("Re-rendering…"):
+            updated_path, problems = _render_clip_version(
+                updated_clip, {**context, "source_duration": float(context["source_duration"])}, drafts,
+                replacement_path, settings,
+            )
     except Exception as exc:
         logging.exception("Could not re-render clip %d", index + 1)
         st.error(f"Could not re-render this clip: {exc}")
         return
-    updated_clip = clip.model_copy(update={"start_time": adjusted_start, "end_time": adjusted_end})
-    updated_clips = list(generated_clips)
-    updated_clips[index] = (updated_path, updated_clip)
-    st.session_state["generated_clips"] = updated_clips
-    st.session_state["clip_paths"] = [str(Path(item[0]).expanduser().resolve()) for item in updated_clips]
-    contexts.pop(_clip_key(clip_path), None)
-    contexts[_clip_key(updated_path)] = {**context, "start_time": adjusted_start, "end_time": adjusted_end}
-    st.session_state["clip_render_contexts"] = contexts
-    # Graphics keep their source times; they're checked again against the new start and end when rendered.
-    st.session_state.get("card_clips", {}).pop(_clip_key(clip_path), None)
-    card_drafts = st.session_state.get("card_drafts", {})
-    if _clip_key(clip_path) in card_drafts:
-        card_drafts[_clip_key(updated_path)] = card_drafts.pop(_clip_key(clip_path))
-    clip_path.unlink(missing_ok=True)
+    if problems:
+        st.session_state["graphics_problems"] = problems
+    _swap_clip(index, clip_path, updated_path, updated_clip, context)
     st.rerun()
 
 

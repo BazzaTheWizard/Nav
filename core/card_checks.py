@@ -21,6 +21,10 @@ PAYOFF_SECONDS = 2.0  # the clip ends full-screen too, on the speaker's punchlin
 MAX_CARDS = 1  # charts (split view) per clip: restraint, so each one lands
 MAX_OVERLAYS = 2  # numbers or boxes over the speaker per clip (plus one name card)
 MIN_GAP = 1.5  # seconds of plain video between two graphics
+RECAP_SECONDS = 3.0  # a number said in the hook can come back right after the title, as a recap
+LINE_LOOKBACK = 8.0  # the line under a number may quote words said this long before it
+OVERLAY_HOLD = 2.6  # a number or box graphic leaves this long after its last item comes in
+MAX_OVERLAY_SECONDS = 5.0  # ...and is never up longer than this (it covers the speaker)
 LIMITS = {"eyebrow": 30, "headline": 30, "label": 26, "value": 14, "footnote": 58, "box": 20, "detail": 30,
           "context": 44, "name": 28, "role": 42}
 _ASIDES = {"dunno", "guess", "maybe", "like", "whatever"}  # "I dunno, five, six months?": an aside, not evidence
@@ -89,6 +93,8 @@ def spoken_numbers(words: list[Any]) -> list[SpokenNumber]:
             if end + 1 < len(tokens) and tokens[end + 1] == "hundred":
                 value *= 100
                 end += 1
+        elif token == "hundred":
+            value = 100.0  # "a hundred", "the last hundred years" ("five hundred" is read above)
         if value is None:
             i += 1
             continue
@@ -187,6 +193,45 @@ def _match_numbers(value, numbers: list[SpokenNumber], used: set[int]) -> list[S
     return hits
 
 
+_ARROW = re.compile(r"\s*(?:→|->|=>)\s*")
+
+
+def _check_change(row: Any, window: list[Any], tokens: list[str], numbers: list[Any], errors: list[str],
+                  lead_in: set[str] | None = None) -> None:
+    """A change, "C → A" or "$2M → $8M": both ends said in the window, in that order.
+    A number end is checked like any number; a word end (a grade, a rank) must be said as
+    that word (a one-letter end must match its case, so "a" never counts as "A")."""
+    _limit(errors, "Value", row.value, LIMITS["value"])
+    _limit(errors, "Line", row.label, LIMITS["context"])
+    ends = [part.strip() for part in _ARROW.split(row.value, maxsplit=1)]
+    if len(ends) != 2 or not all(ends):
+        errors.append(f"\"{row.value}\": write a change as \"from → to\".")
+        return
+    found: list[float] = []
+    after = -1
+    for end in ends:
+        value = parse_value(end)
+        if value.numbers:
+            hits = _match_numbers(value, [n for n in numbers if n.index > after], set())
+            if hits is None:
+                errors.append(f"\"{end}\" isn't said while it's on screen.")
+                return
+            after = hits[0].index
+            found.append(float(hits[0].start))
+            continue
+        target = _clean(end)
+        index = next((k for k in range(after + 1, len(window)) if tokens[k] == target and
+                      (len(target) > 1 or window[k].text.strip().strip(".,!?;:\"'").startswith(end))), None)
+        if index is None:
+            errors.append(f"\"{end}\" isn't said while it's on screen.")
+            return
+        after = index
+        found.append(float(window[index].start))
+    row.reveal_at, row.reveal_to = found[0], found[1]
+    if row.label and not _said(row.label, lead_in if lead_in is not None else set(tokens)):
+        errors.append("The line under it must be the speaker's words.")
+
+
 def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
                hook_seconds: float = HOOK_SECONDS) -> CardCheck:
     """Check one card against what was said, and set each item's ``reveal_at`` (and a
@@ -200,12 +245,21 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
     if card.end - card.start < shortest:
         errors.append(f"On screen {card.end - card.start:.1f} s; this needs at least {shortest} s.")
     hook = max(HOOK_SECONDS, hook_seconds)
-    if card.start < clip_start + hook:
+    if card.template == "kinetic_range" and card.start < clip_start + hook < card.end - MIN_OVERLAY_SECONDS:
+        # Said under the title (the hook): the number comes in right after the title,
+        # as a recap of what was just said, never on top of the title.
+        card.start = clip_start + hook + 0.2
+    elif card.start < clip_start + hook:
         errors.append(f"Starts in the first {hook:g} s: the hook and its title stay clear.")
     if card.end > clip_end - PAYOFF_SECONDS:
         errors.append(f"Runs into the last {PAYOFF_SECONDS:.0f} s: the clip ends full-screen on the speaker.")
     _limit(errors, "Title", card.headline, LIMITS["headline"])
     window = _in_window(words, card.start, card.end)
+    # A number graphic may recap what was said just before it (under the title, say), and
+    # its line may quote the words that led up to it. Checking twice gives the same answer:
+    # the start a first check moved onto the number's word still finds the line.
+    recap_window = _in_window(words, max(clip_start, card.start - RECAP_SECONDS), card.end)
+    lead_in = {_clean(w.text) for w in _in_window(words, max(clip_start, card.start - LINE_LOOKBACK), card.end)}
     clip_words = _in_window(words, clip_start, clip_end)
     tokens = [_clean(word.text) for word in window]
     said_in_clip = {_clean(w.text) for w in clip_words}
@@ -242,6 +296,17 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
             errors.append("Upload the price file (CSV: date, open, high, low, close, volume).")
         result.warnings.append("Drawn from your file, not from what was said: it shows its source.")
         return result
+    if card.template == "kinetic_range" and _ARROW.search(rows[0].value):
+        _check_change(rows[0], recap_window, [_clean(w.text) for w in recap_window], spoken_numbers(recap_window),
+                      errors, lead_in)
+        if not errors:
+            if rows[0].reveal_at < card.start:  # a recap: "C", then "→ A" a beat later
+                rows[0].reveal_at = card.start + 0.12
+                if rows[0].reveal_to < rows[0].reveal_at + 0.3:
+                    rows[0].reveal_to = rows[0].reveal_at + 0.6
+            card.start = max(card.start, rows[0].reveal_at - 0.12)
+            _hold_overlay(card, rows, errors)
+        return result
     if card.template in numeric:
         for position, row in enumerate(rows, start=1):
             _limit(errors, f"Item {position} value", row.value, LIMITS["value"])
@@ -252,6 +317,14 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
                 errors.append(f"Item {position}: \"{row.value}\" has no number.")
                 continue
             hits = _match_numbers(value, numbers, used)
+            if hits is None and card.template == "kinetic_range":
+                recap = spoken_numbers([w for w in recap_window if float(w.start) < card.start])
+                hits = _match_numbers(value, recap, set())
+                if hits is not None:  # said just before: it comes in as the graphic does
+                    row.reveal_at, row.reveal_to = card.start + 0.12, None
+                    if row.label and not _said(row.label, lead_in):
+                        errors.append(f"The line under the number should use the speaker's words: \"{row.label}\".")
+                    continue
             if hits is None:
                 scale_word = _SCALE_WORDS.get(value.scale or "", "")
                 errors.append(f"Item {position}: \"{row.value}\" isn't said while it's on screen (check the number"
@@ -266,7 +339,7 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
                                        "Graphics work best for numbers that carry the point.")
             row.reveal_at = hits[0].start
             row.reveal_to = hits[1].start if len(hits) > 1 else None
-            if card.template == "kinetic_range" and row.label and not _said(row.label, {_clean(w.text) for w in window}):
+            if card.template == "kinetic_range" and row.label and not _said(row.label, lead_in):
                 errors.append(f"The line under the number should use the speaker's words: \"{row.label}\".")
         if card.template not in {"kinetic_range", "cac_payback"} and not errors:
             scales = {parse_value(row.value).scale for row in rows}
@@ -312,12 +385,25 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
         if times != sorted(times):
             errors.append("Timeline points must appear in order: put them in the order they come up.")
     if overlay and not errors:
+        for row in rows:  # a recap (said under the title) comes in as the graphic does
+            if row.reveal_at is not None and row.reveal_at < card.start:
+                row.reveal_at = card.start + 0.12
+                row.reveal_to = None
         first = min((row.reveal_at for row in rows if row.reveal_at is not None), default=card.start)
         # No empty frames: an overlay starts exactly as its first item comes in.
         card.start = max(card.start, first - 0.12)
-        if card.end - card.start < MIN_OVERLAY_SECONDS:
-            errors.append(f"Only {card.end - card.start:.1f} s after the first item appears; extend the end.")
+        _hold_overlay(card, rows, errors)
     return result
+
+
+def _hold_overlay(card: Card, rows: list[Any], errors: list[str]) -> None:
+    """A number or box graphic covers the speaker, so it stays only as long as it's needed:
+    OVERLAY_HOLD after its last item comes in, never over MAX_OVERLAY_SECONDS."""
+    last = max((t for row in rows for t in (row.reveal_at, row.reveal_to) if t is not None), default=card.start)
+    longest = max(MAX_OVERLAY_SECONDS, last - card.start + 1.5)  # boxes said slowly still get 1.5 s each
+    card.end = min(card.end, max(last + OVERLAY_HOLD, card.start + MIN_OVERLAY_SECONDS), card.start + longest)
+    if card.end - card.start < MIN_OVERLAY_SECONDS:
+        errors.append(f"Only {card.end - card.start:.1f} s after the first item appears; extend the end.")
 
 
 def _shape_checks(card: Card, errors: list[str]) -> None:

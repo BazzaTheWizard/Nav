@@ -32,8 +32,11 @@ from core.edl import MODES, BrandKit, Card
 
 FPS = 30
 FRAME_W, FRAME_H = 1080, 1920
-SPLIT_TOP = 608  # the speaker's strip in split mode: the whole 16:9 frame at full width
-SPLIT_H = FRAME_H - SPLIT_TOP  # chart page; content stays in its top 642 px (y 608-1250 of the frame)
+SPLIT_TOP = 460  # 24/76 split: the speaker's strip (a 2.35:1 band of the frame), the chart below
+SPLIT_H = FRAME_H - SPLIT_TOP  # the chart page (76% of the frame)
+CHART_H = 1312  # the builders' drawing area; content stays in its top 642 px
+CHART_PAD = 136  # the drawing area starts this far below the strip: content at y 596-1238, centred
+# between the strip and the captions (the bottom fifth stays clear: apps cover it)
 W = FRAME_W
 
 # Design tokens (the whole library uses only these).
@@ -54,9 +57,10 @@ FOCUS = 2  # focus frames
 FONTS = Path(__file__).resolve().parents[1] / "assets" / "fonts"
 MIN_CONTRAST = 4.5  # WCAG AA for text
 EASE = "cubic-bezier(0.22, 1, 0.36, 1)"  # entrances: fast in, gentle settle
-EASE_IN = "cubic-bezier(0.55, 0, 0.75, 0.2)"  # exits
+EASE_IN = "cubic-bezier(0.55, 0, 0.75, 0.2)"  # accelerating
+EASE_OUT_EXIT = "cubic-bezier(0.65, 0, 0.35, 1)"  # exits: damped ease-in-out, no snap at either end
 POP = "cubic-bezier(0.34, 1.56, 0.64, 1)"  # points popping in, a touch of overshoot
-EXIT = 0.25  # seconds: every graphic slides and fades out over its last 0.25 s
+EXIT = 0.4  # seconds (12 frames): every graphic slides and fades out over its last 0.4 s
 
 
 @dataclass
@@ -132,15 +136,16 @@ class Motion:
         return out
 
 
-def _base_css(width: int, height: int) -> str:
+def _base_css(width: int, height: int, stage_top: int = 0, stage_h: int | None = None) -> str:
+    stage_h = stage_h or height
     return f"""
 @font-face {{ font-family: Inter; src: url("{(FONTS / 'Inter-Variable.ttf').as_uri()}"); font-weight: 100 900; }}
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 html, body {{ width: {width}px; height: {height}px; background: transparent; overflow: hidden; }}
 body {{ font-family: Inter, sans-serif; color: {INK}; -webkit-font-smoothing: antialiased;
   font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1, "calt" 0; position: relative; }}
-.stage {{ position: absolute; inset: 0; }}
-.lyr {{ position: absolute; left: 0; top: 0; width: {width}px; height: {height}px; }}
+.stage {{ position: absolute; left: 0; top: {stage_top}px; width: {width}px; height: {stage_h}px; }}
+.lyr {{ position: absolute; left: 0; top: 0; width: {width}px; height: {stage_h}px; }}
 .title {{ position: absolute; left: 76px; right: 76px; top: 40px; text-align: center; font-size: 44px;
   font-weight: 760; letter-spacing: -.012em; white-space: nowrap; overflow: hidden; }}
 .lab {{ font-size: 30px; font-weight: 560; color: {SOFT}; white-space: nowrap; }}
@@ -165,7 +170,7 @@ def _title(card: Card, motion: Motion) -> str:
     return f'<div class="title fit">{_e(card.headline)}</div>'
 
 
-def _layer(layer_id: str, inner: str, width: int = W, height: int = SPLIT_H) -> str:
+def _layer(layer_id: str, inner: str, width: int = W, height: int = CHART_H) -> str:
     return (f'<div class="lyr" id="{layer_id}"><svg width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
             f"{inner}</svg></div>")
 
@@ -181,9 +186,14 @@ def _top(card: Card) -> float:
 
 
 # ------------------------------------------------------------ overlays (speaker full-screen)
+ARROW = re.compile(r"\s*(?:→|->|=>)\s*")
+
+
 def _kinetic_range(card: Card, accent: str) -> tuple[str, str, Motion]:
     row = card.rows[0]
-    first, second = _split_range(row.value)
+    change = ARROW.search(row.value)
+    first, second = ([part.strip() for part in ARROW.split(row.value, maxsplit=1)] if change
+                     else _split_range(row.value))
     color = accent if row.highlight else INK
     css = f"""
 .scrim {{ position: absolute; left: 0; right: 0; top: 860px; bottom: 0;
@@ -196,7 +206,8 @@ def _kinetic_range(card: Card, accent: str) -> tuple[str, str, Motion]:
 .ctx {{ margin-top: 26px; font-size: 46px; font-weight: 600; line-height: 1.18; color: rgba(255,255,255,.94);
   text-shadow: 0 3px 16px rgba(0,0,0,.5); }}
 """
-    rest = f'<span class="rest"><span class="dash">–</span><span>{_e(second)}</span></span>' if second else ""
+    joiner = "→" if change else "–"
+    rest = f'<span class="rest"><span class="dash">{joiner}</span><span>{_e(second)}</span></span>' if second else ""
     body = (f'<div class="scrim"></div><div class="wrap"><div class="nums fit"><span class="a">{_e(first)}</span>'
             f'{rest}</div><div class="ctx">{_e(row.label)}</div></div>')
     m = Motion()
@@ -802,9 +813,10 @@ def scene(card: Card, brand: BrandKit) -> tuple[str, Motion, int, int, int]:
     width, height, top = (FRAME_W, FRAME_H, 0) if overlay else (FRAME_W, SPLIT_H, SPLIT_TOP)
     duration = max(0.5, card.end - card.start)
     gone = duration - 1 / FPS  # fully faded on the last frame, so nothing pops off
-    motion.tween(".stage", "opacity", gone - EXIT, gone, "1", "0", EASE_IN)
-    motion.tween(".stage", "transform", gone - EXIT, gone, "translateY(0px)", "translateY(18px)", EASE_IN)
-    page = (f"<!doctype html><html><head><meta charset='utf-8'><style>{_base_css(width, height)}{css}</style>"
+    motion.tween(".stage", "opacity", gone - EXIT, gone, "1", "0", EASE_OUT_EXIT)
+    motion.tween(".stage", "transform", gone - EXIT, gone, "translateY(0px)", "translateY(18px)", EASE_OUT_EXIT)
+    stage_top, stage_h = (0, height) if overlay else (CHART_PAD, CHART_H)
+    page = (f"<!doctype html><html><head><meta charset='utf-8'><style>{_base_css(width, height, stage_top, stage_h)}{css}</style>"
             f"</head><body><div class='stage'>{body}</div></body></html>")
     return page, motion, width, height, top
 

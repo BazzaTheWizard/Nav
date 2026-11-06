@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import ssl
 import statistics
@@ -415,7 +416,14 @@ FACE_FRAME_WIDTH = 640
 CUT_MIN_DIFFERENCE = 18.0
 CUT_DIFFERENCE_RATIO = 4.0
 CUT_HISTOGRAM_CORRELATION = 0.5
-MIN_SHOT_SECONDS = 0.6
+MIN_SHOT_SECONDS = 0.6  # shorter: an edge sliver (held over) or a quick shot (framed only if it has a face)
+FLASH_SECONDS = 0.2  # cuts closer together than this are a flash, not a shot
+SAMPLE_MARGIN = 0.12  # face samples this close to a cut may show the neighbouring shot
+# Inside a shot the crop is locked (no jitter, no chasing head movements). It re-frames
+# only when the face sits outside the dead zone for REFRAME_HOLD seconds, with an eased pan.
+DEAD_ZONE = 0.28  # share of the crop width the face may sit off-centre
+REFRAME_HOLD = 2.0
+REFRAME_SECONDS = 0.8
 FACE_SHOT_PRESENCE = 0.4
 GROUP_SHOT_PRESENCE = 0.5
 SAME_X_TOLERANCE_PX = 8
@@ -435,6 +443,9 @@ class Shot:
 
     ``speakers``: for a two-person shot, the left and right faces as
     (center_x, center_y, face_width) in source pixels; None otherwise.
+    ``moves``: re-frames inside a long shot when the person really moves (leans or walks
+    out of the dead zone and stays there): (absolute start second, new x). Each is an
+    eased REFRAME_SECONDS pan; head movements inside the dead zone never move the crop.
     """
 
     start: float
@@ -443,6 +454,7 @@ class Shot:
     has_face: bool
     group: bool
     speakers: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+    moves: tuple[tuple[float, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -472,6 +484,7 @@ class CropPlan:
     crop_height: int
     y: int
     shots: tuple[Shot, ...]
+    cuts: tuple[float, ...] = ()  # every camera cut found, absolute source seconds
 
     @property
     def duration(self) -> float:
@@ -534,11 +547,12 @@ class CropPlan:
             return None
         width, height = size
         windows: list[tuple[float, float, int, int, int, int]] = []
+        first, last = self._visible(clip_start, clip_end)
         for shot in self.shots:
-            if not self._splittable(shot) or shot.end <= clip_start or shot.start >= clip_end:
+            if not self._splittable(shot) or shot.end <= first + 1e-6 or shot.start >= last - 1e-6:
                 continue
-            start = max(shot.start, clip_start) - clip_start
-            end = min(shot.end, clip_end) - clip_start
+            start = (clip_start if shot.start <= first + 1e-6 else shot.start) - clip_start
+            end = (clip_end if shot.end >= last - 1e-6 else shot.end) - clip_start
             if end - start < MIN_SHOT_SECONDS:
                 continue
             (lx, ly, _lw), (rx, ry, _rw) = shot.speakers
@@ -580,6 +594,22 @@ class CropPlan:
         y = int(max(0, min(self.frame_height - height, cy - face_y * height))) // 2 * 2
         return x, y
 
+    def holds(self, clip_start: float, clip_end: float) -> tuple[float, float]:
+        """(head, tail): seconds at the clip's start and end that show a sliver of another
+        camera (a cut under MIN_SHOT_SECONDS from the edge). The renderer holds the main
+        shot's first frame over the head and its last frame over the tail, so a clip never
+        opens or closes on a flash of the wrong shot."""
+        head = max((c - clip_start for c in self.cuts if 0 < c - clip_start < MIN_SHOT_SECONDS), default=0.0)
+        tail = max((clip_end - c for c in self.cuts if 0 < clip_end - c < MIN_SHOT_SECONDS), default=0.0)
+        if head + tail >= clip_end - clip_start - MIN_SHOT_SECONDS:
+            return 0.0, 0.0
+        return round(head, 3), round(tail, 3)
+
+    def _visible(self, clip_start: float, clip_end: float) -> tuple[float, float]:
+        """The part of the clip whose own frames are shown (the holds cover the rest)."""
+        head, tail = self.holds(clip_start, clip_end)
+        return clip_start + head, clip_end - tail
+
     @property
     def cut_count(self) -> int:
         return max(0, len(self.shots) - 1)
@@ -597,13 +627,16 @@ class CropPlan:
         would cut those off; the renderer shows the whole frame there instead."""
         spans: list[tuple[float, float]] = []
         split = self.split_view(clip_start, clip_end) is not None
+        first, last = self._visible(clip_start, clip_end)
         for shot in self.shots:
             if shot.has_face and not shot.group:
                 continue
             if split and self._splittable(shot):
                 continue  # shown as the two-speaker split view instead
-            start = max(shot.start, clip_start) - clip_start
-            end = min(shot.end, clip_end) - clip_start
+            if shot.end <= first + 1e-6 or shot.start >= last - 1e-6:
+                continue
+            start = (clip_start if shot.start <= first + 1e-6 else shot.start) - clip_start
+            end = (clip_end if shot.end >= last - 1e-6 else shot.end) - clip_start
             if end - start < MIN_SHOT_SECONDS:
                 continue
             if spans and start - spans[-1][1] < 0.05:
@@ -616,22 +649,43 @@ class CropPlan:
         """FFmpeg crop x expression that switches position at each camera cut.
 
         ``t`` is clip-relative because the renderer seeks with ``-ss`` before
-        ``-i``. Crop moves happen exactly on cuts, so viewers never see a pan.
+        ``-i``. Crop moves happen exactly on cuts, so viewers never see a jump inside
+        a shot; the only in-shot motion is a rare eased re-frame (Shot.moves).
         """
         segments: list[tuple[float, int]] = []
+        ramps: list[tuple[float, float, int, int]] = []  # (start, end, from x, to x), clip-relative
+        first, last = self._visible(clip_start, clip_end)
         for shot in self.shots:
-            if shot.end <= clip_start or shot.start >= clip_end:
+            if shot.end <= first + 1e-6 or shot.start >= last - 1e-6:
                 continue
-            boundary = min(shot.end, clip_end) - clip_start
-            if segments and abs(segments[-1][1] - shot.x) <= SAME_X_TOLERANCE_PX:
+            boundary = (clip_end if shot.end >= last - 1e-6 else shot.end) - clip_start
+            x = shot.x
+            for at, target in shot.moves:
+                begin = at - clip_start
+                if begin <= 0 or begin + REFRAME_SECONDS >= boundary:
+                    if begin <= 0:
+                        x = target
+                    continue
+                if segments and abs(segments[-1][1] - x) <= SAME_X_TOLERANCE_PX:
+                    segments[-1] = (begin, segments[-1][1])
+                else:
+                    segments.append((begin, x))
+                ramps.append((begin, begin + REFRAME_SECONDS, x, target))
+                x = target
+            if segments and abs(segments[-1][1] - x) <= SAME_X_TOLERANCE_PX:
                 segments[-1] = (boundary, segments[-1][1])
             else:
-                segments.append((boundary, shot.x))
+                segments.append((boundary, x))
         if not segments:
             return str(self.crop.x)
         expression = str(segments[-1][1])
         for boundary, x in reversed(segments[:-1]):
             expression = f"if(lt(t,{boundary:.3f}),{x},{expression})"
+        for begin, end, start_x, end_x in reversed(ramps):
+            # smoothstep ease from start_x to end_x between begin and end
+            progress = f"(t-{begin:.3f})/{end - begin:.3f}"
+            eased = f"{start_x}+({end_x - start_x})*{progress}*{progress}*(3-2*{progress})"
+            expression = f"if(between(t,{begin:.3f},{end:.3f}),{eased},{expression})"
         return expression
 
 
@@ -675,16 +729,25 @@ def _decode_analysis_frames(
     start_time: float,
     duration: float,
     face_size: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Decode the clip once into tiny gray frames (cuts) and small color frames (faces)."""
+) -> tuple[np.ndarray, np.ndarray, list[float], list[float]]:
+    """Decode the clip once into tiny gray frames (cuts) and small color frames (faces),
+    with each one's time (clip-relative).
+
+    The cut frames are every frame of the source (no frame-rate conversion), with each
+    frame's exact time (clip-relative, the same ``t`` the renderer sees), so a crop
+    switch lands between the last frame of one shot and the first of the next.
+    (Resampling a 29.97 fps source to 30 fps put switches up to half a frame late:
+    the first frame of the new shot kept the old crop.)"""
     cut_w, cut_h = CUT_FRAME_SIZE
     face_w, face_h = face_size
     with tempfile.TemporaryDirectory(prefix="crop-analysis-") as temp_dir:
         face_file = Path(temp_dir) / "faces.raw"
         command = [
             shutil.which("ffmpeg") or "ffmpeg",
+            "-hide_banner",
+            "-nostats",
             "-v",
-            "error",
+            "info",
             "-y",
             "-ss",
             f"{start_time:.3f}",
@@ -696,16 +759,24 @@ def _decode_analysis_frames(
             "-filter_complex",
             (
                 f"[0:v]split=2[a][b];"
-                f"[a]fps={CUT_ANALYSIS_FPS},scale={cut_w}:{cut_h},format=gray[cuts];"
-                f"[b]fps={FACE_ANALYSIS_FPS},scale={face_w}:{face_h},format=bgr24[faces]"
+                f"[a]showinfo,scale={cut_w}:{cut_h},format=gray[cuts];"
+                # Face samples: real source frames about 1/FACE_ANALYSIS_FPS apart, each
+                # with its exact time (an fps filter's frames only approximate their time,
+                # which put a quick shot's sample in the shot next to it).
+                f"[b]select='isnan(prev_selected_t)+gte(t-prev_selected_t,{1 / FACE_ANALYSIS_FPS - 0.001:.3f})',"
+                f"showinfo,scale={face_w}:{face_h},format=bgr24[faces]"
             ),
             "-map",
             "[cuts]",
+            "-fps_mode",
+            "passthrough",
             "-f",
             "rawvideo",
             "pipe:1",
             "-map",
             "[faces]",
+            "-fps_mode",
+            "passthrough",
             "-f",
             "rawvideo",
             str(face_file),
@@ -719,16 +790,56 @@ def _decode_analysis_frames(
         frame_size = face_w * face_h * 3
         face_frames = face_bytes[: face_bytes.size - face_bytes.size % frame_size]
         face_frames = face_frames.reshape(-1, face_h, face_w, 3)
-    return cut_frames, face_frames
+    log = result.stderr.decode("utf-8", "replace")
+    times, face_times = _frame_times(log, 0), _frame_times(log, 1)
+    if len(times) != len(cut_frames):  # no timing info: assume a steady frame rate
+        times = [index / CUT_ANALYSIS_FPS for index in range(len(cut_frames))]
+    if len(face_times) != len(face_frames):
+        face_times = [index / FACE_ANALYSIS_FPS for index in range(len(face_frames))]
+    return cut_frames, face_frames, times, face_times
 
 
-def _cut_times(cut_frames: np.ndarray) -> list[float]:
+_SHOWINFO_TIME = re.compile(r"Parsed_showinfo_(\d+).*?\bn:\s*(\d+).*?\bpts_time:\s*(-?[0-9.]+)")
+
+
+def _frame_times(log: str, which: int = 0) -> list[float]:
+    """Each frame's time from FFmpeg's showinfo lines, in frame order. ``which``: 0 for the
+    first showinfo in the graph (every frame, for cuts), 1 for the second (face samples)."""
+    by_filter: dict[int, dict[int, float]] = {}
+    for match in _SHOWINFO_TIME.finditer(log):
+        by_filter.setdefault(int(match.group(1)), {})[int(match.group(2))] = float(match.group(3))
+    if len(by_filter) <= which:
+        return []
+    found = by_filter[sorted(by_filter)[which]]
+    return [found[index] for index in range(len(found))] if found and max(found) == len(found) - 1 else []
+
+
+def _frame_at(video_path: Path, time: float, size: tuple[int, int]) -> np.ndarray | None:
+    """One color frame at ``time`` (source seconds), for a shot too short for the
+    2 fps face samples."""
+    width, height = size
+    try:
+        raw = subprocess.run(
+            [shutil.which("ffmpeg") or "ffmpeg", "-v", "error", "-ss", f"{time:.3f}", "-i", str(video_path),
+             "-frames:v", "1", "-vf", f"scale={width}:{height}", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+            check=True, capture_output=True, timeout=60,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if len(raw) < width * height * 3:
+        return None
+    return np.frombuffer(raw[: width * height * 3], dtype=np.uint8).reshape(height, width, 3)
+
+
+def _cut_times(cut_frames: np.ndarray, times: list[float] | None = None) -> list[float]:
     """Times (clip-relative) where the camera cuts.
 
     Uses pixel difference between consecutive frames, which catches cuts between
-    two angles of the same set (same colors), plus a histogram check.
+    two angles of the same set (same colors), plus a histogram check. With the
+    frames' ``times``, each cut is halfway between the last frame of the old shot
+    and the first frame of the new one; without, frame index / CUT_ANALYSIS_FPS.
     """
-    times: list[float] = []
+    found: list[float] = []
     previous: np.ndarray | None = None
     previous_hist: np.ndarray | None = None
     recent: list[float] = []
@@ -749,14 +860,39 @@ def _cut_times(cut_frames: np.ndarray) -> list[float]:
                 and difference >= CUT_MIN_DIFFERENCE / 2
             )
             if is_cut:
-                times.append(index / CUT_ANALYSIS_FPS)
+                found.append((times[index - 1] + times[index]) / 2 if times else index / CUT_ANALYSIS_FPS)
                 recent.clear()
             else:
                 recent.append(difference)
                 del recent[:-15]
         previous = frame
         previous_hist = hist
-    return times
+    return found
+
+
+def _reframes(
+    track: list[tuple[float, float]], x: int, crop_width: int, frame_width: int, start_time: float
+) -> tuple[tuple[float, int], ...]:
+    """Dead-zone re-framing for one shot. ``track``: (clip second, face centre x) samples.
+    The crop stays put while the face is within DEAD_ZONE of its centre; when the face
+    sits outside it for REFRAME_HOLD seconds, one eased pan re-centres it (hysteresis:
+    a quick lean or a gesture never moves the camera)."""
+    moves: list[tuple[float, int]] = []
+    center = x + crop_width / 2
+    outside: list[tuple[float, float]] = []
+    for t, face_x in track:
+        if abs(face_x - center) <= DEAD_ZONE * crop_width:
+            outside.clear()
+            continue
+        outside.append((t, face_x))
+        if outside[-1][0] - outside[0][0] >= REFRAME_HOLD:
+            target_center = statistics.median(value for _t, value in outside)
+            new_x = int(max(0, min(frame_width - crop_width, target_center - crop_width / 2))) // 2 * 2
+            if abs(new_x - (center - crop_width / 2)) > SAME_X_TOLERANCE_PX:
+                moves.append((start_time + outside[0][0], new_x))
+                center = new_x + crop_width / 2
+            outside.clear()
+    return tuple(moves)
 
 
 def _cluster(values: list[tuple[float, float]], distance: float) -> list[list[tuple[float, float]]]:
@@ -811,44 +947,53 @@ def analyze_crop_plan(
 
     duration = end_time - start_time
     face_height = max(2, round(FACE_FRAME_WIDTH * frame_height / frame_width / 2) * 2)
-    cut_frames, face_frames = _decode_analysis_frames(
+    cut_frames, face_frames, frame_times, face_times = _decode_analysis_frames(
         source, start_time, duration, (FACE_FRAME_WIDTH, face_height)
     )
 
-    # Shot boundaries (clip-relative), dropping flash cuts shorter than MIN_SHOT_SECONDS.
+    # Shot boundaries (clip-relative). A cut within MIN_SHOT_SECONDS of the clip's start
+    # or end is a sliver of another camera: the renderer holds the main shot's first (or
+    # last) frame over it instead (CropPlan.holds), so it isn't a boundary here.
+    # Real quick cuts inside the clip stay (each gets its own framing below); only
+    # flashes shorter than FLASH_SECONDS are ignored.
+    cuts = _cut_times(cut_frames, frame_times)
+    head = max((cut for cut in cuts if cut < MIN_SHOT_SECONDS), default=0.0)
+    tail = max((duration - cut for cut in cuts if duration - cut < MIN_SHOT_SECONDS), default=0.0)
     boundaries = [0.0]
-    for cut in _cut_times(cut_frames):
-        if cut - boundaries[-1] >= MIN_SHOT_SECONDS and duration - cut >= MIN_SHOT_SECONDS:
+    for cut in cuts:
+        if head < cut < duration - tail and cut - boundaries[-1] >= FLASH_SECONDS and duration - tail - cut >= FLASH_SECONDS:
             boundaries.append(cut)
     boundaries.append(duration)
 
     detector = _face_detector()
     scale = frame_width / FACE_FRAME_WIDTH
-    samples: list[tuple[float, list[tuple[float, float]]]] = []
     frame_area = float(FACE_FRAME_WIDTH * face_height)
-    for index, frame in enumerate(face_frames):
-        faces = detector.detect(frame) if detector.available else []
-        samples.append(
-            (
-                index / FACE_ANALYSIS_FPS,
-                # (center x, area, center y, width) in source pixels. A small face in a
-                # corner is a webcam overlay on a screen share: it never steers the crop
-                # (that shot shows the whole frame instead, like a slide).
-                [
-                    (cx * scale, w * h * scale * scale, cy * scale, w * scale)
-                    for cx, cy, w, h, _s in faces
-                    if pip_corner(cx / FACE_FRAME_WIDTH, cy / face_height, w * h / frame_area) is None
-                ],
-            )
-        )
+
+    def faces_in(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
+        """(center x, area, center y, width) in source pixels. A lone small face in a
+        corner is a webcam overlay on a screen share: it never steers the crop (that shot
+        shows the whole frame instead, like a slide). Two or more faces are people: a
+        wide shot can frame two speakers high up near the edges."""
+        found = detector.detect(frame) if detector.available else []
+        return [
+            (cx * scale, w * h * scale * scale, cy * scale, w * scale)
+            for cx, cy, w, h, _s in found
+            if len(found) > 1 or pip_corner(cx / FACE_FRAME_WIDTH, cy / face_height, w * h / frame_area) is None
+        ]
+
+    samples = [(time, faces_in(frame)) for time, frame in zip(face_times, face_frames)]
 
     cluster_distance = frame_width * FACE_CLUSTER_DISTANCE_RATIO
-    raw_shots: list[tuple[float, float, int | None, bool, tuple | None]] = []
-    for shot_start, shot_end in zip(boundaries, boundaries[1:]):
-        shot_samples = [faces for t, faces in samples if shot_start <= t < shot_end]
-        if not shot_samples:  # very short shot between two face samples
-            nearest = min(samples, key=lambda item: abs(item[0] - (shot_start + shot_end) / 2), default=None)
-            shot_samples = [nearest[1]] if nearest else []
+    raw_shots: list[tuple[float, float, int | None, bool, tuple | None, tuple]] = []
+    for index, (shot_start, shot_end) in enumerate(zip(boundaries, boundaries[1:])):
+        # Only samples well inside the shot (2 fps samples near a cut can show the
+        # neighbouring shot); the edge slivers aren't this shot's camera.
+        inner_start = max(shot_start, head if index == 0 else 0.0) + SAMPLE_MARGIN
+        inner_end = min(shot_end, duration - tail if shot_end >= duration else shot_end) - SAMPLE_MARGIN
+        shot_samples = [faces for t, faces in samples if inner_start <= t <= inner_end]
+        if not shot_samples:  # a short shot: look at its middle frame
+            middle = _frame_at(source, start_time + (inner_start + inner_end) / 2, (FACE_FRAME_WIDTH, face_height))
+            shot_samples = [faces_in(middle)] if middle is not None else []
         detections = [face for faces in shot_samples for face in faces]
         x: int | None = None
         has_face = False
@@ -869,12 +1014,25 @@ def analyze_crop_plan(
             group = spread_samples >= GROUP_SHOT_PRESENCE * len(shot_samples)
             if group:
                 speakers = _speaker_pair(clusters, len(shot_samples))
-        raw_shots.append((shot_start, shot_end, x if has_face else None, group, speakers))
+        if raw_shots and shot_end - shot_start < MIN_SHOT_SECONDS and not has_face:
+            # A quick shot with no face to frame: part of the shot before it.
+            previous = raw_shots[-1]
+            raw_shots[-1] = (previous[0], shot_end, *previous[2:])
+            continue
+        moves: tuple[tuple[float, int], ...] = ()
+        if has_face and not group and x is not None:
+            track = [
+                (t, min(faces, key=lambda face: abs(face[0] - face_center))[0])
+                for t, faces in samples
+                if inner_start <= t <= inner_end and faces
+            ]
+            moves = _reframes(track, x, crop_width, frame_width, start_time)
+        raw_shots.append((shot_start, shot_end, x if has_face else None, group, speakers, moves))
 
     # Shots without a face reuse the nearest face shot's position (or the center).
     shots: list[Shot] = []
-    known = [(s, x) for s, _e, x, _g, _p in raw_shots if x is not None]
-    for shot_start, shot_end, x, group, speakers in raw_shots:
+    known = [(s, x) for s, _e, x, _g, _p, _m in raw_shots if x is not None]
+    for shot_start, shot_end, x, group, speakers, moves in raw_shots:
         has_face = x is not None
         if x is None:
             x = min(known, key=lambda item: abs(item[0] - shot_start))[1] if known else center_x
@@ -886,6 +1044,7 @@ def analyze_crop_plan(
                 has_face=has_face,
                 group=group,
                 speakers=speakers,
+                moves=moves if has_face else (),
             )
         )
     return CropPlan(
@@ -895,6 +1054,7 @@ def analyze_crop_plan(
         crop_height=crop_height,
         y=y,
         shots=tuple(shots),
+        cuts=tuple(start_time + cut for cut in cuts),
     )
 
 

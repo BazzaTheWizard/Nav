@@ -62,6 +62,7 @@ from core.lead_harvester import (
     generate_search_queries,
     lead_profile,
 )
+from core.graphics_director import VideoInfo
 from core.hook_selector import replay_peaks
 from core.pipeline import (
     MIN_CLIPS,
@@ -1613,10 +1614,12 @@ def _render_selected_clips(
     words: list[Word],
     layouts_out: list[str] | None = None,
     rendered_out: list[Any] | None = None,
+    graphics: VideoInfo | None = None,
 ) -> list[Path]:
     """Render each clip (2 or 3 after the quality gate). ``layouts_out`` receives
     each clip's layout, for the Outbox record; ``rendered_out`` the full results
-    (for the Outbox preview and trim files)."""
+    (for the Outbox preview and trim files). ``graphics``: the video's title, channel and
+    description; the graphics director adds each clip's graphics (Round 28)."""
     rendered = [
         render_selected_clip(
             source_path,
@@ -1627,6 +1630,7 @@ def _render_selected_clips(
             layout_mode="auto",
             work_dir=job_dir,
             title_fade_in=False,  # the hook is on screen from the very first frame
+            graphics=graphics,
         )
         for index, clip in enumerate(clips, start=1)
     ]
@@ -1764,8 +1768,9 @@ def _process_lead(
             peaks = replay_peaks(downloaded.get("heatmap"))  # type: ignore[arg-type]
             if peaks:
                 logger.info("Using %d 'Most replayed' peak(s) for clip picking.", len(peaks))
+            video_info = downloaded
         else:
-            _info, peaks = video_info_and_peaks(video_url)
+            video_info, peaks = video_info_and_peaks(video_url)
         report: dict[str, Any] = {}
         try:
             clips, outreach_email, subject = pick_clips_with_agent(
@@ -1794,6 +1799,8 @@ def _process_lead(
             words,
             layouts,
             rendered_items,
+            graphics=VideoInfo(title=str(video_title or ""), channel=str(channel_title or ""),
+                               description=str(video_info.get("description") or "")),
         )
         if rendered_items:
             try:

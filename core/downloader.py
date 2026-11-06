@@ -228,8 +228,6 @@ __all__ = [
     "download_source_video",
     "extract_audio_only",
     "extract_audio_segment",
-    "fetch_captions",
-    "download_section",
 ]
 
 
@@ -318,6 +316,7 @@ def _download_url(
             "channel": info.get("channel") or info.get("uploader"),
             "duration": info.get("duration"),
             "heatmap": info.get("heatmap") if isinstance(info.get("heatmap"), list) else None,
+            "description": str(info.get("description") or "")[:3000],  # the name card's source
         }
     downloaded_files = list(settings.raw_dir.glob(f"{download_id}*.mp4"))
     if len(downloaded_files) != 1 or not downloaded_files[0].is_file():
@@ -403,104 +402,8 @@ def fetch_video_info(url: str) -> dict[str, object]:
         "channel": info.get("channel") or info.get("uploader"),
         "duration": info.get("duration"),
         "heatmap": heatmap if isinstance(heatmap, list) else None,
+        "description": str(info.get("description") or "")[:3000],  # the name card's source (graphics)
     }
-
-
-# --- ✂️ Quote grabber (Make clips) -----------------------------------------------------
-CAPTION_LANGUAGES = ("en", "en-US", "en-GB", "en-orig")
-
-
-def _caption_track(info: dict[str, object]) -> dict[str, object] | None:
-    """The video's English captions as json3: the uploader's own first, else YouTube's
-    automatic ones. None when there are none."""
-    for field in ("subtitles", "automatic_captions"):
-        tracks = info.get(field) if isinstance(info.get(field), dict) else {}
-        languages = [lang for lang in CAPTION_LANGUAGES if lang in tracks] + sorted(
-            lang for lang in tracks if str(lang).startswith("en") and lang not in CAPTION_LANGUAGES
-        )
-        for lang in languages:
-            for track in tracks.get(lang) or []:
-                if isinstance(track, dict) and track.get("ext") == "json3" and track.get("url"):
-                    return track
-    return None
-
-
-def parse_json3_captions(text: str) -> list[tuple[float, float, str]]:
-    """YouTube json3 captions -> [(start s, end s, text)], one per caption event."""
-    import json
-
-    lines: list[tuple[float, float, str]] = []
-    for event in (json.loads(text) or {}).get("events") or []:
-        words = "".join(str(seg.get("utf8", "")) for seg in event.get("segs") or [])
-        words = " ".join(words.split())
-        if not words:
-            continue
-        start = float(event.get("tStartMs", 0)) / 1000.0
-        end = start + float(event.get("dDurationMs", 0)) / 1000.0
-        lines.append((start, max(end, start + 0.5), words))
-    return lines
-
-
-def fetch_captions(url: str) -> tuple[dict[str, object], list[tuple[float, float, str]]]:
-    """(title/channel/duration, caption lines) without downloading the video. The lines
-    are empty when the video has no English captions."""
-    from yt_dlp import YoutubeDL
-
-    def run(options: dict[str, object]) -> tuple[object, str | None]:
-        with YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, download=False)
-            track = _caption_track(info) if isinstance(info, dict) else None
-            if track is None:
-                return info, None
-            return info, downloader.urlopen(str(track["url"])).read().decode("utf-8")
-
-    info, text = _with_sign_in(
-        run, {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}, "the video's captions"
-    )
-    if not isinstance(info, dict):
-        raise RuntimeError(f"Could not read the video's details for {url}")
-    details = {"title": info.get("title"), "channel": info.get("channel") or info.get("uploader"), "duration": info.get("duration")}
-    return details, parse_json3_captions(text) if text else []
-
-
-def download_section(url: str, start: float, end: float, output_path: str | Path) -> Path:
-    """Download only ``start``-``end`` seconds of a video (cut at exactly those times),
-    as MP4: a 30-second quote out of a 2-hour podcast, without the 2 hours."""
-    from yt_dlp import YoutubeDL
-    from yt_dlp.utils import download_range_func
-
-    if not 0 <= start < end:
-        raise ValueError("The section must satisfy 0 <= start < end.")
-    destination = Path(output_path).expanduser().resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    download_id = uuid.uuid4().hex
-    template = str(destination.parent / f"section_{download_id}.%(ext)s")
-    options = {
-        "format": VIDEO_FORMAT,
-        "format_sort": video_format_sort(),
-        "outtmpl": template,
-        "noplaylist": True,
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "noprogress": True,
-        "no_warnings": True,
-        "ffmpeg_location": shutil.which("ffmpeg"),
-        "download_ranges": download_range_func(None, [(start, end)]),
-        "force_keyframes_at_cuts": True,
-    }
-
-    def run(run_options: dict[str, object]) -> object:
-        with YoutubeDL(run_options) as downloader:
-            return downloader.extract_info(url, download=True)
-
-    _with_sign_in(run, options, "the quote")
-    found = sorted(destination.parent.glob(f"section_{download_id}*"))
-    if not found:
-        raise RuntimeError("yt-dlp finished but saved no file for the quote.")
-    for extra in found[1:]:
-        extra.unlink(missing_ok=True)
-    found[0].replace(destination)
-    return destination
 
 
 def _require_ffmpeg() -> str:

@@ -162,9 +162,11 @@ def rerender_clip(
         x_expression = None
         full_frame: list[tuple[float, float]] = []
         split = None
+        holds = (0.0, 0.0)
         if crop_plan is not None and layout_mode in CROP_LAYOUTS:
             crop = crop_plan.crop
             x_expression = crop_plan.x_expression(new_start, new_end)
+            holds = crop_plan.holds(new_start, new_end)
             if layout_mode == "smart_crop":
                 # Same as first renders: slides and wide shots show the whole frame,
                 # two-person shots the two-speaker split view.
@@ -221,6 +223,7 @@ def rerender_clip(
             full_frame_ranges=full_frame or None,
             split_view=split,
             webinar=webinar if layout_mode == "webinar" else None,
+            holds=holds,
         )
         temporary_output.replace(destination)
     finally:

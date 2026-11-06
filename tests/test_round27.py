@@ -277,8 +277,8 @@ for template, card in ok.items():
 broken = {t: str(f) for t, f in drawn.items() if isinstance(f, Exception)}
 check("All 13 graphics draw", not broken, str(broken))
 sizes = {t: (f.width, f.height, f.top) for t, f in drawn.items() if not isinstance(f, Exception)}
-check("Over-the-speaker graphics are full frame; charts are the lower 1080x1312",
-      all(sizes[t] == ((1080, 1920, 0) if MODES[t] == "overlay" else (1080, 1312, 608)) for t in sizes), str(sizes))
+check("Over-the-speaker graphics are full frame; charts are the lower 76% (Round 28: 24/76 split)",
+      all(sizes[t] == ((1080, 1920, 0) if MODES[t] == "overlay" else (1080, 1460, 460)) for t in sizes), str(sizes))
 frames = drawn["metric_bars"]
 first, middle, last = (Image.open(frames.pattern % k) for k in (0, frames.count // 2, frames.count - 1))
 check("Chart frames: clear at the start, drawn mid-way (the canvas is laid under them)",
@@ -445,8 +445,9 @@ next(b for b in app.button if b.label.startswith("🎬 Render this clip")).click
 sent = json.loads(calls.read_text()) if calls.is_file() else None
 check("Rendering sends the graphics, the saved accent, the title length and the clip renderer",
       sent == [["speaker_title", "metric_bars"], "#5EC8F2", 4.0, True], str(sent))
-check("The version with graphics can be downloaded",
-      any(b.label == "Download the version with graphics" for b in app.get("download_button")))
+new_path = Path(app.session_state["generated_clips"][0][0])
+check("The clip is replaced by the version with graphics (Round 28: no separate copy)",
+      new_path != clip_file and new_path.is_file() and not clip_file.exists(), str(new_path))
 check("No leftover watermark or footnote fields in the app",
       not any(t.label.startswith(("Footnote", "Eyebrow", "Name in the corner")) for t in app.text_input))
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import tempfile
 import subprocess
 import uuid
 from pathlib import Path
@@ -29,6 +30,7 @@ from core.video_renderer import _video_encoder_args
 
 FRAME_W, FRAME_H = 1080, 1920
 FONTS = Path(__file__).resolve().parents[1] / "assets" / "fonts"
+ENTER = 0.3  # seconds (9 frames): the split view dissolves in
 CAPTION_BOTTOM = 1440  # calm captions sit with their bottom here (above where apps cover the screen)
 CAPTION_CHARS = 30
 BLUR = "boxblur=18:2"
@@ -147,21 +149,24 @@ def compose_cards(
     if len(frames) != len(edit.cards):
         raise ValueError("One set of frames per card.")
     output = Path(output).resolve()
-    work = output.parent
-    work.mkdir(parents=True, exist_ok=True)
+    base_clip, source_video, output = Path(base_clip).resolve(), Path(source_video).resolve(), Path(output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="graphics-"))  # captions and masks; removed after
     duration = edit.end - edit.start
     windows = windows_of(edit)
     splits = [k for k, card in enumerate(edit.cards) if MODES[card.template] == "split"]
     ass = calm_captions(words, edit, work / f"calm_{uuid.uuid4().hex}.ass")
 
     inputs = ["-i", str(base_clip)]
-    graph = ["[0:v]fps=30,format=yuv420p[v0]"]
+    graph = ["[0:v]format=yuv420p[v0]"]  # the clip's own frame rate: no repeated or dropped frames
     next_input = 1
     if splits:
         inputs += ["-ss", f"{edit.start:.3f}", "-t", f"{duration:.3f}", "-i", str(source_video)]
         labels = "".join(f"[sp{k}]" for k in splits)
+        # The speaker's strip: a 2.35:1 band of the frame, a little above centre so heads
+        # (which sit high in an interview frame) aren't cut.
         graph.append(f"[1:v]scale={FRAME_W}:{SPLIT_TOP}:force_original_aspect_ratio=increase:flags=lanczos,"
-                     f"crop={FRAME_W}:{SPLIT_TOP},setsar=1,fps={FPS},split={len(splits)}{labels}")
+                     f"crop={FRAME_W}:{SPLIT_TOP}:0:'(ih-oh)*0.35',setsar=1,split={len(splits)}{labels}")
         next_input = 2
     current, n = "v0", 0
     order = sorted(range(len(edit.cards)), key=lambda k: edit.cards[k].start)
@@ -195,9 +200,11 @@ def compose_cards(
         else:
             graph.append(f"color=c={_hex(CANVAS)}:s={FRAME_W}x{FRAME_H}:r={FPS}:d={duration:.3f}[cv{k}]")
             graph.append(f"[cv{k}][sp{k}]overlay=0:0[sb{k}]")
-            # Leaving: the split view dissolves back into the full-screen speaker over EXIT
-            # seconds while the chart slides down and fades (no snap back).
+            # Coming in, the split view dissolves in over ENTER seconds (the chart then draws
+            # itself); leaving, it dissolves back into the full-screen speaker over EXIT
+            # seconds while the chart slides down and fades. No snap either way.
             graph.append(f"[sb{k}][{graphic}]overlay=0:{SPLIT_TOP}:eof_action=repeat,format=rgba,"
+                         f"fade=t=in:st={a:.3f}:d={ENTER}:alpha=1,"
                          f"fade=t=out:st={b - EXIT - 1 / FPS:.3f}:d={EXIT}:alpha=1[split{k}]")
             graph.append(f"[{current}][split{k}]overlay=0:0:enable='{on}'[v{n + 1}]")
             current, n = f"v{n + 1}", n + 1
@@ -213,7 +220,7 @@ def compose_cards(
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Adding the graphics failed: {exc.stderr.strip()[-700:]}") from exc
     finally:
-        ass.unlink(missing_ok=True)
+        shutil.rmtree(work, ignore_errors=True)
     return output
 
 

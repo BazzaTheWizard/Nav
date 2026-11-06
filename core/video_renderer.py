@@ -195,6 +195,36 @@ def _audio_filter(ffmpeg: str, source: Path, start: float, duration: float) -> s
     )
 
 
+def _hold_edges(filter_complex: str, holds: tuple[float, float], duration: float) -> str:
+    """Hold the main shot's first frame over the clip's first ``holds[0]`` seconds and its
+    last frame over the final ``holds[1]`` seconds (see render_clip), on the finished
+    picture ([base]). No other frame is re-timed, so every crop switch still lands on its
+    cut and the picture stays in sync with the sound.
+    Head: the first frame at or after the cut, laid over the sliver (only that sliver is
+    buffered). Tail: the picture stops at the cut and its last frame is repeated."""
+    head, tail = (max(0.0, float(value)) for value in holds)
+    if (head <= 0 and tail <= 0) or filter_complex.count("[base]") != 1:
+        return filter_complex
+    chain = filter_complex.replace("[base]", "[unheld]")
+    current = "unheld"
+    if tail > 0:
+        cut = duration - tail
+        chain += (f";[{current}]trim=end={cut:.3f},tpad=stop_duration={tail + 0.2:.3f}:stop_mode=clone,"
+                  f"trim=end={duration:.3f}[tailed]")
+        current = "tailed"
+    if head > 0:
+        frames = int(head * 60) + 30  # a still well past the sliver (the overlay uses it only there)
+        chain += (
+            f";[{current}]split=2[held_main][held_first]"
+            f";[held_first]trim=start={head:.3f},setpts=PTS-STARTPTS,trim=end_frame=1,"
+            f"loop=loop={frames}:size=1:start=0,setpts=N/60/TB[held_still]"
+            f";[held_main][held_still]overlay=0:0:enable='lt(t,{head:.3f})':eof_action=pass[base]"
+        )
+    else:
+        chain += f";[{current}]null[base]"
+    return chain
+
+
 def render_clip(
     video_path: str | Path,
     subtitle_path: str | Path,
@@ -208,8 +238,13 @@ def render_clip(
     full_frame_ranges: list[tuple[float, float]] | None = None,
     split_view: SplitView | None = None,
     webinar: WebinarLayout | None = None,
+    holds: tuple[float, float] = (0.0, 0.0),
 ) -> Path:
     """Render one vertical clip.
+
+    ``holds`` (head, tail) seconds (from CropPlan.holds): the clip opens or closes on a
+    sliver of another camera; the main shot's first frame is held over the head and its
+    last frame over the tail, so the picture never flashes a badly framed shot.
 
     ``crop_x_expression`` (from CropPlan.x_expression) lets the crop follow
     camera cuts; when omitted, ``crop.x`` is used for the whole clip.
@@ -343,6 +378,7 @@ def render_clip(
             f"[0:v]{crop_filter},"
             f"scale=1080:1920:flags=lanczos{crop_sharpen}[base]"
         )
+    filter_complex = _hold_edges(filter_complex, holds, end_time - start_time)
     # Tag the picture as Rec. 709 (SDR HD) so captions, the title card and players
     # all use the same colors; some layouts dropped the source's tags.
     color = _source_color(source)

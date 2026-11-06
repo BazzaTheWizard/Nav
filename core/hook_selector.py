@@ -118,6 +118,10 @@ def _clip_bounds(
     sentence_start = sentences[sentence_start_index][0]
     sentence_end, final_word_index = sentences[sentence_end_index][1:]
     clip_start = max(0.0, sentence_start - PRE_ROLL_SECONDS)
+    if sentence_start_index > 0:
+        # Never open on the tail of the sentence before (its last word flashed as a caption).
+        previous_end = ordered_words[sentences[sentence_start_index - 1][2]].end
+        clip_start = max(clip_start, min(previous_end, sentence_start))
     final_word = ordered_words[final_word_index]
     next_word: Word | None = None
     for index in range(final_word_index + 1, len(ordered_words)):

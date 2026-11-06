@@ -633,6 +633,11 @@ def clip_words_from_transcript(
     for word in words:
         if word.end <= clip_start or word.start >= clip_end:
             continue
+        # A word mostly cut off by the clip's start (the end of the sentence before) or end
+        # (the start of the next one) is barely heard: no caption flash for it.
+        length = max(word.end - word.start, 1e-6)
+        if (clip_start - word.start) > length / 2 or (word.end - clip_end) > length / 2:
+            continue
         relative_start = max(0.0, word.start - clip_start)
         relative_end = min(clip_duration, word.end - clip_start)
         if relative_end > relative_start:

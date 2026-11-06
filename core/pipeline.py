@@ -6,6 +6,7 @@ copy didn't reach the others.
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,9 @@ from core.agent_brain import judge_clips, select_clips_and_draft_pitch
 from core.clipper import _center_crop
 from core.downloader import extract_audio_segment, fetch_video_info
 from core import explainer
+from core.edl import ClipEdit
 from core.face_tracker import CropBox, CropPlan, _probe_display_size, analyze_crop_plan
+from core.graphics_director import VideoInfo
 from core.hook_selector import ClipResult, choose_clips, clip_text, prepare_candidates, replay_peaks
 from core.subtitle_engine import create_ass_subtitles
 from core.outreach import (
@@ -58,6 +61,8 @@ class RenderedClip:
     webinar: WebinarLayout | None = None  # layout "webinar": reused when the clip is trimmed
     pin_title: bool = False  # the title card stayed on for the whole clip
     title_fade_in: bool = True  # False: the card was on screen from frame 0 (worker clips)
+    graphics: ClipEdit | None = None  # the graphics rendered into the clip (Round 28)
+    graphics_notes: tuple[str, ...] = ()  # what the graphics director added or left out, and why
 
 
 def choose_layout(requested: str, plan: CropPlan | None) -> str:
@@ -94,6 +99,7 @@ def render_selected_clip(
     webinar_layout: WebinarLayout | None = None,
     title_fade_in: bool = True,
     allow_explainer: bool = False,
+    graphics: VideoInfo | None = None,
 ) -> RenderedClip:
     """Subtitles, framing and render for one selected clip.
 
@@ -103,13 +109,15 @@ def render_selected_clip(
     ``slides``, ``divider``, ``accent``); ``webinar_layout`` a layout found before (a
     trim reuses the first render's). ``title_fade_in``: False shows the title card fully
     from the first frame (the worker's clips). ``allow_explainer`` (Make clips): "auto"
-    may choose the explainer layout for a faceless slide video (core.explainer)."""
+    may choose the explainer layout for a faceless slide video (core.explainer).
+    ``graphics`` (the video's title, channel and description): the graphics director picks
+    and checks this clip's graphics and they're rendered in (settings.auto_graphics);
+    RenderedClip.graphics holds what was added, RenderedClip.graphics_notes why."""
     work_dir = work_dir or settings.temp_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     subtitle_path = work_dir / f"{output_path.stem}.ass"
     clip_audio_path = work_dir / f"{output_path.stem}.wav"
     start, end = clip.start_time, clip.end_time
-    title: TitleOverlay | None = None
     try:
         clip_words = clip_words_from_transcript(words, start, end)
         if clip_words is None:
@@ -135,67 +143,122 @@ def render_selected_clip(
 
         full_frame: list[tuple[float, float]] = []
         split = None
+        holds = (0.0, 0.0)
         if layout in CROP_LAYOUTS:
             crop = plan.crop if plan is not None else _center_crop(source_video, None)
             x_expression = plan.x_expression(start, end) if plan is not None else None
+            if plan is not None:
+                holds = plan.holds(start, end)
             if layout == "smart_crop" and plan is not None:
                 full_frame = plan.full_frame_ranges(start, end)
                 split = plan.split_view(start, end)
         else:
             crop, x_expression = _PLACEHOLDER_CROP, None
 
-        try:
-            title = prepare_title_overlay(
-                clip.viral_title,
-                settings.hook_title_seconds,
-                layout=layout,
-                plan=plan,
-                crop=crop,
-                source_video=source_video,
-                clip_start=start,
-                clip_duration=end - start,
-                work_dir=work_dir,
-                name=output_path.stem,
-                style=settings.hook_title_style,
-                pinned=pin_title,
-                webinar=webinar,
-                fade_in=title_fade_in,
+        direction = None
+        # The graphics work in source seconds; the captions in clip seconds.
+        source_words = [Word(text=w.text, start=w.start + start, end=w.end + start) for w in clip_words]
+        if graphics is not None and settings.auto_graphics:
+            from core.edl import load_brand_kit
+            from core.graphics_director import direct
+
+            direction = direct(
+                source_words, start, end, info=graphics, hook_seconds=settings.hook_title_seconds,
+                plan=plan if layout == "smart_crop" else None, brand=load_brand_kit(),
             )
-        except Exception:
-            logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
-        create_ass_subtitles(
-            clip_words,
-            subtitle_path,
-            clip_duration=end - start,
-            highlight_active_word=settings.caption_highlight,
-            # The card replaces the old subtitle-style title; that one is only a fallback.
-            hook_title=None if title else clip.viral_title,
-            hook_seconds=end - start if pin_title else settings.hook_title_seconds,
-            seam_spans=split.spans if split else None,
-            seam_title=_seam_title(title),
-            caption_top=webinar.caption_top if webinar else _explainer_caption_top(layout, source_video),
-        )
-        rendered = render_clip(
-            source_video,
-            subtitle_path,
-            crop,
-            start,
-            end,
-            output_path,
-            layout_mode=layout,
-            crop_x_expression=x_expression,
-            title=title,
-            full_frame_ranges=full_frame or None,
-            split_view=split,
-            webinar=webinar,
-        )
+            for note in direction.notes:
+                logger.info("Graphics, %s: %s", output_path.name, note)
+        with_graphics = direction is not None and bool(direction.edit.cards)
+        # With graphics the title shows for the opening only, so it never sits under one.
+        pinned = pin_title and not with_graphics
+
+        def render_version(caption_words: list[Word], destination: Path) -> Path:
+            title: TitleOverlay | None = None
+            try:
+                try:
+                    title = prepare_title_overlay(
+                        clip.viral_title,
+                        settings.hook_title_seconds,
+                        layout=layout,
+                        plan=plan,
+                        crop=crop,
+                        source_video=source_video,
+                        clip_start=start,
+                        clip_duration=end - start,
+                        work_dir=work_dir,
+                        name=destination.stem,
+                        style=settings.hook_title_style,
+                        pinned=pinned,
+                        webinar=webinar,
+                        fade_in=title_fade_in,
+                    )
+                except Exception:
+                    logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
+                create_ass_subtitles(
+                    caption_words,
+                    subtitle_path,
+                    clip_duration=end - start,
+                    highlight_active_word=settings.caption_highlight,
+                    # The card replaces the old subtitle-style title; that one is only a fallback.
+                    hook_title=None if title else clip.viral_title,
+                    hook_seconds=end - start if pinned else settings.hook_title_seconds,
+                    seam_spans=split.spans if split else None,
+                    seam_title=_seam_title(title),
+                    caption_top=webinar.caption_top if webinar else _explainer_caption_top(layout, source_video),
+                )
+                return render_clip(
+                    source_video,
+                    subtitle_path,
+                    crop,
+                    start,
+                    end,
+                    destination,
+                    layout_mode=layout,
+                    crop_x_expression=x_expression,
+                    title=title,
+                    full_frame_ranges=full_frame or None,
+                    split_view=split,
+                    webinar=webinar,
+                    holds=holds,
+                )
+            finally:
+                if title is not None:
+                    title.image_path.unlink(missing_ok=True)
+
+        rendered: Path | None = None
+        applied = None
+        if with_graphics:
+            from core.dynamic_layout import render_with_cards
+
+            graphics_dir = work_dir / f"{output_path.stem}_graphics"
+            try:
+                graphics_dir.mkdir(parents=True, exist_ok=True)
+                rendered, _checks = render_with_cards(
+                    source_video, direction.edit, source_words, output_path, graphics_dir,
+                    lambda kept: render_version(
+                        [Word(text=w.text, start=w.start - start, end=w.end - start) for w in kept],
+                        graphics_dir / f"{output_path.stem}_base.mp4",
+                    ),
+                    hook_seconds=settings.hook_title_seconds,
+                )
+                applied = direction.edit if rendered is not None else None
+            except Exception as exc:  # noqa: BLE001 - a graphics failure never costs the clip
+                logger.warning("Graphics failed for %s; rendering without them.", output_path.name, exc_info=True)
+                direction.notes.append(f"Graphics left out: {exc}")
+                rendered = None
+            finally:
+                shutil.rmtree(graphics_dir, ignore_errors=True)
+        if rendered is None:
+            pinned = pin_title
+            rendered = render_version(clip_words, output_path)
         logger.info(
-            "Rendered %s (%s, %d shot(s), %d shown full-frame, %d as two-speaker split)",
+            "Rendered %s (%s, %d shot(s), %d shown full-frame, %d as two-speaker split, %d graphic(s))",
             rendered.name,
             layout,
             len(plan.shots) if plan else 1,
             len(full_frame),
             len(split.spans) if split else 0,
+            len(applied.cards) if applied else 0,
         )
         return RenderedClip(
             path=rendered,
@@ -204,14 +267,14 @@ def render_selected_clip(
             crop=crop,
             crop_plan=plan if layout in CROP_LAYOUTS else None,
             webinar=webinar,
-            pin_title=pin_title,
+            pin_title=pinned,
             title_fade_in=title_fade_in,
+            graphics=applied,
+            graphics_notes=tuple(direction.notes) if direction else (),
         )
     finally:
         subtitle_path.unlink(missing_ok=True)
         clip_audio_path.unlink(missing_ok=True)
-        if title is not None:
-            title.image_path.unlink(missing_ok=True)
 
 
 def _explainer_caption_top(layout: str, source_video: Path) -> int | None:
