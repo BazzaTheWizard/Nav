@@ -13,7 +13,7 @@ from core.face_tracker import CropBox, CropPlan, _probe_display_size
 from core.subtitle_engine import create_ass_subtitles
 from core.title_card import TitleOverlay, prepare_title_overlay, title_above_captions
 from core.transcriber import Word
-from core.video_renderer import CROP_LAYOUTS, render_clip
+from core.video_renderer import CROP_LAYOUTS, pull_in_enabled, render_clip
 from core.webinar import WebinarLayout, plan_webinar
 
 logger = logging.getLogger(__name__)
@@ -224,6 +224,8 @@ def rerender_clip(
             split_view=split,
             webinar=webinar if layout_mode == "webinar" else None,
             holds=holds,
+            pull_in_until=(crop_plan.pull_in_until(new_start, new_end)
+                           if layout_mode == "smart_crop" and crop_plan is not None and pull_in_enabled() else 0.0),
         )
         temporary_output.replace(destination)
     finally:

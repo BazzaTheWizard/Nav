@@ -268,7 +268,7 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
     count = {"kinetic_range": (1, 1), "buckets": (2, 3), "speaker_title": (1, 1), "timeline": (2, 4),
              "metric_bars": (2, 4), "ranked_bars": (2, 5), "diverging_bar": (2, 2), "share_split": (2, 5),
              "trend_line": (2, 6), "arr_bridge": (3, 7), "sankey_flow": (3, 8), "cac_payback": (2, 2),
-             "candlestick_ema": (0, 0)}[card.template]
+             "drawdown_curve": (2, 2), "candlestick_ema": (0, 0)}[card.template]
     if not count[0] <= len(rows) <= count[1]:
         errors.append(f"This graphic takes {count[0]}{'' if count[0] == count[1] else f' to {count[1]}'} items.")
         return result
@@ -306,6 +306,9 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
                     rows[0].reveal_to = rows[0].reveal_at + 0.6
             card.start = max(card.start, rows[0].reveal_at - 0.12)
             _hold_overlay(card, rows, errors)
+        return result
+    if card.template == "drawdown_curve":
+        _check_drawdown(rows, window, tokens, numbers, errors)
         return result
     if card.template in numeric:
         for position, row in enumerate(rows, start=1):
@@ -394,6 +397,51 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
         card.start = max(card.start, first - 0.12)
         _hold_overlay(card, rows, errors)
     return result
+
+
+def _check_drawdown(rows: list[Any], window: list[Any], tokens: list[str], numbers: list[Any],
+                    errors: list[str]) -> None:
+    """A fall and a recovery: item 1 the fall as said ("−20%"), item 2 the recovery in the
+    speaker's words ("they go back up"), with a number only if one was said. The curve's
+    shape is a sketch; only these two are claims, and both must be said."""
+    fall, recovery = rows
+    value = parse_value(fall.value)
+    _limit(errors, "Item 1 value", fall.value, LIMITS["value"])
+    _limit(errors, "Item 1 label", fall.label, LIMITS["label"])
+    _limit(errors, "Item 2 label", recovery.label, LIMITS["label"])
+    if not value.numbers or value.scale != "%":
+        errors.append('Item 1 is the fall, as a percentage as said: e.g. "−20%".')
+        return
+    if fall.label and not _said(fall.label, set(tokens)):
+        errors.append(f'Item 1\'s label should use the speaker\'s words (or be empty): "{fall.label}".')
+        return
+    if not fall.value.strip().startswith(("-", "−", "–")):
+        errors.append(f'Mark the fall with a minus: "−{fall.value.strip()}".')
+        return
+    hits = _match_numbers(value, numbers, set())
+    if hits is None:
+        errors.append(f'Item 1: "{fall.value}" isn\'t said while it\'s on screen.')
+        return
+    if any(_hedge_near(tokens, hit.index) for hit in hits) and not value.hedged:
+        errors.append(f'Item 1: the speaker hedged, so "{fall.value}" must show it (~ or a range).')
+        return
+    fall.reveal_at = hits[0].start
+    if recovery.value.strip():
+        found = _match_numbers(parse_value(recovery.value), numbers, {h.index for h in hits})
+        if found is None:
+            errors.append(f'Item 2: "{recovery.value}" isn\'t said while it\'s on screen.')
+            return
+        recovery.reveal_at = max(found[0].start, fall.reveal_at + 0.8)
+    if not recovery.label.strip():
+        errors.append('Item 2 is the recovery in the speaker\'s words, e.g. "they go back up".')
+        return
+    if not _said(recovery.label, set(tokens)):
+        errors.append(f'Item 2 should use the speaker\'s words: "{recovery.label}".')
+        return
+    if recovery.reveal_at is None:
+        keys = [_clean(word) for word in recovery.label.split() if len(_clean(word)) >= 3]
+        after = [w for w in window if float(w.start) > fall.reveal_at and _clean(w.text) in keys]
+        recovery.reveal_at = max(float(after[0].start) if after else fall.reveal_at + 1.2, fall.reveal_at + 0.8)
 
 
 def _hold_overlay(card: Card, rows: list[Any], errors: list[str]) -> None:

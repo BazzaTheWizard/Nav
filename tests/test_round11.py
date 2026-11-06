@@ -70,9 +70,13 @@ check("One unsuitable two-person shot doesn't cancel the split for the others",
 check("A group shot without a pair still counts against the crop",
       P.choose_layout("auto", CropPlan(1920, 1080, 606, 1078, 1, (Shot(0, 30, 600, True, True),))) == "blurred_background")
 clusters2 = [[(400.0, 1.0, 300.0, 100.0)] * 8, [(1500.0, 1.0, 320.0, 90.0)] * 7]
-check("Speaker pair: two steady faces -> (left, right)", F._speaker_pair(clusters2, 10) == ((400.0, 300.0, 100.0), (1500.0, 320.0, 90.0)))
-check("Three steady faces -> no pair", F._speaker_pair(clusters2 + [[(900.0, 1.0, 300.0, 90.0)] * 6], 10) is None)
-check("A face seen only briefly doesn't count", F._speaker_pair([clusters2[0], [(1500.0, 1.0, 1.0, 1.0)] * 2], 10) is None)
+together = [[(400.0, 1.0, 300.0, 100.0), (1500.0, 1.0, 320.0, 90.0)]] * 7 + [[(400.0, 1.0, 300.0, 100.0)]] * 3
+check("Speaker pair: two steady faces -> (left, right)",
+      F._speaker_pair(clusters2, together, 345.6, 545.0) == ((400.0, 300.0, 100.0), (1500.0, 320.0, 90.0)))
+check("Three steady faces -> no pair",
+      F._speaker_pair(clusters2 + [[(900.0, 1.0, 300.0, 90.0)] * 6], together, 345.6, 545.0) is None)
+check("A face seen only briefly doesn't count",
+      F._speaker_pair([clusters2[0], [(1500.0, 1.0, 1.0, 1.0)] * 2], together, 345.6, 545.0) is None)
 check("Older shots without the new field still work", Shot(0, 30, 600, True, False).speakers is None)
 
 # ---------- Renderer: the split view and the time limit ----------

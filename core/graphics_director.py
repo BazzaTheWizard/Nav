@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -30,7 +29,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 MIN_STRENGTH = 7  # the AI's own 1-10 score; below this the moment isn't worth a graphic
 NAME_CARD_SECONDS = 3.3
-NAME_CARD_LATEST = 0.6  # share of the clip: a name card later than this is skipped
+_GUESTS: dict[tuple[str, str], tuple[str, str]] = {}  # (title, channel) -> the guest's (name, role)
 SHORT_CLIP_SECONDS = 30  # under this, one graphic at most
 DIRECTED = tuple(t for t in TEMPLATES if t not in {"speaker_title", "candlestick_ema"})
 _STOP = {"of", "the", "and", "at", "for", "in", "on", "a", "an", "to", "&"}
@@ -61,9 +60,12 @@ RULES
    HOOK_END s), give that sentence and the next; it comes in right after the title as a
    recap. A number or box graphic stays up only a few seconds, so never stretch one
    over sentences that don't need it.
-5. Use the lightest form that works: one number -> kinetic_range; 2-3 concepts ->
-   buckets; a chart only when 3+ related numbers are said close together (a timeline
-   needs 2+ dated points).
+5. Show, don't tell. When the speaker describes a relationship, show its shape instead of
+   printing a number they just said: a fall and a recovery (a crash, a dip, a drawdown,
+   "and then it came back") -> drawdown_curve; a comparison -> bars; dated points ->
+   timeline; growth over time -> trend_line; a whole and its parts -> share_split or
+   sankey_flow; a start, gains and losses -> arr_bridge. kinetic_range is only for one
+   standalone number with nothing to show it against; buckets for 2-3 named ideas.
 
 TEMPLATES (items: label, value, detail, parent, dashed, highlight)
 - kinetic_range: over the speaker. 1 item: value = one number, range or change
@@ -82,12 +84,17 @@ TEMPLATES (items: label, value, detail, parent, dashed, highlight)
 - sankey_flow: chart. One starting item, then items that flow out of it (parent = the
   label they flow from, at most 2 levels); each split adds up to its parent.
 - cac_payback: chart. 2 items: the cost to win a customer, the months to earn it back.
+- drawdown_curve: chart. A fall and the recovery. Item 1: value = the fall as said, as a
+  negative percentage ("−20%"), label = "" or the speaker's few words for it. Item 2:
+  label = the recovery in the speaker's words ("they go back up", ≤26 chars), value = a
+  number only if one was said ("4 yrs"), else "".
 Set highlight = true on the one item the point is about. Chart headline: 2-4 words, or "".
 
-NAME CARD: if the clip's main speaker is a guest whose full name is in the video title or
-description, give {"name": ..., "role": ...} with the role taken from the title or
-description (≤42 chars, e.g. "Professor of Finance, MIT Sloan"). Never the channel's own
-host. If you are not sure who is speaking, null.
+THE GUEST: if the video has a guest whose full name is in the video title or description,
+always give {"name": ..., "role": ...}, with the role taken from the title or description
+(≤42 chars, e.g. "Professor of Finance, MIT Sloan"). Every clip carries the guest's name
+card (it's placed on the guest's own face), even when the host talks most in this clip.
+Never the channel's own host. If the video has no named guest, null.
 
 Return JSON only:
 {"graphics": [{"template": "...", "first_sentence": 3, "last_sentence": 4, "strength": 1-10,
@@ -210,41 +217,48 @@ def grounded_name(speaker: Any, info: VideoInfo) -> tuple[str, str] | None:
     return name, role
 
 
-def _main_speaker_shots(plan: Any, clip_start: float, clip_end: float) -> list[tuple[float, float]]:
-    """(start, end) of the single-person shots of whoever is on screen most (the guest's
-    camera, usually), clip times in source seconds."""
-    if plan is None:
-        return [(clip_start, clip_end)]
-    singles = [s for s in plan.shots if s.has_face and not s.group and s.end > clip_start and s.start < clip_end]
-    if not singles:
-        return []
-    tolerance = plan.frame_width * 0.12
-    groups: list[list[Any]] = []
-    for shot in singles:
-        for group in groups:
-            if abs(statistics.median(s.x for s in group) - shot.x) <= tolerance:
-                group.append(shot)
-                break
-        else:
-            groups.append([shot])
-    main = max(groups, key=lambda g: sum(min(s.end, clip_end) - max(s.start, clip_start) for s in g))
-    return sorted((max(s.start, clip_start), min(s.end, clip_end)) for s in main)
+def _add_name_card(direction: Direction, named: tuple[str, str], clip_words: list[Any], clip_start: float,
+                   clip_end: float, hook: float, plan: Any, source: Any, strengths: dict[int, int]) -> None:
+    """The guest's name card: in every clip, on the guest's own face (core.name_cards),
+    never counted toward the graphics limit. If the data graphics leave no free moment
+    while the guest is on screen, the weakest one makes room."""
+    from core import name_cards
 
-
-def _name_slot(shots: list[tuple[float, float]], taken: list[Card], clip_start: float, clip_end: float,
-               hook: float) -> float | None:
-    """Earliest start for the name card: inside one of the guest's shots, after the title,
-    clear of the other graphics, and early enough to still introduce them."""
-    earliest = clip_start + hook + 0.2
-    latest = clip_start + NAME_CARD_LATEST * (clip_end - clip_start)
-    for shot_start, shot_end in shots:
-        t = max(earliest, shot_start + 0.3)
-        while t + NAME_CARD_SECONDS <= min(shot_end - 0.2, clip_end - PAYOFF_SECONDS) and t <= latest:
-            clash = next((c for c in taken if t < c.end + MIN_GAP and c.start < t + NAME_CARD_SECONDS + MIN_GAP), None)
-            if clash is None:
-                return round(t, 3)
-            t = clash.end + MIN_GAP
-    return None
+    edit = direction.edit
+    name, role = named
+    card: Card | None = None
+    if plan is not None and source is not None:
+        try:
+            card, where = name_cards.name_card(source, plan, clip_start, clip_end, hook, edit.cards, name, role)
+            for weakest in sorted(edit.cards, key=lambda c: strengths.get(id(c), 0)) if card is None else []:
+                others = [c for c in edit.cards if c is not weakest]
+                card, where_now = name_cards.name_card(source, plan, clip_start, clip_end, hook, others, name, role)
+                if card is not None:
+                    edit.cards.remove(weakest)
+                    direction.notes.append(f"Dropped {weakest.template} to make room for the guest's name card.")
+                    where = where_now
+                    break
+        except Exception as exc:  # noqa: BLE001 - the clip still renders without it
+            logger.warning("Name card placement failed: %s", exc)
+            card, where = None, f"placing it failed ({exc})"
+    else:  # no crop plan (another layout): the standard spot, at the first free moment
+        start = clip_start + hook + 0.2
+        for other in sorted(edit.cards, key=lambda c: c.start):
+            if start < other.end + MIN_GAP and other.start < start + NAME_CARD_SECONDS + MIN_GAP:
+                start = other.end + MIN_GAP
+        where = "in the standard spot"
+        if start + NAME_CARD_SECONDS <= clip_end - PAYOFF_SECONDS:
+            card = Card("speaker_title", start=start, end=start + NAME_CARD_SECONDS, rows=[CardRow(name, detail=role)])
+    if card is None:
+        direction.notes.append(f"No name card for {name}: {where}.")
+        return
+    result = check_edit(ClipEdit(clip_start, clip_end, cards=edit.cards + [card]), clip_words, hook)[-1]
+    if not result.ok:
+        direction.notes.append(f"No name card for {name}: {result.errors[0]}")
+        return
+    edit.cards.append(card)
+    edit.cards.sort(key=lambda c: c.start)
+    direction.notes.append(f"Added the name card ({name}) at {_clock(card.start - clip_start)}, {where}.")
 
 
 def direct(
@@ -257,10 +271,12 @@ def direct(
     plan: Any = None,
     brand: BrandKit | None = None,
     ask: Callable[[str, str], str | None] | None = None,
+    source: str | Path | None = None,
 ) -> Direction:
     """The clip's graphics, every one checked. ``words``: the clip's words (source
-    times). ``plan``: the crop plan (where the guest's own shots are, for the name card).
-    Never raises: anything that goes wrong means no graphics, with a note."""
+    times). ``plan`` and ``source``: the crop plan and the video, to find the guest's own
+    face for the name card. Never raises: anything that goes wrong means no graphics,
+    with a note."""
     from core.agent_brain import _parse_json_response
     from core.service_pause import ServicePause
 
@@ -288,6 +304,7 @@ def direct(
         return direction
 
     limit = max_graphics(duration)
+    strengths: dict[int, int] = {}
     for strength, card, reason in proposals(answer, spans):
         what = f"{card.template} ({', '.join(r.value or r.label for r in card.rows)[:40]})"
         if strength < MIN_STRENGTH:
@@ -305,25 +322,18 @@ def direct(
         if result.ok:
             edit.cards.append(card)
             edit.cards.sort(key=lambda c: c.start)
+            strengths[id(card)] = strength
             direction.notes.append(f"Added {what} at {_clock(card.start - clip_start)}: {reason}")
         else:
             direction.notes.append(f"Dropped {what}: {result.errors[0]}")
 
     named = grounded_name(answer.get("speaker"), info)
     if named:
-        slot = _name_slot(_main_speaker_shots(plan, clip_start, clip_end), edit.cards, clip_start, clip_end, hook)
-        if slot is None:
-            direction.notes.append(f"No name card for {named[0]}: no clear shot of them early in the clip.")
-        else:
-            card = Card("speaker_title", start=slot, end=slot + NAME_CARD_SECONDS,
-                        rows=[CardRow(named[0], detail=named[1])])
-            result = check_edit(ClipEdit(clip_start, clip_end, cards=edit.cards + [card]), clip_words, hook)[-1]
-            if result.ok:
-                edit.cards.append(card)
-                edit.cards.sort(key=lambda c: c.start)
-                direction.notes.append(f"Added the name card ({named[0]}) at {_clock(slot - clip_start)}.")
-            else:
-                direction.notes.append(f"No name card: {result.errors[0]}")
+        _GUESTS[(info.title, info.channel)] = named
+    else:  # the same guest as the video's other clips
+        named = _GUESTS.get((info.title, info.channel))
+    if named:
+        _add_name_card(direction, named, clip_words, clip_start, clip_end, hook, plan, source, strengths)
     # The renderer checks again; anything that wouldn't pass the second time is left out now.
     final = check_edit(edit, clip_words, hook)
     for card, result in list(zip(edit.cards, final)):

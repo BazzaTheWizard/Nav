@@ -37,7 +37,7 @@ from core.transcriber import (
     transcribe_clip_audio,
     transcript_segments,
 )
-from core.video_renderer import CROP_LAYOUTS, LAYOUT_MODES, render_clip
+from core.video_renderer import CROP_LAYOUTS, LAYOUT_MODES, pull_in_enabled, render_clip
 from core.webinar import WebinarLayout, plan_webinar
 
 
@@ -155,6 +155,9 @@ def render_selected_clip(
         else:
             crop, x_expression = _PLACEHOLDER_CROP, None
 
+        # The hook's subtle pull-in zoom (smart crop, a plain shot of one person at the start).
+        pull_until = (plan.pull_in_until(start, end)
+                      if layout == "smart_crop" and plan is not None and pull_in_enabled() else 0.0)
         direction = None
         # The graphics work in source seconds; the captions in clip seconds.
         source_words = [Word(text=w.text, start=w.start + start, end=w.end + start) for w in clip_words]
@@ -164,7 +167,7 @@ def render_selected_clip(
 
             direction = direct(
                 source_words, start, end, info=graphics, hook_seconds=settings.hook_title_seconds,
-                plan=plan if layout == "smart_crop" else None, brand=load_brand_kit(),
+                plan=plan if layout == "smart_crop" else None, brand=load_brand_kit(), source=source_video,
             )
             for note in direction.notes:
                 logger.info("Graphics, %s: %s", output_path.name, note)
@@ -220,6 +223,7 @@ def render_selected_clip(
                     split_view=split,
                     webinar=webinar,
                     holds=holds,
+                    pull_in_until=pull_until,
                 )
             finally:
                 if title is not None:
@@ -240,6 +244,9 @@ def render_selected_clip(
                         graphics_dir / f"{output_path.stem}_base.mp4",
                     ),
                     hook_seconds=settings.hook_title_seconds,
+                    seams=list(split.spans) if split else None,
+                    crop_at=((lambda t: plan.shown_rect_at(t, start, end, pull_until))
+                             if layout == "smart_crop" and plan is not None else None),
                 )
                 applied = direction.edit if rendered is not None else None
             except Exception as exc:  # noqa: BLE001 - a graphics failure never costs the clip

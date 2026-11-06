@@ -10,7 +10,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from core.face_tracker import CropBox, SplitView, _probe_display_size
+from core.face_tracker import PULL_IN, PULL_IN_CENTER_Y, PULL_IN_SECONDS, CropBox, SplitView, _probe_display_size
 from core.title_card import TitleOverlay, overlay_filter
 from core import explainer
 from core.webinar import WebinarLayout
@@ -195,6 +195,41 @@ def _audio_filter(ffmpeg: str, source: Path, start: float, duration: float) -> s
     )
 
 
+def _frame_rate(path: Path) -> float:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+                          "-of", "csv=p=0", str(path)], capture_output=True, text=True).stdout.strip()
+    try:
+        number, _slash, denominator = out.partition("/")
+        rate = float(number) / float(denominator or 1)
+        return rate if rate > 0 else 30.0
+    except (ValueError, ZeroDivisionError):
+        return 30.0
+
+
+def pull_in_enabled() -> bool:
+    """The hook pull-in is on unless HOOK_PULL_IN=0 in .env."""
+    return os.getenv("HOOK_PULL_IN", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _pull_in(filter_complex: str, until: float, rate: float) -> str:
+    """The hook's subtle pull-in on the finished picture ([base]): 1.00x to 1.05x, eased
+    out over PULL_IN_SECONDS, held until the first camera cut (``until``, where the new
+    shot hides the change back). FFmpeg's perspective filter resamples every frame at
+    sub-pixel precision (no zoompan rounding wobble: measured as steady as an exact
+    float warp) and is switched off after ``until``, so it costs only the first shot."""
+    if until <= 0.5 or filter_complex.count("[base]") != 1:
+        return filter_complex
+    frames = PULL_IN_SECONDS * rate
+    zoom = f"(1+{PULL_IN}*(1-pow(1-min(1\\,in/{frames:.4f})\\,3)))"
+    cx, cy = "W/2", f"H*{PULL_IN_CENTER_Y}"
+    left, top = f"{cx}-({cx})/{zoom}", f"{cy}-({cy})/{zoom}"
+    right, bottom = f"{cx}+(W-{cx})/{zoom}", f"{cy}+(H-{cy})/{zoom}"
+    corners = (f"x0='{left}':y0='{top}':x1='{right}':y1='{top}':"
+               f"x2='{left}':y2='{bottom}':x3='{right}':y3='{bottom}'")
+    return (filter_complex.replace("[base]", "[unzoomed]")
+            + f";[unzoomed]perspective={corners}:interpolation=cubic:eval=frame:enable='lt(t\\,{until:.3f})'[base]")
+
+
 def _hold_edges(filter_complex: str, holds: tuple[float, float], duration: float) -> str:
     """Hold the main shot's first frame over the clip's first ``holds[0]`` seconds and its
     last frame over the final ``holds[1]`` seconds (see render_clip), on the finished
@@ -239,8 +274,12 @@ def render_clip(
     split_view: SplitView | None = None,
     webinar: WebinarLayout | None = None,
     holds: tuple[float, float] = (0.0, 0.0),
+    pull_in_until: float = 0.0,
 ) -> Path:
     """Render one vertical clip.
+
+    ``pull_in_until`` (seconds, from the pipeline): the hook's subtle pull-in zoom runs
+    until then (the first camera cut); 0 means no pull-in (see _pull_in).
 
     ``holds`` (head, tail) seconds (from CropPlan.holds): the clip opens or closes on a
     sliver of another camera; the main shot's first frame is held over the head and its
@@ -379,6 +418,8 @@ def render_clip(
             f"scale=1080:1920:flags=lanczos{crop_sharpen}[base]"
         )
     filter_complex = _hold_edges(filter_complex, holds, end_time - start_time)
+    if pull_in_until > 0:
+        filter_complex = _pull_in(filter_complex, min(pull_in_until, end_time - start_time), _frame_rate(source))
     # Tag the picture as Rec. 709 (SDR HD) so captions, the title card and players
     # all use the same colors; some layouts dropped the source's tags.
     color = _source_color(source)

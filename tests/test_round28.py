@@ -256,6 +256,7 @@ card = next((c for c in named.edit.cards if c.template == "speaker_title"), None
 check("Name card from the video's own title and description, right after the title",
       card is not None and card.rows[0].label == "Dana Reyes" and card.rows[0].detail == "CEO, Northwind Labs"
       and abs(card.start - 104.2) < 1e-6 and abs(card.end - card.start - 3.3) < 1e-6, str(named.notes))
+G._GUESTS.clear()  # Round 29: a video's guest is remembered for its other clips; start fresh here
 made_up = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=answer(speaker={"name": "Sam Altman", "role": "CEO"}))
 check("...never a name that isn't in the title or description", not made_up.edit.cards)
 check("...never the channel's own host", G.grounded_name({"name": "Founders Podcast", "role": ""}, INFO) is None)
@@ -330,6 +331,7 @@ subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x4
 spoken_talk = words_from(TALK, start=2.0)
 clip = ClipResult(start_time=2.0, end_time=spoken_talk[-1].end + 0.3, viral_title="Growth in one year", caption="",
                   hashtags=[], virality_score=90)
+G._GUESTS.clear()  # no guest remembered from the checks above
 asked = []
 G.ask_ai = lambda prompt, system: asked.append(prompt) or json.dumps({"graphics": [change], "speaker": None})
 rendered = P.render_selected_clip(plain_source, clip, spoken_talk, settings, tmp / "out" / "auto.mp4",

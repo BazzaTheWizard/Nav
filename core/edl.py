@@ -20,7 +20,7 @@ from typing import Any
 TEMPLATES = (
     "kinetic_range", "buckets", "speaker_title",
     "timeline", "metric_bars", "ranked_bars", "diverging_bar", "share_split", "trend_line",
-    "arr_bridge", "sankey_flow", "cac_payback", "candlestick_ema",
+    "arr_bridge", "sankey_flow", "cac_payback", "drawdown_curve", "candlestick_ema",
 )
 TEMPLATE_LABELS = {
     "kinetic_range": "A · Number or range over the speaker",
@@ -35,6 +35,7 @@ TEMPLATE_LABELS = {
     "arr_bridge": "C · ARR bridge / waterfall (start, + and − steps, end)",
     "sankey_flow": "C · Flow of money (Sankey: revenue into costs and profit)",
     "cac_payback": "C · CAC payback (cost to win a customer, months to earn it back)",
+    "drawdown_curve": "C · Fall and recovery (a crash, a dip and the rebound)",
     "candlestick_ema": "C · Price chart (from a price file you upload, with its source)",
 }
 MODES = {name: ("overlay" if name in {"kinetic_range", "buckets", "speaker_title"} else "split") for name in TEMPLATES}
@@ -71,6 +72,10 @@ class Card:
     footnote: str = ""
     source: str = ""  # only for charts drawn from a file (candlestick_ema): where the data is from
     data_path: str = ""  # that file (CSV: date, open, high, low, close, volume)
+    # Name cards only: where it sits, "x,y,scale,align" in output pixels (align: center,
+    # left or right; x is the left edge for left, the right edge for right). Empty: the
+    # standard lower-middle spot.
+    place: str = ""
 
     def __post_init__(self) -> None:
         if self.template not in TEMPLATES:

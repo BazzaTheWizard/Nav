@@ -246,16 +246,44 @@ def _buckets(card: Card, accent: str) -> tuple[str, str, Motion]:
     return css, f'<div class="row">{boxes}</div>', m
 
 
+NAME_CARD_TOP = 1150  # the standard spot: lower-middle, above the captions
+NAME_CARD_SIZE = (940, 166)  # the largest card (width, height) at scale 1
+
+
+def name_card_size(name: str, role: str, scale: float = 1.0) -> tuple[int, int]:
+    """About how big a name card is, in output pixels (to place it before drawing)."""
+    width = 120 + max(len(name) * 31.0, len(role) * 16.6)
+    return int(min(NAME_CARD_SIZE[0], max(560, width)) * scale), int(NAME_CARD_SIZE[1] * scale)
+
+
+def parse_place(place: str) -> tuple[float, float, float, str]:
+    """(x, y, scale, align) from Card.place; the standard spot when empty or unreadable."""
+    try:
+        x, y, scale, align = place.split(",")
+        if align in {"center", "left", "right"}:
+            return float(x), float(y), max(0.5, min(1.0, float(scale))), align
+    except (AttributeError, ValueError):
+        pass
+    return W / 2, NAME_CARD_TOP, 1.0, "center"
+
+
 def _speaker_title(card: Card, accent: str) -> tuple[str, str, Motion]:
     row = card.rows[0]
-    css = """
-.ltwrap { position: absolute; left: 0; right: 0; top: 1150px; display: flex; justify-content: center; }
+    x, y, scale, align = parse_place(card.place)
+    if align == "left":
+        wrap = f"left: {x:.0f}px; justify-content: flex-start; transform-origin: top left;"
+    elif align == "right":
+        wrap = f"right: {W - x:.0f}px; justify-content: flex-end; transform-origin: top right;"
+    else:
+        wrap = f"left: {x - W / 2:.0f}px; width: {W}px; justify-content: center; transform-origin: top center;"
+    css = (f".ltwrap {{ position: absolute; top: {y:.0f}px; display: flex; {wrap} transform: scale({scale:.3f}); }}"
+           + """
 .lt { position: relative; min-width: 560px; max-width: 940px; padding: 30px 60px 32px; border-radius: 30px;
   background: rgba(16,18,24,.40); box-shadow: 0 14px 44px rgba(0,0,0,.32); text-align: left; }
 .lt svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
 .name { font-size: 56px; font-weight: 720; letter-spacing: -.015em; color: #FFFFFF; white-space: nowrap; line-height: 1.05; }
 .role { margin-top: 8px; font-size: 30px; font-weight: 520; color: #CDD2DB; white-space: nowrap; }
-"""
+""")
     border = ('<svg><defs><linearGradient id="spec" x1="0" y1="0" x2="1" y2="1">'
               '<stop offset="0" stop-color="#fff" stop-opacity=".7"/><stop offset=".45" stop-color="#fff" stop-opacity=".1"/>'
               '<stop offset="1" stop-color="#fff" stop-opacity=".4"/></linearGradient></defs>'
@@ -777,11 +805,66 @@ def _nice_step(raw: float) -> float:
     return next(s * exponent for s in (1, 2, 2.5, 5, 10) if s * exponent >= raw)
 
 
+def _drawdown_curve(card: Card, accent: str) -> tuple[str, str, Motion]:
+    """A fall and the recovery, shown rather than told: a line climbs to its peak, drops
+    by the percentage said (bracketed, in red) as it's said, then climbs back past the
+    old peak as the recovery is said. The shape is a sketch: no axis, no dates; the only
+    claims on it are the two the speaker made."""
+    fall, recovery = card.rows
+    left, peak_x, trough_x, cross_x, right = 120, 330, 560, 810, 960
+    peak_y, trough_y = 250, 470
+    end_y = peak_y - 0.22 * (trough_y - peak_y)
+    start_y = peak_y + 70
+    rise = f"M{left},{start_y} C{left + 90},{start_y - 10} {peak_x - 90},{peak_y} {peak_x},{peak_y}"
+    drop = f"M{peak_x},{peak_y} C{peak_x + 80},{peak_y} {trough_x - 90},{trough_y} {trough_x},{trough_y}"
+    back = (f"M{trough_x},{trough_y} C{trough_x + 110},{trough_y} {cross_x - 90},{peak_y + 10} {cross_x},{peak_y} "
+            f"S{right - 40},{end_y} {right},{end_y}")
+    middle = (peak_x + trough_x) / 2
+    css = f"""
+.seg {{ fill: none; stroke-width: {STROKE + 1}; stroke-linecap: round; stroke-dasharray: 1; stroke-dashoffset: 1; }}
+.fallv {{ position: absolute; left: {middle - 170:.0f}px; width: 340px; top: {peak_y - 112}px; text-align: center;
+  font-size: 72px; font-weight: 800; letter-spacing: -.03em; color: {NEG}; white-space: nowrap; }}
+.falll {{ position: absolute; left: {middle - 220:.0f}px; width: 440px; top: {peak_y - 150}px; text-align: center;
+  font-size: 30px; font-weight: 560; color: {SOFT}; white-space: nowrap; }}
+.backl {{ position: absolute; right: {W - right}px; top: {end_y - 92:.0f}px; text-align: right; font-size: 38px;
+  font-weight: 720; color: {POS}; white-space: nowrap; max-width: 520px; }}
+.backv {{ font-size: 30px; font-weight: 560; color: {SOFT}; }}
+"""
+    m = Motion()
+    parts = [
+        _title(card, m),
+        _layer("ref", f'<line x1="{left}" y1="{peak_y}" x2="{right}" y2="{peak_y}" stroke="{RULE}" stroke-width="2" '
+                      f'stroke-dasharray="10 10"/>'),
+        _layer("bracket", f'<path d="M{trough_x - 14},{peak_y} H{trough_x + 14} M{trough_x},{peak_y} V{trough_y - 12}" '
+                          f'fill="none" stroke="{NEG}" stroke-width="3" stroke-dasharray="6 6"/>'),
+        _layer("curve", f'<path class="seg" id="s1" pathLength="1" stroke="{INK}" d="{rise}"/>'
+                        f'<path class="seg" id="s2" pathLength="1" stroke="{NEG}" d="{drop}"/>'
+                        f'<path class="seg" id="s3" pathLength="1" stroke="{POS}" d="{back}"/>'),
+        f'<div class="fallv fit" id="fv">{_e(fall.value)}</div>',
+        f'<div class="falll" id="fl">{_e(fall.label)}</div>' if fall.label else "",
+        f'<div class="backl" id="bl">{_e(recovery.label)}'
+        + (f'<div class="backv">{_e(recovery.value)}</div>' if recovery.value else "") + "</div>",
+    ]
+    t_fall = _rel(card, fall.reveal_at, 0.9)
+    t_back = max(_rel(card, recovery.reveal_at, t_fall + 1.4), t_fall + 0.8)
+    m.tween("#ref", "opacity", 0.0, 0.4, "0", "1")
+    m.tween("#s1", "strokeDashoffset", 0.05, min(0.75, max(0.3, t_fall - 0.1)), "1", "0")
+    m.tween("#s2", "strokeDashoffset", t_fall, t_fall + 0.7, "1", "0")
+    m.tween("#bracket", "clipPath", t_fall + 0.1, t_fall + 0.6, "inset(0 0 100% 0)", "inset(0 0 0% 0)")
+    m.fade_up("#fv", t_fall + 0.25)
+    if fall.label:
+        m.fade_up("#fl", t_fall + 0.15, rise=8)
+    m.tween("#s3", "strokeDashoffset", t_back, t_back + 1.0, "1", "0")
+    m.fade_up("#bl", t_back + 0.5)
+    return css, "".join(parts), m
+
+
 def _fmt(value: float) -> str:
     return f"{value:,.0f}" if abs(value) >= 100 else f"{value:,.2f}".rstrip("0").rstrip(".")
 
 
 BUILDERS = {
+    "drawdown_curve": _drawdown_curve,
     "kinetic_range": _kinetic_range, "buckets": _buckets, "speaker_title": _speaker_title,
     "timeline": _timeline, "metric_bars": _metric_bars, "ranked_bars": _ranked_bars,
     "diverging_bar": _diverging_bar, "share_split": _share_split, "trend_line": _trend_line,
@@ -803,7 +886,8 @@ _SETUP = """(tracks) => {
 _SEEK = "(ms) => { for (const a of document.getAnimations()) a.currentTime = ms; }"
 _BLUR = """() => [...document.querySelectorAll('.blur')].map(el => { const r = el.getBoundingClientRect();
   return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height),
-          el.classList.contains('round') ? parseInt(getComputedStyle(el).borderTopLeftRadius) : 0]; })"""
+          el.classList.contains('round') ? Math.round(parseInt(getComputedStyle(el).borderTopLeftRadius)
+            * r.width / Math.max(1, el.offsetWidth)) : 0]; })"""
 
 
 def scene(card: Card, brand: BrandKit) -> tuple[str, Motion, int, int, int]:

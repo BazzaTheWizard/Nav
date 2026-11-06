@@ -66,8 +66,8 @@ check("Signed values for waterfalls (+$3.2M, −$0.4M)",
       K.signed_value("+$3.2M") == 3.2 and K.signed_value("−$0.4M") == -0.4)
 check("Sentences split on . ? !", SPANS[0][2] == "Where's all this money going to come from?" and len(SPANS) == 6,
       str(len(SPANS)))
-check("The library: 13 graphics, 3 over the speaker and 10 charts",
-      len(TEMPLATES) == 13 and sum(MODES[t] == "overlay" for t in TEMPLATES) == 3)
+check("The library: 14 graphics, 3 over the speaker and 11 charts (Round 29 added the fall-and-recovery curve)",
+      len(TEMPLATES) == 14 and sum(MODES[t] == "overlay" for t in TEMPLATES) == 3)
 
 # ---------- the checks: a breakdown chart (the S&P moment) ----------
 card_start, card_end = SPANS[2][0], SPANS[4][1] + 0.15
@@ -214,6 +214,10 @@ card, res, _ = moment("It costs us $1,200 to win a customer and about twelve mon
                       [CardRow("Cost to win a customer", "$1,200"), CardRow("Payback", "~12 months")])
 ok["cac_payback"] = card
 check("CAC payback passes (hedge kept)", res.ok, str(res.errors))
+card, res, _ = moment("What if the stock market crashes by 20% this year? History says eventually they go back up again.",
+                      "drawdown_curve", [CardRow("", "−20%"), CardRow("they go back up", "")])
+ok["drawdown_curve"] = card
+check("Fall and recovery passes (the fall said, the recovery in the speaker's words)", res.ok, str(res.errors))
 _, res, _ = moment("It costs us $1,200 to win a customer and about twelve months to earn it back.", "cac_payback",
                    [CardRow("Cost to win a customer", "$1,200"), CardRow("Payback", "~12")])
 check("CAC payback needs the months", any("months" in e for e in res.errors), str(res.errors))
@@ -275,7 +279,7 @@ for template, card in ok.items():
     except Exception as exc:  # noqa: BLE001
         drawn[template] = exc
 broken = {t: str(f) for t, f in drawn.items() if isinstance(f, Exception)}
-check("All 13 graphics draw", not broken, str(broken))
+check("All 14 graphics draw", not broken, str(broken))
 sizes = {t: (f.width, f.height, f.top) for t, f in drawn.items() if not isinstance(f, Exception)}
 check("Over-the-speaker graphics are full frame; charts are the lower 76% (Round 28: 24/76 split)",
       all(sizes[t] == ((1080, 1920, 0) if MODES[t] == "overlay" else (1080, 1460, 460)) for t in sizes), str(sizes))
@@ -372,8 +376,40 @@ check("Name card gone after it leaves", near(pixel(made, 106.6 - 100.0, (790, 13
 check("Chart: the speaker on top (the whole frame)", near(pixel(made, during_chart, (540, 300)), BLUE))
 check("Chart: the obsidian canvas below", near(pixel(made, during_chart, (1040, 1800)), CANVAS))
 check("After the chart: back to full screen", near(pixel(made, chart_end - 100.0 + 0.4, (540, 300)), RED))
-mix = pixel(made, chart_end - 100.0 - 0.1, (540, 300))
-check("The chart dissolves back to full screen (no hard cut)", not near(mix, RED, 12) and not near(mix, BLUE, 12), str(mix))
+
+
+def frames_between(path, t0, t1):
+    """Every frame from t0 to t1 at a quarter size (270x480), RGB."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t0:.3f}", "-t", f"{t1 - t0:.3f}", "-i", str(path),
+                          "-vf", "scale=270:480", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
+    import numpy as np
+    return [np.frombuffer(raw[k:k + 270 * 480 * 3], np.uint8).reshape(480, 270, 3) for k in range(0, len(raw), 270 * 480 * 3)]
+
+
+def panel_edge(frame):
+    """The top of the dark panel (output pixels) in the right margin, where no chart is drawn."""
+    column = frame[:, 266].astype(int)
+    dark = [all(abs(c - k) <= 24 for c, k in zip(px, CANVAS)) for px in column]
+    edge = len(dark)
+    while edge > 0 and dark[edge - 1]:
+        edge -= 1
+    return edge * 4
+
+
+def blended(px):
+    return not (near(px, RED) or near(px, BLUE) or near(px, CANVAS))
+
+
+into = frames_between(made, chart_start - 100.0 - 0.05, chart_start - 100.0 + 0.6)
+out_of = frames_between(made, chart_end - 100.0 - 0.6, chart_end - 100.0 + 0.1)
+edges_in, edges_out = [panel_edge(f) for f in into], [panel_edge(f) for f in out_of]
+check("Into the chart: the panel slides up from the bottom edge (never a cross-fade)",
+      edges_in[0] >= 1900 and edges_in[-1] <= 470 and all(b <= a for a, b in zip(edges_in, edges_in[1:]))
+      and len(set(edges_in)) >= 6, str(edges_in))
+check("Out of the chart: it slides back down", edges_out[0] <= 470 and edges_out[-1] >= 1900
+      and all(b >= a for a, b in zip(edges_out, edges_out[1:])), str(edges_out))
+check("No frame blends two pictures (no double face)",
+      not any(blended(tuple(int(v) for v in f[75, 135])) for f in into + out_of))
 probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(made)],
                        capture_output=True, text=True).stdout
 check("Same length, audio kept", abs(float(probe) - duration) < 0.15 and b"audio" in subprocess.run(
@@ -397,7 +433,7 @@ wrapper.write_text(textwrap.dedent(f"""
     import core.edl as E
     E.BRAND_KIT_PATH = Path({str(store / "brand_kit.json")!r})
     import core.dynamic_layout as D
-    def fake(source, edit, words, output, work, render_base, hook_seconds=3.0):
+    def fake(source, edit, words, output, work, render_base, hook_seconds=3.0, **_kw):
         Path({str(calls)!r}).write_text(__import__("json").dumps(
             [[c.template for c in edit.cards], edit.brand.accent, hook_seconds, callable(render_base)]))
         Path(output).write_bytes(Path({str(base_clip)!r}).read_bytes())

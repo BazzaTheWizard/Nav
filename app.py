@@ -134,7 +134,7 @@ from core.transcriber import (
     youtube_video_id,
 )
 from core.subtitle_engine import caption_style
-from core.video_renderer import loudness_target
+from core.video_renderer import loudness_target, pull_in_enabled
 from main import _audio_duration, _video_duration
 
 
@@ -2071,12 +2071,15 @@ CARD_GUIDE: dict[str, tuple[str, dict[str, str]]] = {
                     "the row it flows from.", {"label": "Label", "value": "Number as said", "parent": "Flows from"}),
     "cac_payback": ("Row 1: what it costs to win a customer. Row 2: the months to earn it back (e.g. 12 months).",
                     {"label": "Label", "value": "Number as said"}),
+    "drawdown_curve": ("A fall and the recovery, drawn as a curve. Item 1: the fall as said (\u2212 and a %, e.g. \u221220%). "
+                       "Item 2: the recovery in the speaker's words (\"they go back up\"), with a number only if one was said.",
+                       {"label": "Label (speaker's words)", "value": "Number as said"}),
     "candlestick_ema": ("Drawn from a price file you upload (CSV: date, open, high, low, close, volume), not from "
                         "speech. The chart shows its source.", {}),
 }
 CARD_ROWS = {"kinetic_range": 1, "buckets": 3, "timeline": 3, "metric_bars": 3, "ranked_bars": 3,
              "diverging_bar": 2, "share_split": 3, "trend_line": 4, "arr_bridge": 4, "sankey_flow": 4,
-             "cac_payback": 2}
+             "cac_payback": 2, "drawdown_curve": 2}
 NAME_CARD_SECONDS = 3.3
 
 
@@ -2155,7 +2158,7 @@ def _new_card(template: str, key: str, clip: Any, spans: list[tuple[float, float
             for field, header in fields.items()
         }
         edited = st.data_editor([dict(blank) for _ in range(CARD_ROWS[template])], column_config=config,
-                                num_rows="fixed" if template in {"kinetic_range", "diverging_bar", "cac_payback"}
+                                num_rows="fixed" if template in {"kinetic_range", "diverging_bar", "cac_payback", "drawdown_curve"}
                                 else "dynamic", hide_index=True, use_container_width=True,
                                 key=f"card_rows_{key}_{template}")
         for item in edited:
@@ -2198,10 +2201,15 @@ def _render_clip_version(
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
             # The title shows for the opening only, so it never sits under a graphic.
+            plan = context.get("crop_plan")
+            smart = plan is not None and str(context.get("layout_mode")) == "smart_crop"
+            split = plan.split_view(clip.start_time, clip.end_time) if smart else None
+            pull_until = plan.pull_in_until(clip.start_time, clip.end_time) if smart and pull_in_enabled() else 0.0
             made, checks = render_with_cards(
                 Path(context["source_path"]), edit, clip_words, output, work_dir,
                 lambda kept: render(kept, work_dir / "base.mp4", False),
-                hook_seconds=settings.hook_title_seconds,
+                hook_seconds=settings.hook_title_seconds, seams=list(split.spans) if split else None,
+                crop_at=((lambda t: plan.shown_rect_at(t, clip.start_time, clip.end_time, pull_until)) if smart else None),
             )
             problems = [f"Graphic {n + 1}: {e}" for n, c in enumerate(checks) for e in c.errors]
             if made is not None:
