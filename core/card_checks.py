@@ -1,0 +1,395 @@
+"""Round 27: the accuracy checks every data card passes before it's rendered.
+
+The promise: every number on a card was said in the clip, at that moment, with the
+speaker's own hedges. Nothing is computed, rounded or added. A card that fails is not
+"fixed": the problems are listed and the card isn't drawn.
+
+check_card() also finds the word where each number is said, so it appears on that word.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from core.edl import MODES, Card, ClipEdit
+
+MIN_CARD_SECONDS = 2.5  # shorter than this, a chart is gone before anyone reads it
+MIN_OVERLAY_SECONDS = 2.0
+HOOK_SECONDS = 3.0  # the first seconds stay full-screen: the hook is the speaker
+PAYOFF_SECONDS = 2.0  # the clip ends full-screen too, on the speaker's punchline
+MAX_CARDS = 1  # charts (split view) per clip: restraint, so each one lands
+MAX_OVERLAYS = 2  # numbers or boxes over the speaker per clip (plus one name card)
+MIN_GAP = 1.5  # seconds of plain video between two graphics
+LIMITS = {"eyebrow": 30, "headline": 30, "label": 26, "value": 14, "footnote": 58, "box": 20, "detail": 30,
+          "context": 44, "name": 28, "role": 42}
+_ASIDES = {"dunno", "guess", "maybe", "like", "whatever"}  # "I dunno, five, six months?": an aside, not evidence
+
+_UNITS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+SCALES = {"thousand": "K", "k": "K", "million": "M", "mil": "M", "billion": "B", "bn": "B", "trillion": "T"}
+_SCALE_WORDS = {"K": "thousand", "M": "million", "B": "billion", "T": "trillion", "%": "percent"}
+HEDGES = {
+    "about", "around", "roughly", "approximately", "approx", "nearly", "almost", "maybe", "probably",
+    "somewhere", "between", "or", "ish", "think", "guess", "estimate", "estimated", "expected", "expect",
+    "projected", "project", "up", "close", "under", "over", "plus", "something", "dunno",
+}
+_DIGITS = re.compile(r"^\$?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(%|[kmbt]n?)?(?:-\w+)?$", re.IGNORECASE)
+
+
+@dataclass
+class SpokenNumber:
+    value: float
+    scale: str | None  # "K", "M", "B", "T", "%" or None
+    start: float
+    index: int
+    end: int = -1  # index of its last word
+
+
+@dataclass
+class CardCheck:
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def _clean(text: str) -> str:
+    return re.sub(r"[^\w$%.,'-]", "", str(text or "")).strip(".,'").lower()
+
+
+def spoken_numbers(words: list[Any]) -> list[SpokenNumber]:
+    """Numbers said in ``words`` (Word objects): "$17", "1,200", "47%", "five and a half",
+    "ninety six", each with its scale ("trillion" -> "T") when one follows."""
+    found: list[SpokenNumber] = []
+    tokens = [_clean(word.text) for word in words]
+    i = 0
+    while i < len(tokens):
+        token, start, value, end = tokens[i], i, None, i
+        scale: str | None = None
+        match = _DIGITS.match(token)
+        if match:
+            value = float(match.group(1).replace(",", "") + (match.group(2) or ""))
+            suffix = (match.group(3) or "").lower()
+            if suffix == "%":
+                scale = "%"
+            elif suffix:
+                scale = SCALES.get(suffix.rstrip("n"), None) or {"k": "K", "m": "M", "b": "B", "t": "T"}[suffix[0]]
+        elif token in _TENS or token in _UNITS:
+            value = float(_TENS.get(token, _UNITS.get(token, 0)))
+            if token in _TENS and i + 1 < len(tokens) and tokens[i + 1] in _UNITS and _UNITS[tokens[i + 1]] < 10:
+                value += _UNITS[tokens[i + 1]]
+                end = i + 1
+            if end + 1 < len(tokens) and tokens[end + 1] == "hundred":
+                value *= 100
+                end += 1
+        if value is None:
+            i += 1
+            continue
+        rest = tokens[end + 1:end + 4]
+        if rest[:3] == ["and", "a", "half"]:
+            value += 0.5
+            end += 3
+            rest = tokens[end + 1:end + 4]
+        elif rest[:1] == ["point"] and len(rest) > 1 and rest[1] in _UNITS:
+            value = float(f"{int(value)}.{_UNITS[rest[1]]}")
+            end += 2
+            rest = tokens[end + 1:end + 4]
+        if scale is None:
+            for offset, word in enumerate(tokens[end + 1:end + 3]):
+                if word in SCALES:
+                    scale = SCALES[word]
+                    break
+                if word in {"percent", "%"}:
+                    scale = "%"
+                    break
+                if offset == 0 and word not in {"or", "to", "and"}:
+                    break
+        found.append(SpokenNumber(value, scale, float(words[start].start), start, end))
+        i = end + 1
+    # "between five and five and a half trillion": the first number takes the next one's scale.
+    for k in range(len(found) - 2, -1, -1):
+        joined = found[k].end + 1 < len(tokens) and tokens[found[k].end + 1] in {"and", "or", "to"} \
+            and found[k + 1].index == found[k].end + 2
+        if found[k].scale is None and found[k + 1].scale and joined:
+            found[k].scale = found[k + 1].scale
+    return found
+
+
+@dataclass
+class CardValue:
+    numbers: list[float]
+    scale: str | None
+    hedged: bool
+
+
+def signed_value(text: str) -> float:
+    """'+$3.2M' -> 3.2, '−$0.4M' or '-$0.4M' -> -0.4 (a waterfall step)."""
+    value = parse_value(text)
+    magnitude = max(value.numbers) if value.numbers else 0.0
+    return -magnitude if str(text).strip().startswith(("-", "−", "–")) else magnitude
+
+
+def parse_value(text: str) -> CardValue:
+    """'~$11–12T' -> numbers [11, 12], scale 'T', hedged (a range or '~')."""
+    text = str(text or "").strip()
+    numbers = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", text)]
+    scale = None
+    if "%" in text:
+        scale = "%"
+    else:
+        match = re.search(r"\d\s*(K|M|B|T|thousand|million|billion|trillion)\b", text, re.IGNORECASE)
+        if match:
+            word = match.group(1).lower()
+            scale = SCALES.get(word) or word.upper()
+    hedged = text.startswith(("~", "≈", "c.")) or len(numbers) > 1
+    return CardValue(numbers, scale, hedged)
+
+
+def _in_window(words: list[Any], start: float, end: float) -> list[Any]:
+    return [word for word in words if start - 0.05 <= float(word.start) < end]
+
+
+def _hedge_near(tokens: list[str], index: int) -> bool:
+    return any(token in HEDGES for token in tokens[max(0, index - 5):index + 4])
+
+
+def _limit(errors: list[str], field_name: str, text: str, limit: int) -> None:
+    if len(text) > limit:
+        errors.append(f"{field_name} is {len(text)} characters; the most is {limit}: \"{text}\"")
+
+
+def _keywords(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9']+", text.lower()) if len(w) >= 4]
+
+
+def _said(text: str, said: set[str], share: float = 0.5) -> bool:
+    """At least ``share`` of the text's longer words were said (labels and descriptions
+    are short summaries, so not every word has to be the speaker's)."""
+    keys = _keywords(text)
+    return not keys or sum(k in said or k.rstrip("s") in said for k in keys) / len(keys) >= share
+
+
+def _match_numbers(value, numbers: list[SpokenNumber], used: set[int]) -> list[SpokenNumber] | None:
+    hits = []
+    for number in value.numbers:
+        hit = next((n for n in numbers if abs(n.value - number) < 1e-9 and n.index not in used
+                    and (value.scale is None or n.scale == value.scale)), None)
+        if hit is None:
+            return None
+        hits.append(hit)
+    return hits
+
+
+def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
+               hook_seconds: float = HOOK_SECONDS) -> CardCheck:
+    """Check one card against what was said, and set each item's ``reveal_at`` (and a
+    range's ``reveal_to``) to the word where it's said. Errors stop the card; warnings
+    are for you to look at. ``hook_seconds``: how long the opening stays clear (at least
+    HOOK_SECONDS, or as long as the title card shows), so no graphic sits on the title."""
+    result = CardCheck()
+    errors = result.errors
+    overlay = MODES.get(card.template) == "overlay"
+    shortest = MIN_OVERLAY_SECONDS if overlay else MIN_CARD_SECONDS
+    if card.end - card.start < shortest:
+        errors.append(f"On screen {card.end - card.start:.1f} s; this needs at least {shortest} s.")
+    hook = max(HOOK_SECONDS, hook_seconds)
+    if card.start < clip_start + hook:
+        errors.append(f"Starts in the first {hook:g} s: the hook and its title stay clear.")
+    if card.end > clip_end - PAYOFF_SECONDS:
+        errors.append(f"Runs into the last {PAYOFF_SECONDS:.0f} s: the clip ends full-screen on the speaker.")
+    _limit(errors, "Title", card.headline, LIMITS["headline"])
+    window = _in_window(words, card.start, card.end)
+    clip_words = _in_window(words, clip_start, clip_end)
+    tokens = [_clean(word.text) for word in window]
+    said_in_clip = {_clean(w.text) for w in clip_words}
+    numbers = spoken_numbers(window)
+    rows = card.rows
+    count = {"kinetic_range": (1, 1), "buckets": (2, 3), "speaker_title": (1, 1), "timeline": (2, 4),
+             "metric_bars": (2, 4), "ranked_bars": (2, 5), "diverging_bar": (2, 2), "share_split": (2, 5),
+             "trend_line": (2, 6), "arr_bridge": (3, 7), "sankey_flow": (3, 8), "cac_payback": (2, 2),
+             "candlestick_ema": (0, 0)}[card.template]
+    if not count[0] <= len(rows) <= count[1]:
+        errors.append(f"This graphic takes {count[0]}{'' if count[0] == count[1] else f' to {count[1]}'} items.")
+        return result
+    used: set[int] = set()
+    numeric = {"metric_bars", "ranked_bars", "diverging_bar", "kinetic_range", "share_split", "trend_line",
+               "arr_bridge", "sankey_flow", "cac_payback"}
+    if card.template == "speaker_title":
+        _limit(errors, "Name", rows[0].label, LIMITS["name"])
+        _limit(errors, "Role", rows[0].detail, LIMITS["role"])
+        if not rows[0].label.strip():
+            errors.append("The name card needs a name.")
+        if not 2.5 <= card.end - card.start <= 4.5:
+            errors.append("A name card stays on 2.5 to 4.5 s (3.3 s is best).")
+        rows[0].reveal_at = card.start
+        return result
+    if card.template == "candlestick_ema":
+        from core.cards import read_prices  # a chart from your file: no transcript numbers to check
+
+        if not card.source.strip():
+            errors.append("Say where the prices come from (Source), for example \"Bloomberg\" or \"Company filings\".")
+        try:
+            if len(read_prices(card.data_path)) < 10:
+                errors.append("The price file needs at least 10 rows with open, high, low and close.")
+        except OSError:
+            errors.append("Upload the price file (CSV: date, open, high, low, close, volume).")
+        result.warnings.append("Drawn from your file, not from what was said: it shows its source.")
+        return result
+    if card.template in numeric:
+        for position, row in enumerate(rows, start=1):
+            _limit(errors, f"Item {position} value", row.value, LIMITS["value"])
+            _limit(errors, f"Item {position} label", row.label,
+                   LIMITS["context"] if card.template == "kinetic_range" else LIMITS["label"])
+            value = parse_value(row.value)
+            if not value.numbers:
+                errors.append(f"Item {position}: \"{row.value}\" has no number.")
+                continue
+            hits = _match_numbers(value, numbers, used)
+            if hits is None:
+                scale_word = _SCALE_WORDS.get(value.scale or "", "")
+                errors.append(f"Item {position}: \"{row.value}\" isn't said while it's on screen (check the number"
+                              f"{', that it was said in ' + scale_word if scale_word else ''}, and the start and end).")
+                continue
+            used.update(hit.index for hit in hits)
+            if any(_hedge_near(tokens, hit.index) for hit in hits) and not value.hedged:
+                errors.append(f"Item {position}: the speaker hedged (\"about\", \"or\", \"between\"...), so "
+                              f"\"{row.value}\" must show it: \"~{row.value}\" or a range.")
+            if any(token in _ASIDES for hit in hits for token in tokens[max(0, hit.index - 3):hit.index]):
+                result.warnings.append(f"Item {position}: \"{row.value}\" sounds like an aside or a guess. "
+                                       "Graphics work best for numbers that carry the point.")
+            row.reveal_at = hits[0].start
+            row.reveal_to = hits[1].start if len(hits) > 1 else None
+            if card.template == "kinetic_range" and row.label and not _said(row.label, {_clean(w.text) for w in window}):
+                errors.append(f"The line under the number should use the speaker's words: \"{row.label}\".")
+        if card.template not in {"kinetic_range", "cac_payback"} and not errors:
+            scales = {parse_value(row.value).scale for row in rows}
+            if len(scales) > 1:
+                errors.append("One unit per chart: these mix scales (" + ", ".join(sorted(str(x) for x in scales)) + ").")
+        if not errors:
+            _shape_checks(card, errors)
+    elif card.template == "buckets":
+        after = card.start
+        for position, row in enumerate(rows, start=1):
+            _limit(errors, f"Box {position}", row.label, LIMITS["box"])
+            keys = [_clean(w) for w in re.findall(r"[A-Za-z0-9']+", row.label)]
+            keys = [k for k in keys if len(k) >= 4] or keys[:1]
+            spot = next((word for word in window if float(word.start) >= after and _clean(word.text) in keys), None)
+            if spot is None:
+                errors.append(f"Box {position} (\"{row.label}\"): none of its words are said after box {position - 1}.")
+            else:
+                row.reveal_at = after = float(spot.start)
+    else:  # timeline: a point said in this window appears on its word; one said earlier is a recap
+        clip_numbers = spoken_numbers(clip_words)
+        recap = 0
+        for position, row in enumerate(rows, start=1):
+            _limit(errors, f"Point {position} time", row.value, LIMITS["value"])
+            _limit(errors, f"Point {position} description", row.detail, LIMITS["detail"])
+            value = parse_value(row.value)
+            hits = _match_numbers(value, numbers, used) if value.numbers else None
+            if hits:
+                used.update(hit.index for hit in hits)
+                row.reveal_at = hits[0].start
+                if any(_hedge_near(tokens, hit.index) for hit in hits) and not value.hedged:
+                    errors.append(f"Point {position}: the speaker hedged, so \"{row.value}\" must show it (~ or a range).")
+            elif value.numbers and _match_numbers(value, [n for n in clip_numbers if n.start < card.start], set()):
+                row.reveal_at = card.start + 0.2 + 0.7 * recap  # said earlier in the clip: drawn in as a recap
+                recap += 1
+            elif not value.numbers and _said(row.value, said_in_clip, 1.0):
+                row.reveal_at = card.start + 0.2 + 0.7 * recap
+                recap += 1
+            else:
+                errors.append(f"Point {position}: \"{row.value}\" isn't said in the clip before or while it's on screen.")
+            if row.detail and not _said(row.detail, said_in_clip, 0.34):
+                errors.append(f"Point {position}: the description should use the speaker's words: \"{row.detail}\".")
+        times = [row.reveal_at for row in rows if row.reveal_at is not None]
+        if times != sorted(times):
+            errors.append("Timeline points must appear in order: put them in the order they come up.")
+    if overlay and not errors:
+        first = min((row.reveal_at for row in rows if row.reveal_at is not None), default=card.start)
+        # No empty frames: an overlay starts exactly as its first item comes in.
+        card.start = max(card.start, first - 0.12)
+        if card.end - card.start < MIN_OVERLAY_SECONDS:
+            errors.append(f"Only {card.end - card.start:.1f} s after the first item appears; extend the end.")
+    return result
+
+
+def _shape_checks(card: Card, errors: list[str]) -> None:
+    """Charts whose parts must add up, and the parts each chart needs."""
+    rows = card.rows
+    values = [parse_value(r.value) for r in rows]
+    if card.template == "arr_bridge":
+        if any(len(v.numbers) > 1 for v in values):
+            errors.append("A waterfall needs exact numbers, not ranges.")
+            return
+        steps = rows[1:-1]
+        unsigned = [r.value for r in steps if not r.value.strip().startswith(("+", "-", "−", "–"))]
+        if unsigned:
+            errors.append("Mark each step + or − (e.g. +$3.2M, −$0.4M): " + ", ".join(unsigned))
+            return
+        start, end = values[0].numbers[0], values[-1].numbers[0]
+        total = start + sum(signed_value(r.value) for r in steps)
+        if abs(total - end) > max(0.02 * abs(end), 1e-9):
+            errors.append(f"It doesn't add up: start {start:g} plus the steps is {total:g}, but the end is {end:g}. "
+                          "Check the numbers and signs (a waterfall never fills a gap itself).")
+    elif card.template == "sankey_flow":
+        labels = [r.label for r in rows]
+        roots = [r for r in rows if not r.parent]
+        if len(roots) != 1:
+            errors.append("A flow chart needs exactly one starting row (the one with no 'flows from').")
+            return
+        missing = [r.parent for r in rows if r.parent and r.parent not in labels]
+        if missing:
+            errors.append("'Flows from' must name another row: " + ", ".join(missing))
+            return
+        by_label = {r.label: r for r in rows}
+        for row in rows:  # depth: at most two splits (revenue -> costs -> cost lines)
+            depth, current = 0, row
+            while current.parent:
+                depth, current = depth + 1, by_label[current.parent]
+                if depth > 2:
+                    errors.append("At most two levels of splits.")
+                    return
+        for parent in rows:
+            kids = [r for r in rows if r.parent == parent.label]
+            if kids:
+                whole = max(parse_value(parent.value).numbers)
+                parts = sum(max(parse_value(k.value).numbers) for k in kids)
+                if abs(parts - whole) > 0.03 * whole:
+                    errors.append(f"The parts of {parent.label} add up to {parts:g}, not {whole:g}: every flow must be said.")
+    elif card.template == "share_split":
+        if values[0].scale == "%":
+            total = sum(max(v.numbers) for v in values)
+            if not 95 <= total <= 105:
+                errors.append(f"The shares add up to {total:g}%, not 100%: a part is missing or a number is off.")
+    elif card.template == "trend_line":
+        long = [r.label for r in rows if len(r.label) > 10]
+        if long:
+            errors.append("Keep the time labels short (10 characters, e.g. 2024 or Q3 '25): " + ", ".join(long))
+    elif card.template == "cac_payback":
+        if "month" not in rows[1].value.lower():
+            errors.append("The second row is the payback period in months, e.g. \"12 months\".")
+
+
+def check_edit(edit: ClipEdit, words: list[Any], hook_seconds: float = HOOK_SECONDS) -> list[CardCheck]:
+    """Every card in the clip, plus the clip-wide rules: at most 1 chart, 2 number or box
+    graphics and 1 name card, with at least MIN_GAP seconds between graphics."""
+    results = [check_card(card, words, edit.start, edit.end, hook_seconds) for card in edit.cards]
+    charts = [k for k, card in enumerate(edit.cards) if MODES.get(card.template) == "split"]
+    overlays = [k for k, card in enumerate(edit.cards) if card.template in {"kinetic_range", "buckets"}]
+    names = [k for k, card in enumerate(edit.cards) if card.template == "speaker_title"]
+    for kind, members, most in (("chart", charts, MAX_CARDS), ("number or box graphics", overlays, MAX_OVERLAYS),
+                                ("name card", names, 1)):
+        for k in members[most:]:
+            results[k].errors.append(f"At most {most} {kind} per clip: graphics land when they're rare.")
+    ordered = sorted(range(len(edit.cards)), key=lambda k: edit.cards[k].start)
+    for first, second in zip(ordered, ordered[1:]):
+        if edit.cards[second].start < edit.cards[first].end + MIN_GAP:
+            results[second].errors.append(f"Starts less than {MIN_GAP:g} s after the graphic before it: give the speaker room.")
+    return results

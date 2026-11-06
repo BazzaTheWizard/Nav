@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import re
 import shutil
 import time
 import uuid
+from dataclasses import asdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -67,6 +69,22 @@ from core import series
 from core import long_video, quotes
 import core.downloader as youtube
 from core.lead_harvester import lead_profile, subscriber_range
+from core.card_checks import LIMITS as CARD_LIMITS, check_edit
+from core.cards import CANVAS as CARD_CANVAS, MIN_CONTRAST, contrast
+from core.dynamic_layout import render_with_cards
+from core.edl import (
+    BRAND_KIT_PATH,
+    MODES,
+    TEMPLATE_LABELS,
+    TEMPLATES,
+    BrandKit,
+    Card,
+    CardRow,
+    ClipEdit,
+    load_brand_kit,
+    save_brand_kit,
+    sentences as edl_sentences,
+)
 from core import webinar as webinar_defaults
 from core.clipper import MIN_CLIP_DURATION, rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
@@ -583,6 +601,8 @@ def _discard_generated_clips() -> None:
     for key in (
         "generated_clips",
         "published_page",
+        "card_drafts",
+        "card_clips",
         "clip_paths",
         "active_clip_run_id",
         "clip_render_contexts",
@@ -1687,6 +1707,8 @@ def _make_clips(
         )
         st.session_state["generated_clips"] = generated
         st.session_state.pop("published_page", None)  # new clips: a new page
+        st.session_state.pop("card_drafts", None)
+        st.session_state.pop("card_clips", None)
         st.session_state["clip_paths"] = [str(item[0].expanduser().resolve()) for item in generated]
         if generated:
             st.session_state["outreach_input_path"] = str(input_path)
@@ -2176,6 +2198,7 @@ def _render_generated_clips() -> None:
                         st.markdown(" ".join(f"#{tag.lstrip('#')}" for tag in clip.hashtags))
             _render_trim_form(index, clip_path, clip, generated_clips, settings)
 
+    _render_data_cards(generated_clips)
     _render_publish_page(generated_clips)
 
     if st.session_state.get("drive_folder_link"):
@@ -2217,6 +2240,245 @@ def _render_generated_clips() -> None:
                 st.caption("The Drive link is added after you upload the clips.")
 
 
+# Round 27: what each graphic needs. "fields": the item columns shown (CardRow field -> header).
+CARD_GUIDE: dict[str, tuple[str, dict[str, str]]] = {
+    "kinetic_range": ("One number (or range) exactly as said, e.g. 96 hrs or ~$11–12T, and an optional short line "
+                      "under it in the speaker's words.",
+                      {"value": "Number as said", "label": "Line under it (optional)"}),
+    "buckets": ("2–3 short boxes. Each appears when one of its words is said. Tick 'Dashed' for an expectation "
+                "or projection, next to solid boxes for what happened.",
+                {"label": "Box text", "dashed": "Dashed", "highlight": "Gold"}),
+    "speaker_title": ("", {}),
+    "timeline": ("2–4 points in time, in the order they come up. A point said earlier in the clip is drawn in "
+                 "as a recap.", {"value": "When (as said)", "detail": "What (speaker's words)", "highlight": "Focus"}),
+    "metric_bars": ("2–4 numbers in one unit. Each bar grows as its number is said.",
+                    {"label": "Label", "value": "Number as said", "highlight": "Focus"}),
+    "ranked_bars": ("2–5 numbers in one unit, largest first. The focus moves to each as it's said.",
+                    {"label": "Label", "value": "Number as said", "highlight": "Focus"}),
+    "diverging_bar": ("Two numbers that pull against each other (e.g. buyers vs sellers).",
+                      {"label": "Label", "value": "Number as said", "highlight": "Focus"}),
+    "share_split": ("3–5 shares of one whole. Percentages must add up to 100%.",
+                    {"label": "Label", "value": "Share as said", "highlight": "Focus"}),
+    "trend_line": ("2–6 values over time, oldest first. Keep the time labels short (2024, Q3 '25).",
+                   {"label": "When", "value": "Number as said", "highlight": "Focus"}),
+    "arr_bridge": ("First row the start, last row the end, and + or − steps between "
+                   "(e.g. +$3.2M new, −$0.4M churn). It must add up.",
+                   {"label": "Label", "value": "Number as said (+/−)", "highlight": "Focus"}),
+    "sankey_flow": ("One starting row (e.g. Revenue), then rows that flow out of it. Each split must add up to "
+                    "the row it flows from.", {"label": "Label", "value": "Number as said", "parent": "Flows from"}),
+    "cac_payback": ("Row 1: what it costs to win a customer. Row 2: the months to earn it back (e.g. 12 months).",
+                    {"label": "Label", "value": "Number as said"}),
+    "candlestick_ema": ("Drawn from a price file you upload (CSV: date, open, high, low, close, volume), not from "
+                        "speech. The chart shows its source.", {}),
+}
+CARD_ROWS = {"kinetic_range": 1, "buckets": 3, "timeline": 3, "metric_bars": 3, "ranked_bars": 3,
+             "diverging_bar": 2, "share_split": 3, "trend_line": 4, "arr_bridge": 4, "sankey_flow": 4,
+             "cac_payback": 2}
+NAME_CARD_SECONDS = 3.3
+
+
+def _card_clip_path(path: str | Path) -> Path | None:
+    """The version of this clip with graphics, if you made one."""
+    made = st.session_state.get("card_clips", {}).get(_clip_key(path))
+    return Path(made) if made and Path(made).is_file() else None
+
+
+def _render_brand_kit() -> None:
+    brand = load_brand_kit()
+    with st.expander(f"🎨 Accent color: {brand.accent}"):
+        with st.form("brand_kit_form", border=False):
+            accent = st.color_picker("The one highlight color (the client's brand color works well)", value=brand.accent)
+            save = st.form_submit_button("Save")
+        if save:
+            if contrast(accent, CARD_CANVAS) < MIN_CONTRAST:
+                st.error(f"{accent} is too dark to read on the dark background (contrast "
+                         f"{contrast(accent, CARD_CANVAS):.1f}, needs {MIN_CONTRAST}). Pick a lighter color.")
+                return
+            save_brand_kit(BrandKit(wordmark=brand.wordmark, accent=accent, logo_path=brand.logo_path,
+                                    show_name=brand.show_name))
+            st.success("Saved. New graphics use it.")
+            st.rerun()
+
+
+def _card_summary(draft: dict[str, Any]) -> str:
+    rows = draft.get("rows") or []
+    if draft["template"] == "speaker_title":
+        return rows[0]["label"] if rows else ""
+    if draft["template"] == "candlestick_ema":
+        return f"Source: {draft.get('source', '')}"
+    return ", ".join((row.get("value") or row.get("label") or "")[:24] for row in rows)
+
+
+def _new_card(template: str, key: str, clip: Any, spans: list[tuple[float, float, str]], hook: float) -> Card | None:
+    """The inputs for one new graphic; returns the card when 'Check and add' is pressed."""
+    if template == "speaker_title":
+        name_col, role_col = st.columns(2)
+        name = name_col.text_input("Name", max_chars=CARD_LIMITS["name"], key=f"name_{key}")
+        role = role_col.text_input("Role, company", max_chars=CARD_LIMITS["role"], key=f"role_{key}")
+        default = round(hook + 0.2, 1)
+        start = st.number_input("Comes in at (seconds into the clip)", min_value=default,
+                                max_value=max(default, round(clip.end_time - clip.start_time - 6.0, 1)),
+                                value=default, step=0.5, key=f"name_at_{key}",
+                                help=f"On screen for {NAME_CARD_SECONDS:g} s, then slides away. "
+                                     "Best just after the title, when the guest starts speaking.")
+        if not st.button("✔ Check and add", key=f"card_add_{key}"):
+            return None
+        at = clip.start_time + float(start)
+        return Card("speaker_title", start=at, end=at + NAME_CARD_SECONDS,
+                    rows=[CardRow(name.strip(), detail=role.strip())])
+    label = lambda i: f"{_clock(spans[i][0] - clip.start_time)}  {spans[i][2][:70]}"  # noqa: E731
+    first_col, last_col = st.columns(2)
+    first = first_col.selectbox("Starts on", range(len(spans)), format_func=label, key=f"card_first_{key}")
+    last = last_col.selectbox("…and ends after", range(len(spans)), format_func=label, key=f"card_last_{key}",
+                              index=min(len(spans) - 1, first + 1))
+    headline = ""
+    if MODES[template] == "split":
+        headline = st.text_input("Title (optional, a few words)", max_chars=CARD_LIMITS["headline"],
+                                 key=f"card_title_{key}_{template}")
+    rows: list[CardRow] = []
+    source, data_path = "", ""
+    if template == "candlestick_ema":
+        prices = st.file_uploader("Price file (CSV)", type=["csv"], key=f"card_prices_{key}")
+        source = st.text_input("Source (shown on the chart)", max_chars=40, key=f"card_source_{key}")
+        if prices is not None:
+            target = BRAND_KIT_PATH.parent / "price_files" / f"{hashlib.sha1(prices.getvalue()).hexdigest()[:12]}.csv"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(prices.getvalue())
+            data_path = str(target)
+    else:
+        fields = CARD_GUIDE[template][1]
+        blank = {field: (False if field in {"highlight", "dashed"} else "") for field in fields}
+        config = {
+            field: (st.column_config.CheckboxColumn(header, width="small") if field in {"highlight", "dashed"}
+                    else st.column_config.TextColumn(header, max_chars={
+                        "value": CARD_LIMITS["value"], "detail": CARD_LIMITS["detail"], "parent": CARD_LIMITS["label"],
+                        "label": CARD_LIMITS["box" if template == "buckets" else
+                                             "context" if template == "kinetic_range" else "label"],
+                    }[field]))
+            for field, header in fields.items()
+        }
+        edited = st.data_editor([dict(blank) for _ in range(CARD_ROWS[template])], column_config=config,
+                                num_rows="fixed" if template in {"kinetic_range", "diverging_bar", "cac_payback"}
+                                else "dynamic", hide_index=True, use_container_width=True,
+                                key=f"card_rows_{key}_{template}")
+        for item in edited:
+            values = {field: (bool(item.get(field)) if field in {"highlight", "dashed"}
+                              else str(item.get(field) or "").strip()) for field in fields}
+            if values.get("label") or values.get("value") or values.get("detail"):
+                rows.append(CardRow(**values))
+    if not st.button("✔ Check and add", key=f"card_add_{key}"):
+        return None
+    return Card(template, start=spans[first][0], end=spans[max(first, last)][1] + 0.15, headline=headline.strip(),
+                rows=rows, source=source.strip(), data_path=data_path)
+
+
+def _render_data_cards(generated_clips: list[tuple[Any, Any]]) -> None:
+    """📊 Graphics (optional): a number, boxes, a name card or one chart, each checked against
+    the transcript and shown on the word it's said. Never part of picking the clips."""
+    contexts = st.session_state.get("clip_render_contexts", {})
+    choices = [k for k, (path, _) in enumerate(generated_clips) if _clip_key(path) in contexts]
+    st.subheader("📊 Graphics")
+    st.caption(
+        "Optional, for the moments where a number or a name carries the point. Every number is checked against "
+        "the transcript and appears on the word it's said. At most 1 chart, 2 numbers or boxes and 1 name card "
+        "per clip."
+    )
+    if not choices:
+        st.caption("Make clips first.")
+        return
+    settings = load_settings()
+    hook = max(3.0, float(settings.hook_title_seconds))
+    _render_brand_kit()
+    index = st.selectbox(
+        "Clip", choices, key="cards_clip",
+        format_func=lambda k: f"Clip {k + 1}: {(generated_clips[k][1].viral_title or '')[:60]}",
+    )
+    path, clip = generated_clips[index]
+    key = _clip_key(path)
+    context = contexts[key]
+    words = [w for w in context["words"] if clip.start_time <= float(w.start) < clip.end_time]
+    spans = edl_sentences(words)
+    if not spans:
+        st.caption("No words found in this clip.")
+        return
+    drafts: list[dict[str, Any]] = st.session_state.setdefault("card_drafts", {}).setdefault(key, [])
+    for number, draft in enumerate(drafts):
+        left, right = st.columns([5, 1])
+        left.markdown(f"**{number + 1}.** {TEMPLATE_LABELS[draft['template']]} · "
+                      f"{_clock(draft['start'] - clip.start_time)}–{_clock(draft['end'] - clip.start_time)} · "
+                      f"{_card_summary(draft)}")
+        if right.button("Remove", key=f"card_remove_{key}_{number}"):
+            drafts.pop(number)
+            st.session_state.get("card_clips", {}).pop(key, None)
+            st.rerun()
+    with st.expander("➕ Add a graphic", expanded=not drafts):
+        template = st.selectbox("Kind", TEMPLATES, format_func=TEMPLATE_LABELS.get, key=f"card_template_{key}")
+        if CARD_GUIDE[template][0]:
+            st.caption(CARD_GUIDE[template][0])
+        card = _new_card(template, key, clip, spans, hook)
+        if card is not None:
+            edit = ClipEdit(start=clip.start_time, end=clip.end_time, cards=[Card(**d) for d in drafts] + [card])
+            result = check_edit(edit, words, hook)[-1]
+            for warning in result.warnings:
+                st.warning(warning)
+            if not result.ok:
+                st.error("Not added. Fix this first:\n\n" + "\n".join(f"- {e}" for e in result.errors))
+            else:
+                drafts.append(asdict(edit.cards[-1]))
+                drafts.sort(key=lambda d: d["start"])
+                st.session_state.get("card_clips", {}).pop(key, None)
+                for field_key in [k for k in st.session_state if str(k).startswith(("card_rows_", "card_title_"))]:
+                    del st.session_state[field_key]
+                st.rerun()
+    if drafts and st.button("🎬 Render this clip with its graphics", type="primary", key=f"card_render_{key}"):
+        edit = ClipEdit(start=clip.start_time, end=clip.end_time, cards=[Card(**draft) for draft in drafts],
+                        brand=load_brand_kit())
+        output = Path(path).with_name(Path(path).stem + "_graphics.mp4")
+        work_dir = settings.temp_dir / "graphics" / Path(path).stem
+        cached_crop = context.get("crop")
+
+        def render_base(kept_words: list[Any]) -> Path:
+            # Same framing as the clip; no bold captions while a graphic is up; the title
+            # shows for the opening only, so it never sits under a graphic.
+            return Path(rerender_clip(
+                source_path=str(context["source_path"]), new_start=clip.start_time, new_end=clip.end_time,
+                transcript_words=kept_words, output_path=work_dir / "base.mp4",
+                cached_crop_x=cached_crop.x if isinstance(cached_crop, CropBox) else None,
+                cached_crop=cached_crop if isinstance(cached_crop, CropBox) else None,
+                layout_mode=str(context["layout_mode"]), source_duration=context.get("source_duration"),
+                crop_plan=context.get("crop_plan"), hook_title=clip.viral_title, hook_seconds=settings.hook_title_seconds,
+                highlight_active_word=settings.caption_highlight, pin_title=False, webinar=context.get("webinar"),
+                title_fade_in=bool(context.get("title_fade_in", True)),
+            ))
+
+        with st.spinner("Drawing the graphics and adding them to the clip…"):
+            try:
+                work_dir.mkdir(parents=True, exist_ok=True)
+                made, checks = render_with_cards(Path(context["source_path"]), edit, words, output, work_dir,
+                                                 render_base, hook_seconds=hook)
+            except ModuleNotFoundError:
+                st.error("Graphics need Playwright. In Terminal: .venv/bin/pip install playwright && "
+                         ".venv/bin/playwright install chromium")
+                return
+            except Exception as exc:
+                logging.exception("Graphics failed")
+                st.error(f"Couldn't add the graphics: {exc}")
+                return
+        problems = [f"Graphic {n + 1}: {e}" for n, c in enumerate(checks) for e in c.errors]
+        if problems:
+            st.error("Left out:\n\n" + "\n".join(f"- {p}" for p in problems))
+        if made:
+            st.session_state.setdefault("card_clips", {})[key] = str(made)
+            st.session_state.pop("published_page", None)  # the page should show the new version
+            st.rerun()
+    made = _card_clip_path(path)
+    if made:
+        st.video(str(made))
+        st.download_button("Download the version with graphics", data=functools.partial(made.read_bytes),
+                           file_name=made.name, mime="video/mp4", key=f"card_download_{key}", on_click="ignore")
+        st.caption("A published preview page uses this version for this clip.")
+
+
 def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
     """🌐 Publish the clips to a client preview page: the same R2 page as the worker's
     pitches, with the same open/play/download tracking."""
@@ -2241,7 +2503,8 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
             st.rerun()
         return
     clips = [
-        {"path": str(Path(path).expanduser().resolve()), "start": clip.start_time, "end": clip.end_time}
+        {"path": str(_card_clip_path(path) or Path(path).expanduser().resolve()), "start": clip.start_time,
+         "end": clip.end_time}
         for path, clip in generated_clips
         if Path(path).expanduser().is_file()
     ][:9]
@@ -2369,6 +2632,11 @@ def _render_trim_form(
     contexts.pop(_clip_key(clip_path), None)
     contexts[_clip_key(updated_path)] = {**context, "start_time": adjusted_start, "end_time": adjusted_end}
     st.session_state["clip_render_contexts"] = contexts
+    # Graphics keep their source times; they're checked again against the new start and end when rendered.
+    st.session_state.get("card_clips", {}).pop(_clip_key(clip_path), None)
+    card_drafts = st.session_state.get("card_drafts", {})
+    if _clip_key(clip_path) in card_drafts:
+        card_drafts[_clip_key(updated_path)] = card_drafts.pop(_clip_key(clip_path))
     clip_path.unlink(missing_ok=True)
     st.rerun()
 
