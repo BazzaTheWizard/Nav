@@ -168,6 +168,7 @@ def render_selected_clip(
             direction = direct(
                 source_words, start, end, info=graphics, hook_seconds=settings.hook_title_seconds,
                 plan=plan if layout == "smart_crop" else None, brand=load_brand_kit(), source=source_video,
+                video_words=words,
             )
             for note in direction.notes:
                 logger.info("Graphics, %s: %s", output_path.name, note)
@@ -247,6 +248,7 @@ def render_selected_clip(
                     seams=list(split.spans) if split else None,
                     crop_at=((lambda t: plan.shown_rect_at(t, start, end, pull_until))
                              if layout == "smart_crop" and plan is not None else None),
+                    layout=layout,
                 )
                 applied = direction.edit if rendered is not None else None
             except Exception as exc:  # noqa: BLE001 - a graphics failure never costs the clip

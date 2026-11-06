@@ -18,8 +18,15 @@ MIN_CARD_SECONDS = 2.5  # shorter than this, a chart is gone before anyone reads
 MIN_OVERLAY_SECONDS = 2.0
 HOOK_SECONDS = 3.0  # the first seconds stay full-screen: the hook is the speaker
 PAYOFF_SECONDS = 2.0  # the clip ends full-screen too, on the speaker's punchline
-MAX_CARDS = 1  # charts (split view) per clip: restraint, so each one lands
-MAX_OVERLAYS = 2  # numbers or boxes over the speaker per clip (plus one name card)
+MAX_CARDS = 2  # charts (split view) per clip (Round 30: was 1)
+MAX_OVERLAYS = 3  # numbers, boxes or micro-stats over the speaker per clip (plus one name card)
+MAX_GRAPHICS = 3  # data graphics per clip in all: 2-3 clean visual moments where the talk has them
+MAX_CHART_SHARE = 0.55  # charts cover at most this much of the clip: the speaker stays the star
+OVERLAY_TEMPLATES = {"kinetic_range", "buckets", "stat_pill"}
+CONTEXT_TEXT = 44  # characters in a context line
+_NUMBER_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+                 "twenty", "thirty", "forty", "fifty", "hundred", "thousand", "million", "billion", "trillion",
+                 "half", "twice", "double", "triple", "quarter", "third", "percent", "times"}
 MIN_GAP = 1.5  # seconds of plain video between two graphics
 RECAP_SECONDS = 3.0  # a number said in the hook can come back right after the title, as a recap
 LINE_LOOKBACK = 8.0  # the line under a number may quote words said this long before it
@@ -268,13 +275,21 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
     count = {"kinetic_range": (1, 1), "buckets": (2, 3), "speaker_title": (1, 1), "timeline": (2, 4),
              "metric_bars": (2, 4), "ranked_bars": (2, 5), "diverging_bar": (2, 2), "share_split": (2, 5),
              "trend_line": (2, 6), "arr_bridge": (3, 7), "sankey_flow": (3, 8), "cac_payback": (2, 2),
-             "drawdown_curve": (2, 2), "candlestick_ema": (0, 0)}[card.template]
+             "drawdown_curve": (2, 2), "candlestick_ema": (0, 0), "stat_pill": (1, 4)}[card.template]
     if not count[0] <= len(rows) <= count[1]:
         errors.append(f"This graphic takes {count[0]}{'' if count[0] == count[1] else f' to {count[1]}'} items.")
         return result
     used: set[int] = set()
     numeric = {"metric_bars", "ranked_bars", "diverging_bar", "kinetic_range", "share_split", "trend_line",
-               "arr_bridge", "sankey_flow", "cac_payback"}
+               "arr_bridge", "sankey_flow", "cac_payback", "stat_pill"}
+    # One number with a line under it (kinetic_range, or a micro-stat of one number): the
+    # line is the speaker's words. A micro-stat of 2-4 numbers is a short trend: each
+    # number's label is when, as said ("2022", "Q3").
+    single = card.template == "kinetic_range" or (card.template == "stat_pill" and len(rows) == 1)
+    series = card.template == "stat_pill" and len(rows) > 1
+    if card.context and (MODES.get(card.template) != "split" or card.template not in numeric):
+        card.context = {}
+        result.warnings.append("Context layer left out: only number charts take one.")
     if card.template == "speaker_title":
         _limit(errors, "Name", rows[0].label, LIMITS["name"])
         _limit(errors, "Role", rows[0].detail, LIMITS["role"])
@@ -314,13 +329,14 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
         for position, row in enumerate(rows, start=1):
             _limit(errors, f"Item {position} value", row.value, LIMITS["value"])
             _limit(errors, f"Item {position} label", row.label,
-                   LIMITS["context"] if card.template == "kinetic_range" else LIMITS["label"])
+                   LIMITS["context"] if card.template == "kinetic_range"
+                   else 8 if series else 22 if card.template == "stat_pill" else LIMITS["label"])
             value = parse_value(row.value)
             if not value.numbers:
                 errors.append(f"Item {position}: \"{row.value}\" has no number.")
                 continue
             hits = _match_numbers(value, numbers, used)
-            if hits is None and card.template == "kinetic_range":
+            if hits is None and single:
                 recap = spoken_numbers([w for w in recap_window if float(w.start) < card.start])
                 hits = _match_numbers(value, recap, set())
                 if hits is not None:  # said just before: it comes in as the graphic does
@@ -342,14 +358,18 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
                                        "Graphics work best for numbers that carry the point.")
             row.reveal_at = hits[0].start
             row.reveal_to = hits[1].start if len(hits) > 1 else None
-            if card.template == "kinetic_range" and row.label and not _said(row.label, lead_in):
+            if single and row.label and not _said(row.label, lead_in):
                 errors.append(f"The line under the number should use the speaker's words: \"{row.label}\".")
+            if series and not (row.label.strip() and _said(row.label, said_in_clip, 1.0)):
+                errors.append(f"Item {position}: label each point with when it is, as said (\"2022\", \"Q3\").")
         if card.template not in {"kinetic_range", "cac_payback"} and not errors:
             scales = {parse_value(row.value).scale for row in rows}
             if len(scales) > 1:
                 errors.append("One unit per chart: these mix scales (" + ", ".join(sorted(str(x) for x in scales)) + ").")
         if not errors:
             _shape_checks(card, errors)
+        if not errors and card.context and MODES.get(card.template) == "split":
+            _check_context(card, result)
     elif card.template == "buckets":
         after = card.start
         for position, row in enumerate(rows, start=1):
@@ -511,17 +531,111 @@ def _shape_checks(card: Card, errors: list[str]) -> None:
             errors.append("The second row is the payback period in months, e.g. \"12 months\".")
 
 
+def _magnitude(row: Any) -> float:
+    numbers = parse_value(row.value).numbers
+    return max(numbers) if numbers else 0.0
+
+
+def _ratio_text(value: float) -> str:
+    return f"{value:.1f}".rstrip("0").rstrip(".") + "×"
+
+
+def _check_context(card: Card, result: CardCheck) -> None:
+    """The chart's context layer (Card.context): what the numbers mean, from what was
+    said only. "ratio" (one item next to another: 2×) and "share" (a part of a whole:
+    40%) are worked out here from two of the chart's own checked numbers; "earlier" is a
+    number the speaker said elsewhere in the same video (the sentence is kept with it).
+    Its line names things and never carries a number of its own. A context that doesn't
+    hold is left out (the chart stays), with a warning saying why."""
+    context = dict(card.context)
+    kind, text = str(context.get("kind") or ""), str(context.get("text") or "").strip()
+
+    def drop(reason: str) -> None:
+        card.context = {}
+        result.warnings.append(f"Context layer left out: {reason}")
+
+    if not text or len(text) > CONTEXT_TEXT:
+        return drop(f"its line needs 1 to {CONTEXT_TEXT} characters (\"{text}\").")
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    if re.search(r"\d", text) or words & _NUMBER_WORDS:
+        return drop(f"its line can't carry a number of its own; the number is shown next to it (\"{text}\").")
+    if kind in {"ratio", "share"}:
+        try:
+            first, second = (int(n) for n in context.get("of") or [])
+            a, b = card.rows[first - 1], card.rows[second - 1]
+        except (TypeError, ValueError, IndexError):
+            return drop("it must name two of the chart's items by number.")
+        if first == second:
+            return drop("it compares an item with itself.")
+        if parse_value(a.value).scale != parse_value(b.value).scale:
+            return drop("its two numbers are in different units.")
+        x, y = _magnitude(a), _magnitude(b)
+        if x <= 0 or y <= 0:
+            return drop("one of its numbers is zero.")
+        def stems(words: str) -> set[str]:
+            return {k.replace("'s", "").strip("'").rstrip("s") for k in _keywords(words)}
+
+        names = stems(a.label) | stems(b.label)
+        if names and not names & stems(text):
+            return drop(f"its line should name what it compares ({a.label} or {b.label}).")
+        if kind == "ratio":
+            ratio = max(x, y) / min(x, y)
+            if not 1.25 <= ratio <= 50:
+                return drop(f"{ratio:.2f}× is too close to 1 (or too far) to mean something.")
+            context["value"] = _ratio_text(ratio)
+        else:
+            if x >= y:
+                return drop("the part must be smaller than the whole.")
+            context["value"] = f"{100 * x / y:.0f}%"
+        context["reveal"] = max(r.reveal_at for r in (a, b) if r.reveal_at is not None) + 0.9
+    elif kind == "earlier":
+        said, value = str(context.get("said") or ""), parse_value(str(context.get("value") or ""))
+        if not said or not value.numbers or len(str(context.get("value"))) > LIMITS["value"]:
+            return drop("an earlier number needs its value and the sentence it was said in.")
+        heard = [w for w in re.findall(r"\S+", said)]
+        spoken = spoken_numbers([_Plain(token, k) for k, token in enumerate(heard)])
+        if _match_numbers(value, spoken, set()) is None:
+            return drop(f"\"{context.get('value')}\" isn't in the sentence it's quoted from.")
+        if not _said(text, {_clean(token) for token in heard}, 0.6):
+            return drop("its line should use the words of the sentence it quotes.")
+        context["reveal"] = max((r.reveal_at for r in card.rows if r.reveal_at is not None), default=card.start) + 0.9
+    else:
+        return drop(f"unknown kind \"{kind}\".")
+    if context["reveal"] > card.end - 1.9:  # up at least 1.5 s before the chart leaves
+        return drop("there's no time left to read it before the chart leaves.")
+    card.context = context
+
+
+@dataclass
+class _Plain:
+    """A word of a quoted sentence (for spoken_numbers), timed by its position."""
+
+    text: str
+    start: float
+    end: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.end = self.start + 0.5
+
+
 def check_edit(edit: ClipEdit, words: list[Any], hook_seconds: float = HOOK_SECONDS) -> list[CardCheck]:
-    """Every card in the clip, plus the clip-wide rules: at most 1 chart, 2 number or box
-    graphics and 1 name card, with at least MIN_GAP seconds between graphics."""
+    """Every card in the clip, plus the clip-wide rules: at most 2 charts (covering at most
+    MAX_CHART_SHARE of the clip), 3 number, box or micro-stat graphics, 3 data graphics in
+    all and 1 name card, with at least MIN_GAP seconds between graphics."""
     results = [check_card(card, words, edit.start, edit.end, hook_seconds) for card in edit.cards]
     charts = [k for k, card in enumerate(edit.cards) if MODES.get(card.template) == "split"]
-    overlays = [k for k, card in enumerate(edit.cards) if card.template in {"kinetic_range", "buckets"}]
+    overlays = [k for k, card in enumerate(edit.cards) if card.template in OVERLAY_TEMPLATES]
     names = [k for k, card in enumerate(edit.cards) if card.template == "speaker_title"]
-    for kind, members, most in (("chart", charts, MAX_CARDS), ("number or box graphics", overlays, MAX_OVERLAYS),
-                                ("name card", names, 1)):
+    data = sorted(charts + overlays)
+    for kind, members, most in (("chart", charts, MAX_CARDS), ("number, box or micro-stat graphics", overlays, MAX_OVERLAYS),
+                                ("name card", names, 1), ("data graphics", data, MAX_GRAPHICS)):
         for k in members[most:]:
-            results[k].errors.append(f"At most {most} {kind} per clip: graphics land when they're rare.")
+            results[k].errors.append(f"At most {most} {kind} per clip: each one has to land.")
+    covered = 0.0
+    for k in charts:
+        covered += edit.cards[k].end - edit.cards[k].start
+        if covered > MAX_CHART_SHARE * max(1e-6, edit.end - edit.start) and len(charts) > 1:
+            results[k].errors.append(f"Charts would cover over {MAX_CHART_SHARE:.0%} of the clip: the speaker stays the star.")
     ordered = sorted(range(len(edit.cards)), key=lambda k: edit.cards[k].start)
     for first, second in zip(ordered, ordered[1:]):
         if edit.cards[second].start < edit.cards[first].end + MIN_GAP:

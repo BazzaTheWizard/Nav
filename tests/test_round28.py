@@ -246,9 +246,10 @@ check("...a number that wasn't said never gets on screen", not any(c.rows[0].val
 check("...and every graphic passes the renderer's own check", all(r.ok for r in K.check_edit(direction.edit, talk, 4.0)))
 short_end = talk[0].start + 25.0
 short = G.direct(talk, 100.0, short_end, info=INFO, hook_seconds=4.0, ask=answer(change, hedged))
-check("Restraint: one graphic at most in a clip under 30 s", len(short.edit.cards) <= 1
-      and any("is the most for this clip" in n for n in short.notes), str(short.notes))
-check("The prompt states the limit and when the title is up", "At most 2 graphics" in G.build_prompt(
+check("Density (Round 30): at most two graphics in a clip under 25 s, three otherwise",
+      len(short.edit.cards) <= G.max_graphics(short_end - 100.0) and G.max_graphics(24.0) == 2
+      and G.max_graphics(45.0) == 3, str(short.notes))
+check("The prompt states the limit and when the title is up", "At most 3 graphics" in G.build_prompt(
     spans, 100.0, 45.0, 4.0, INFO) and "No graphic before 4.0 s" in G.build_prompt(spans, 100.0, 45.0, 4.0, INFO))
 named = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0,
                  ask=answer(speaker={"name": "Dana Reyes", "role": "CEO, Northwind Labs"}))

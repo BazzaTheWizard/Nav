@@ -298,6 +298,124 @@ def _speaker_title(card: Card, accent: str) -> tuple[str, str, Motion]:
     return css, body, m
 
 
+STAT_PILL_TOP = 190  # the micro-stat's default spot: top left, below the apps' top bar
+STAT_PILL_SIZE = (500, 150)  # about how big it is (width, height), to place it
+
+
+def _stat_pill(card: Card, accent: str) -> tuple[str, str, Motion]:
+    """A micro-stat (Round 30): one number with a few of the speaker's words, or a short
+    trend (2-4 numbers, each labelled with when) as a sparkline ending on its latest
+    value. Small, on frosted glass, in a corner clear of the face: it backs up what's
+    said without taking the frame."""
+    x, y, _scale, align = parse_place(card.place) if card.place else (56, STAT_PILL_TOP, 1.0, "left")
+    side = f"left: {x:.0f}px;" if align != "right" else f"right: {W - x:.0f}px;"
+    last = card.rows[-1]
+    color = accent if (last.highlight or len(card.rows) > 1) else INK
+    css = f"""
+.pill {{ position: absolute; top: {y:.0f}px; {side} max-width: 620px; padding: 22px 30px 22px; border-radius: 26px;
+  background: rgba(16,18,24,.46); box-shadow: 0 12px 36px rgba(0,0,0,.30); display: flex; align-items: center; gap: 22px; }}
+.pill .v {{ font-size: 62px; font-weight: 780; letter-spacing: -.03em; line-height: 1; color: {color}; white-space: nowrap; }}
+.pill .l {{ font-size: 28px; font-weight: 560; color: #D5D9E0; line-height: 1.15; max-width: 300px; }}
+.pill .when {{ font-size: 22px; font-weight: 600; color: {AXIS}; white-space: nowrap; }}
+.spark {{ width: 210px; height: 84px; overflow: visible; }}
+"""
+    m = Motion()
+    m.tween(".pill", "opacity", 0.0, 0.28, "0", "1")
+    m.tween(".pill", "transform", 0.0, 0.4, f"translateX({-20 if align != 'right' else 20}px)", "translateX(0px)")
+    if len(card.rows) == 1:
+        body = (f'<div class="pill blur round"><span class="v fit">{_e(last.value)}</span>'
+                + (f'<span class="l">{_e(last.label)}</span>' if last.label else "") + "</div>")
+        return css, body, m
+    values = [signed_value(row.value) for row in card.rows]  # a fall stays a fall
+    low, high = min(values), max(values)
+    span = (high - low) or 1.0
+    points = [(10 + 190 * k / (len(values) - 1), 74 - 64 * (v - low) / span) for k, v in enumerate(values)]
+    path = " ".join(f"{'M' if k == 0 else 'L'}{px:.1f},{py:.1f}" for k, (px, py) in enumerate(points))
+    dots = "".join(f'<circle class="dot" id="d{k}" cx="{px:.1f}" cy="{py:.1f}" r="{7 if k == len(points) - 1 else 5}" '
+                   f'fill="{accent if k == len(points) - 1 else "#C9CED6"}"/>' for k, (px, py) in enumerate(points))
+    body = (f'<div class="pill blur round"><svg class="spark" viewBox="0 0 210 84"><path class="ln" d="{path}" '
+            f'pathLength="1" fill="none" stroke="#C9CED6" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" '
+            f'stroke-dasharray="1" stroke-dashoffset="1"/>{dots}</svg><span><div class="v fit">{_e(last.value)}</div>'
+            f'<div class="when">{_e(card.rows[0].label)} → {_e(last.label)}</div></span></div>')
+    times = [_rel(card, row.reveal_at, 0.2 + 0.5 * k) for k, row in enumerate(card.rows)]
+    m.tween(".ln", "strokeDashoffset", times[0], max(times[-1], times[0] + 0.6), "1", "0")
+    for k, t in enumerate(times):
+        m.tween(f"#d{k}", "opacity", t, t + 0.2, "0", "1")
+    m.tween(".pill .v", "opacity", 0.0, 0.01, "0", "0")
+    m.tween(".pill .v", "opacity", times[-1], times[-1] + 0.3, "0", "1")
+    return css, body, m
+
+
+def _context_layer(card: Card, accent: str) -> tuple[str, str, Motion]:
+    """The chart's second layer (Card.context, checked by core.card_checks): what its
+    numbers mean, under the chart. A big figure and a short line; for a ratio, two thin
+    bars of the two sizes; for a share, how much of the whole; for an earlier number,
+    when in the video it was said."""
+    context = card.context
+    value, text, kind = str(context.get("value") or ""), str(context.get("text") or ""), str(context.get("kind") or "")
+    reveal = _rel(card, context.get("reveal"), 1.6)
+    extra = ""
+    if kind in {"ratio", "share"}:
+        first, second = (int(n) for n in context.get("of") or [1, 2])
+        a, b = card.rows[first - 1], card.rows[second - 1]
+        x, y = max(parse_value(a.value).numbers or [0.0]), max(parse_value(b.value).numbers or [0.0])
+        if kind == "ratio":  # the smaller one as one block, the larger as that many blocks
+            small, large = (a, b) if x < y else (b, a)
+            times = max(x, y) / (min(x, y) or 1.0)
+            whole = min(10, int(times))
+            blocks = "".join(f'<span class="blk" id="bk{k}" style="background:{accent}"></span>' for k in range(whole))
+            part = times - whole if times < 10 else 0
+            if part >= 0.08:
+                blocks += (f'<span class="blk part" id="bk{whole}" style="width:{44 * part:.0f}px;'
+                           f'background:{accent}"></span>')
+            extra = (f'<div class="units"><span class="unit"><span class="blk" id="bu" style="background:#8A919D"></span>'
+                     f'<span class="cl">{_e(small.label)}</span></span><span class="unit"><span class="row">{blocks}</span>'
+                     f'<span class="cl">{_e(large.label)}</span></span></div>')
+        else:
+            extra = (f'<div class="cbar"><span class="cl">{_e(b.label)}</span><span class="ct"><span class="cf" id="cf0" '
+                     f'style="width:{100 * x / (y or 1.0):.1f}%;background:{accent}"></span></span></div>')
+    elif kind == "earlier":
+        at = float(context.get("at") or 0.0)
+        extra = f'<div class="when">Said earlier, at {int(at // 60)}:{int(at % 60):02d}</div>'
+    css = f"""
+.main {{ position: absolute; left: 0; top: 0; width: {W}px; height: {CHART_H}px; transform-origin: top center; }}
+.ctxl {{ position: absolute; left: 96px; right: 96px; top: 572px; padding-top: 22px; border-top: 2px solid {RULE}; }}
+.ctxl .eye {{ font-size: 21px; font-weight: 700; letter-spacing: .14em; color: {AXIS}; }}
+.ctxl .row1 {{ display: flex; align-items: baseline; gap: 22px; margin-top: 8px; }}
+.ctxl .big {{ font-size: 60px; font-weight: 780; letter-spacing: -.03em; color: {accent}; white-space: nowrap; }}
+.ctxl .txt {{ font-size: 30px; font-weight: 560; color: {SOFT}; white-space: nowrap; overflow: hidden; }}
+.cbar {{ display: flex; align-items: center; gap: 16px; margin-top: 10px; }}
+.cl {{ width: 230px; font-size: 22px; color: {AXIS}; white-space: nowrap; overflow: hidden; }}
+.ct {{ flex: 1; height: 10px; background: {TRACK}; border-radius: 5px; overflow: hidden; }}
+.cf {{ display: block; height: 100%; border-radius: 5px; }}
+.ctxl .when {{ margin-top: 8px; font-size: 22px; color: {AXIS}; }}
+.units {{ display: flex; gap: 46px; margin-top: 14px; align-items: flex-end; }}
+.unit {{ display: flex; flex-direction: column; gap: 8px; }} .unit .row {{ display: flex; gap: 8px; }}
+.blk {{ display: inline-block; width: 44px; height: 44px; border-radius: 6px; }}
+.unit .cl {{ width: auto; }}
+"""
+    body = (f'<div class="ctxl" id="ctx"><div class="eye">IN CONTEXT</div><div class="row1"><span class="big">'
+            f'{_e(value)}</span><span class="txt fit">{_e(text)}</span></div>{extra}</div>'
+            # Laid out once the fonts are in: right under a short chart (it keeps its size), or
+            # with the chart scaled to 86% when the chart fills its area.
+            "<script>window.__layout = () => { const main = document.querySelector('.main');"
+            " const stage = document.querySelector('.stage').getBoundingClientRect();"
+            " const lowest = () => { let b = 0; for (const el of main.querySelectorAll('div, span, rect, circle, path,"
+            " line, polyline, text')) { if (el.closest('.lyr') === el) continue; const r = el.getBoundingClientRect();"
+            " if (r.width > 0 && r.height > 0 && r.height < 900) b = Math.max(b, r.bottom); } return b - stage.top; };"
+            " main.style.transform = 'none'; let bottom = lowest();"
+            " if (bottom > 500) { main.style.transform = 'scale(.86)'; bottom = lowest(); }"
+            " document.querySelector('.ctxl').style.top = Math.max(300, Math.min(572, bottom + 70)) + 'px'; };</script>")
+    m = Motion()
+    m.fade_up("#ctx", reveal, rise=14, length=0.45)
+    if 'id="cf0"' in body:
+        m.tween("#cf0", "clipPath", reveal + 0.15, reveal + 0.75, "inset(0 100% 0 0)", "inset(0 0% 0 0)")
+    for k in range(11):
+        if f'id="bk{k}"' in body:
+            m.tween(f"#bk{k}", "opacity", reveal + 0.2 + 0.12 * k, reveal + 0.35 + 0.12 * k, "0", "1")
+    return css, body, m
+
+
 # ------------------------------------------------------------ split charts
 def _timeline(card: Card, accent: str) -> tuple[str, str, Motion]:
     n = len(card.rows)
@@ -864,7 +982,7 @@ def _fmt(value: float) -> str:
 
 
 BUILDERS = {
-    "drawdown_curve": _drawdown_curve,
+    "drawdown_curve": _drawdown_curve, "stat_pill": _stat_pill,
     "kinetic_range": _kinetic_range, "buckets": _buckets, "speaker_title": _speaker_title,
     "timeline": _timeline, "metric_bars": _metric_bars, "ranked_bars": _ranked_bars,
     "diverging_bar": _diverging_bar, "share_split": _share_split, "trend_line": _trend_line,
@@ -873,6 +991,7 @@ BUILDERS = {
 }
 
 _SETUP = """(tracks) => {
+  if (window.__layout) window.__layout();
   const fit = el => { let size = parseFloat(getComputedStyle(el).fontSize), floor = size * 0.62;
     while (el.scrollWidth > el.clientWidth + 1 && size > floor) { size -= 2; el.style.fontSize = size + 'px'; } };
   document.querySelectorAll('.fit').forEach(fit);
@@ -894,6 +1013,12 @@ def scene(card: Card, brand: BrandKit) -> tuple[str, Motion, int, int, int]:
     """(page, motion, width, height, top) for a card, with its exit (slide and fade)."""
     css, body, motion = BUILDERS[card.template](card, brand.accent)
     overlay = MODES[card.template] == "overlay"
+    if not overlay and card.context.get("value"):  # a checked context layer: the chart moves up a little for it
+        extra_css, extra_body, extra = _context_layer(card, brand.accent)
+        css, body = css + extra_css, f'<div class="main">{body}</div>{extra_body}'
+        for key, points in extra.tracks.items():
+            motion.tracks.setdefault(key, []).extend(points)
+        motion.spans.extend(extra.spans)
     width, height, top = (FRAME_W, FRAME_H, 0) if overlay else (FRAME_W, SPLIT_H, SPLIT_TOP)
     duration = max(0.5, card.end - card.start)
     gone = duration - 1 / FPS  # fully faded on the last frame, so nothing pops off

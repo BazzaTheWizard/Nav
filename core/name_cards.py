@@ -23,7 +23,7 @@ import numpy as np
 
 from core import speaker_id as S
 from core.card_checks import MIN_GAP, PAYOFF_SECONDS
-from core.cards import NAME_CARD_TOP, name_card_size
+from core.cards import NAME_CARD_TOP, STAT_PILL_SIZE, STAT_PILL_TOP, name_card_size
 from core.edl import Card, CardRow
 
 logger = logging.getLogger(__name__)
@@ -55,10 +55,13 @@ class Option:
     talking: Callable[[float, float], float] | None = None  # share of the talking that's the guest's
 
 
-def place(name: str, role: str, option: Option) -> str | None:
+def place(name: str, role: str, option: Option, size: tuple[int, int] | None = None,
+          corner: bool = False) -> str | None:
     """Card.place for this option: the spot closest to ``prefer`` that keeps off the
-    face (eyebrows to chin) and the captions, or None when there is no such spot."""
-    width, height = name_card_size(name, role, option.scale)
+    face (eyebrows to chin) and the captions, or None when there is no such spot.
+    ``size``: the card's size (default: a name card for name and role); ``corner``: a
+    side spot beats the centre (a micro-stat sits in a corner)."""
+    width, height = size or name_card_size(name, role, option.scale)
     cx, cy, fw = option.face
     core = (cx - FACE_SIDE * fw, cy - FACE_UP * fw, cx + FACE_SIDE * fw, cy + FACE_DOWN * fw)
     head = (cx - FACE_SIDE * fw, cy - HEAD_UP * fw, cx + FACE_SIDE * fw, cy - FACE_UP * fw)
@@ -73,8 +76,8 @@ def place(name: str, role: str, option: Option) -> str | None:
             box = (left, y, left + width, y + height)
             if _overlap(box, core) > 0:
                 continue
-            cost = (abs(y - option.prefer) / 400 + 3 * _overlap(box, head) / (width * height)
-                    + (0 if align == "center" else 0.35))
+            side_cost = (0.35 if align == "center" else 0) if corner else (0 if align == "center" else 0.35)
+            cost = abs(y - option.prefer) / 400 + 3 * _overlap(box, head) / (width * height) + side_cost
             if best is None or cost < best[0]:
                 best = (cost, f"{x:.0f},{y},{option.scale:.2f},{align}")
     return best[1] if best else None
@@ -121,7 +124,7 @@ def options(source: str | Path, plan: Any, clip_start: float, clip_end: float, g
             found.append(Option(a, b, "panel", face, region, PANEL_SCALE, prefer,
                                 _talking(lambda a=a, b=b, pair=pair: S.mouth_activity(source, a, b, pair), a,
                                          0 if on_left else 1)))
-        elif not shot.group and shot.has_face:
+        elif not shot.group and shot.has_face and not getattr(shot, "content", False):  # never on a shared page
             faces_now = S.faces_at(source, times, plan.frame_width)
             if guest is not None:
                 hits = [face for face in (S.best_match(faces, guest) for faces in faces_now) if face is not None]
@@ -223,3 +226,32 @@ def name_card(
     card = Card("speaker_title", start=when, end=when + NAME_CARD_SECONDS, rows=[CardRow(name, detail=role)], place=spot)
     where = "on their solo shot" if option.kind == "solo" else "in their panel of the split, while they talk"
     return card, where
+
+
+STAT_REGION = (150, 1100)  # a micro-stat stays in the top part, clear of the captions
+STAT_DEFAULT = f"56,{STAT_PILL_TOP},1.00,left"
+
+
+def stat_place(source: str | Path, plan: Any, clip_start: float, clip_end: float, start: float, end: float) -> str:
+    """Where a micro-stat goes (Card.place): a corner of the top part clear of whoever is
+    on screen (from their face while it's up), top left when nothing is in the way or the
+    faces can't be read."""
+    try:
+        split = plan.split_view(clip_start, clip_end)
+        middle = (start + end) / 2
+        if split and any(a <= middle - clip_start < b for a, b, *_ in split.windows):
+            return STAT_DEFAULT  # a two-person split: the top corner sits above the top panel's head
+        shot = next((s for s in plan.shots if s.start <= middle < s.end), None)
+        if shot is None or shot.group or not shot.has_face or getattr(shot, "content", False):
+            return STAT_DEFAULT
+        faces = [f for faces in S.faces_at(source, [start + 0.3, middle], plan.frame_width) for f in faces]
+        if not faces:
+            return STAT_DEFAULT
+        scale = FRAME[1] / plan.crop_height
+        biggest = max(faces, key=lambda f: f.w)
+        face = ((biggest.cx - shot.x) * scale, (biggest.cy - plan.y) * scale, biggest.w * scale)
+        option = Option(start, end, "solo", face, STAT_REGION, 1.0, STAT_PILL_TOP)
+        return place("", "", option, size=STAT_PILL_SIZE, corner=True) or STAT_DEFAULT
+    except Exception as exc:  # noqa: BLE001 - the default corner is fine
+        logger.warning("Micro-stat placement failed: %s", exc)
+        return STAT_DEFAULT

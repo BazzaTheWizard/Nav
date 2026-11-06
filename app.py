@@ -88,7 +88,7 @@ from core.edl import (
 from core import webinar as webinar_defaults
 from core.clipper import MIN_CLIP_DURATION, rerender_clip, rerender_output_path
 from core.face_tracker import CropBox
-from core.drive_uploader import replace_clip_in_drive, upload_clips_to_drive
+from core.drive_uploader import remove_named_clip_in_drive, replace_clip_in_drive, upload_clips_to_drive
 from core.outreach import (
     SUBJECT,
     build_linkedin_messages,
@@ -1974,6 +1974,9 @@ def _render_generated_clips() -> None:
         return
     settings = load_settings()
     st.subheader("Your vertical clips")
+    note = st.session_state.pop("made_clips_toast", None)
+    if note:
+        st.toast(note, icon="🗑️")
     columns = st.columns(len(generated_clips))
     for index, (clip_path, clip) in enumerate(generated_clips):
         with columns[index]:
@@ -1994,6 +1997,7 @@ def _render_generated_clips() -> None:
                 )
             else:
                 st.warning(f"Clip file not found: {clip_path.name}. Make the clips again.")
+            _render_remove_generated(index, clip_path, len(generated_clips))
             if clip.caption:
                 with st.expander("Why this moment"):
                     st.write(clip.caption)
@@ -2052,6 +2056,9 @@ CARD_GUIDE: dict[str, tuple[str, dict[str, str]]] = {
                 "or projection, next to solid boxes for what happened.",
                 {"label": "Box text", "dashed": "Dashed", "highlight": "Gold"}),
     "speaker_title": ("", {}),
+    "stat_pill": ("A small micro-stat in a top corner: one number as said with 2–4 of the speaker's words, or a short "
+                  "trend (2–4 rows, oldest first, each labelled with when, e.g. 2022).",
+                  {"label": "Words, or when", "value": "Number as said"}),
     "timeline": ("2–4 points in time, in the order they come up. A point said earlier in the clip is drawn in "
                  "as a recap.", {"value": "When (as said)", "detail": "What (speaker's words)", "highlight": "Focus"}),
     "metric_bars": ("2–4 numbers in one unit. Each bar grows as its number is said.",
@@ -2077,7 +2084,7 @@ CARD_GUIDE: dict[str, tuple[str, dict[str, str]]] = {
     "candlestick_ema": ("Drawn from a price file you upload (CSV: date, open, high, low, close, volume), not from "
                         "speech. The chart shows its source.", {}),
 }
-CARD_ROWS = {"kinetic_range": 1, "buckets": 3, "timeline": 3, "metric_bars": 3, "ranked_bars": 3,
+CARD_ROWS = {"kinetic_range": 1, "buckets": 3, "stat_pill": 1, "timeline": 3, "metric_bars": 3, "ranked_bars": 3,
              "diverging_bar": 2, "share_split": 3, "trend_line": 4, "arr_bridge": 4, "sankey_flow": 4,
              "cac_payback": 2, "drawdown_curve": 2}
 NAME_CARD_SECONDS = 3.3
@@ -2210,6 +2217,7 @@ def _render_clip_version(
                 lambda kept: render(kept, work_dir / "base.mp4", False),
                 hook_seconds=settings.hook_title_seconds, seams=list(split.spans) if split else None,
                 crop_at=((lambda t: plan.shown_rect_at(t, clip.start_time, clip.end_time, pull_until)) if smart else None),
+                layout=str(context.get("layout_mode", "")),
             )
             problems = [f"Graphic {n + 1}: {e}" for n, c in enumerate(checks) for e in c.errors]
             if made is not None:
@@ -2327,6 +2335,86 @@ def _render_data_cards(generated_clips: list[tuple[Any, Any]]) -> None:
         st.error("Left out:\n\n" + "\n".join(f"- {p}" for p in problems))
 
 
+def _render_remove_generated(index: int, clip_path: Path, count: int) -> None:
+    """🗑 Remove clip (Make clips): confirm in a pop-over, like the Outbox's."""
+    if count <= 1:
+        st.button("🗑 Remove clip", key=f"remove_made_off_{clip_path.stem}", disabled=True, width="stretch",
+                  help="It's the only clip left. To drop it, use 🗑️ Discard these clips.")
+        return
+    places = [p for p in (
+        "the client preview page" if _published_paths() else "",
+        "the Google Drive folder" if st.session_state.get("drive_folder_link") else "",
+        "this Mac",
+    ) if p]
+    where = ", ".join(places[:-1]) + (" and " if len(places) > 1 else "") + places[-1]
+    with st.popover("🗑 Remove clip", width="stretch"):
+        st.markdown(f"Remove clip {index + 1}? It's deleted from {where}. The other clips stay as they are.")
+        if not st.button(f"Yes, remove clip {index + 1}", key=f"remove_made_{clip_path.stem}", type="primary",
+                         width="stretch"):
+            return
+        with st.spinner("Removing…"):
+            try:
+                note = _remove_generated_clip(index)
+            except Exception as exc:
+                logging.exception("Could not remove the clip")
+                st.error(f"Couldn't remove it: {exc}")
+                return
+    st.session_state["made_clips_toast"] = note
+    st.rerun()
+
+
+def _published_paths() -> list[str]:
+    """The clips on this session's published preview page, in page order (their files)."""
+    published = st.session_state.get("published_page")
+    return list(published.get("paths") or []) if isinstance(published, dict) else []
+
+
+def _remove_generated_clip(index: int) -> str:
+    """Take Make-clips clip ``index`` (from 0) out everywhere it went, in the Outbox's
+    order: its preview page (if published), the Drive folder (if uploaded), this Mac, and
+    the app's lists, so a later Publish or Upload never includes it. Returns a note."""
+    generated = list(st.session_state.get("generated_clips", []))
+    if not 0 <= index < len(generated):
+        raise ValueError("That clip isn't in the list any more.")
+    path = Path(generated[index][0]).expanduser()
+    key = _clip_key(path)
+    notes: list[str] = []
+    published = st.session_state.get("published_page")
+    paths = _published_paths()
+    if isinstance(published, dict) and key in paths:
+        number = paths.index(key) + 1
+        clip_pages.remove_clip(str(published["page_name"]), number, len(paths))
+        paths.pop(number - 1)
+        published["paths"], published["clips"] = paths, len(paths)
+        clip_pages.update_manual_page(str(published["page_name"]), clips=len(paths))
+        notes.append("its preview page")
+    elif isinstance(published, dict):
+        notes.append("not its preview page (published before this version: use Publish again)")
+    drive_link = st.session_state.get("drive_folder_link")
+    if drive_link:
+        if remove_named_clip_in_drive(str(drive_link), path.resolve().name, len(generated)):
+            notes.append("the Drive folder")
+    output_dir = render_output_dir().expanduser().resolve()
+    resolved = path.resolve()
+    if not path.is_symlink() and resolved.parent == output_dir and resolved.suffix.lower() == ".mp4":
+        resolved.unlink(missing_ok=True)
+    removed = generated.pop(index)
+    st.session_state["generated_clips"] = generated
+    st.session_state["clip_paths"] = [p for p in st.session_state.get("clip_paths", []) if _clip_key(p) != key]
+    st.session_state.get("clip_render_contexts", {}).pop(key, None)
+    st.session_state.get("card_drafts", {}).pop(key, None)
+    clip = removed[1]
+    st.session_state.setdefault("removed_made_clips", []).append(
+        {"title": getattr(clip, "viral_title", ""), "start": getattr(clip, "start_time", None),
+         "end": getattr(clip, "end_time", None)}
+    )
+    where = " and ".join(["this Mac", *notes]) if notes else "this Mac"
+    note = f"Clip {index + 1} removed from {where}. {len(generated)} left."
+    if st.session_state.get("outreach_email_body") or st.session_state.get("ai_outreach_email"):
+        note += " Check the email draft: it may still say the old number of clips."
+    return note
+
+
 def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
     """🌐 Publish the clips to a client preview page: the same R2 page as the worker's
     pitches, with the same open/play/download tracking."""
@@ -2390,7 +2478,8 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
             logging.exception("Could not publish the clip page")
             st.error(f"Couldn't publish the page: {exc}")
             return
-    st.session_state["published_page"] = entry
+    # The page's clips in order, so 🗑 Remove clip can take one off it later.
+    st.session_state["published_page"] = {**entry, "paths": [_clip_key(clip["path"]) for clip in clips]}
     st.rerun()
 
 

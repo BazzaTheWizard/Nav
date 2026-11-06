@@ -88,6 +88,13 @@ Analyze the supplied transcript and return one JSON object with:
   stands on its own.
 - Prefer moments with something concrete: a story, a number, a strong opinion,
   a surprising claim, or a clear how-to.
+- Business shows (B2B, SaaS, venture, private equity, consulting, finance, executive
+  and operator interviews): prefer the segments with real substance — unit economics
+  (CAC, LTV, payback, margins, burn), pricing, market structure and competition,
+  go-to-market and sales motions, fundraising, valuation and multiples, and how
+  institutions actually work (fund mechanics, diligence, boards, procurement) — over
+  generic self-help, motivation, life advice or friendly banter. A segment with numbers
+  the viewer can see on screen beats a general one.
 - Never pick sponsor reads, intros, outros, or "like and subscribe" asks.
 - Never start a clip on a word that continues or answers something said before
   ("And", "But", "Because", "Yeah", "Exactly", "That's why", "Like I said").

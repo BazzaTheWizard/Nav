@@ -163,9 +163,13 @@ _CATEGORY_GUIDANCE = {
         "specialist educators, professional training, and practical niche tutorials"
     ),
     "B2B": (
-        "B2B founders, agency owners, consultants, coaches, fractional executives, "
-        "commercial real estate investors and keynote speakers who host interview podcasts "
-        "or long-form talks on sales, marketing, leadership, operations and investing"
+        # Round 30: the core market first. Shows whose talk carries numbers and
+        # mechanics (where the data graphics shine), not motivation or banter.
+        "B2B SaaS founders and operators; venture capital and private equity investors "
+        "(GPs, LPs, angels); consulting and advisory firms; finance, fintech and investing "
+        "shows; CFOs, CROs, RevOps and go-to-market leaders; executive and operator interview "
+        "podcasts on unit economics, pricing, fundraising, valuation, market structure, "
+        "go-to-market and how institutions really work"
     ),
 }
 
@@ -236,6 +240,50 @@ def _parse_query_response(text: str, count: int) -> list[str]:
     return unique_phrases
 
 
+B2B_QUERY_HINT = (
+    "Aim at the shows where operators and investors talk numbers: e.g. 'SaaS founder podcast ARR', "
+    "'venture capital podcast fund strategy', 'go-to-market strategy podcast', 'B2B sales leadership "
+    "interview', 'private equity deal breakdown', 'CFO podcast unit economics', 'fintech founder "
+    "interview', 'consulting firm podcast'. Never self-help, motivation, mindset or lifestyle. "
+)
+
+# Round 30: how well a channel fits the core market, from its own words (channel
+# description and recent video titles). Each core term counts once; so does each
+# self-help or lightweight term. A channel with no core term and 2+ of those is off
+# niche; otherwise the fit adds to its place in the queue.
+CORE_TERMS = (
+    "saas", "b2b", "arr", "mrr", "startup", "founder", "venture", "vc", "fund", "fundraising", "investor",
+    "private equity", "m&a", "valuation", "cfo", "revenue", "go-to-market", "gtm", "sales", "pricing",
+    "unit economics", "cac", "ltv", "churn", "enterprise", "consulting", "advisory", "fintech", "finance",
+    "investing", "capital", "markets", "operator", "ceo", "growth", "margin", "earnings", "economy",
+)
+OFF_NICHE_TERMS = (
+    "mindset", "motivation", "motivational", "manifest", "manifesting", "self-help", "self love", "self-love",
+    "healing", "spiritual", "dating", "relationship advice", "morning routine", "life coach", "inspiration",
+    "law of attraction", "affirmations", "wellness", "vlog", "reaction", "prank",
+)
+NICHE_FIT_MAX_BONUS = 3
+
+
+def niche_fit(channel_description: str, video_titles: list[str]) -> int:
+    """Core-market terms minus self-help/lightweight terms (each counted once) in the
+    channel's description and recent titles."""
+    text = " " + re.sub(r"\s+", " ", " ".join([channel_description, *video_titles]).lower()) + " "
+
+    def hits(terms: tuple[str, ...]) -> int:
+        return sum(1 for term in terms if re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", text))
+
+    return hits(CORE_TERMS) - 2 * hits(OFF_NICHE_TERMS)
+
+
+def off_niche(channel_description: str, video_titles: list[str]) -> bool:
+    """No core-market term at all and 2+ self-help or lightweight ones."""
+    text = " ".join([channel_description, *video_titles]).lower()
+    core = any(re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", text) for term in CORE_TERMS)
+    light = sum(1 for term in OFF_NICHE_TERMS if re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", text))
+    return not core and light >= 2
+
+
 def generate_search_queries(category: str = "All", count: int = 10) -> list[str]:
     """Generate targeted YouTube search phrases for long-form creator discovery."""
     if count < 1:
@@ -253,6 +301,8 @@ def generate_search_queries(category: str = "All", count: int = 10) -> list[str]
         "Incorporate high-yield keywords like 'podcast', 'deep dive', 'interview', 'commentary', "
         "and 'breakdown' (e.g., '[Niche] podcast interview', '[Topic] deep dive breakdown', "
         "'[Topic] masterclass analysis'). Keep phrases concise and specific. "
+        + (B2B_QUERY_HINT if category == "B2B" else "")
+        +
         'Return only JSON in the form {"search_phrases": ["phrase", ...]}.'
     )
     response = generate_content_with_fallback(
@@ -1104,6 +1154,10 @@ def discover_channels(
                     if off_topic_share(recent_videos) > OFF_TOPIC_MAX_SHARE:
                         record(channel_id, "off_topic_category")
                         continue
+                    titles = [str((video.get("snippet") or {}).get("title") or "") for video in recent_videos]
+                    if off_niche(channel_description, titles):
+                        record(channel_id, "off_niche")  # soft: self-help or lightweight, not the core market
+                        continue
                     if not offer:
                         record(channel_id, "no_business_offer")  # soft: they may add a booking link later
                         continue
@@ -1145,6 +1199,10 @@ def discover_channels(
                     and PREFERRED_MIN_SECONDS <= target_seconds <= PREFERRED_MAX_SECONDS
                 )
                 priority = lead_priority(str(profile["status"]), bool(email), preferred_length)
+                if b2b:  # the core market (SaaS, VC, consulting, finance) goes first
+                    fit = niche_fit(channel_description,
+                                    [str((video.get("snippet") or {}).get("title") or "") for video in recent_videos])
+                    priority += max(0, min(NICHE_FIT_MAX_BONUS, fit // 2))
                 qualified.append(
                     {
                         "channel_id": channel_id,

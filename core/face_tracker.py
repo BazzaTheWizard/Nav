@@ -426,6 +426,14 @@ REFRAME_HOLD = 2.0
 REFRAME_SECONDS = 0.8
 FACE_SHOT_PRESENCE = 0.4
 GROUP_SHOT_PRESENCE = 0.6  # two people in the same frames for most of the shot
+# Embedded content (Round 30): a chart, slide, document or screen share in the recording
+# itself, maybe with small webcam tiles beside it. A 9:16 face crop (or the two-person
+# split) would cut it in half, so the whole frame is shown instead, like a slide.
+CONTENT_FACE_MAX = 0.11  # the biggest face is at most this share of the frame width: webcam tiles, not the subject
+CONTENT_FLAT_MIN = 0.45  # at least this share of the picture outside the faces is flat colour (a slide, a chart)
+CONTENT_EDGE_MIN = 0.02  # ...with text or lines on it (a blank or black screen isn't content)
+CONTENT_PRESENCE = 0.6  # in this share of a shot's samples
+CONTENT_CROP_FIT = 1.02  # content up to this share of the crop's width is framed on (shown big), not shown as the whole frame
 SAME_X_TOLERANCE_PX = 8
 # Two-speaker split view: two people side by side (a two-person shot or a remote
 # call's side-by-side webcams) become two stacked 1080x960 panels, one face each.
@@ -473,6 +481,7 @@ class Shot:
     group: bool
     speakers: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
     moves: tuple[tuple[float, int], ...] = ()
+    content: bool = False  # the recording's own chart, page or screen share, framed on it (Round 30)
 
 
 @dataclass(frozen=True)
@@ -715,6 +724,8 @@ class CropPlan:
         checks = [t for t in (0.05, hook_seconds / 2, min(hook_seconds, until) - 0.05) if 0 <= t < until]
         if until < 1.0 or any(self.base_rect_at(t, clip_start, clip_end) is None for t in checks):
             return 0.0
+        if any(shot.content and shot.start - 1e-6 <= clip_start + t < shot.end for shot in self.shots for t in checks):
+            return 0.0  # a shared page or chart never zooms
         return until
 
     def shown_rect_at(self, t: float, clip_start: float, clip_end: float,
@@ -1112,6 +1123,58 @@ def _dissolve_times(
     return found
 
 
+def _content_like(frame: np.ndarray, faces: list[tuple[float, float, float, float]], scale: float,
+                  frame_width: int) -> bool:
+    """The sample frame shows content of its own (a chart, slide, document or screen
+    share), not a person: no face bigger than a webcam tile, and the picture outside the
+    faces is mostly flat colour with text or lines on it. Measured on a screen-share
+    podcast: tiles at 9-10% of the width over a page 50-74% flat; talking heads 12-20%,
+    with 26-44% flat."""
+    if any(face[3] > CONTENT_FACE_MAX * frame_width for face in faces):
+        return False
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    rows, cols = gray.shape
+    keep = np.ones(gray.shape, bool)
+    for cx, _area, cy, width in faces:  # the tiles' faces (and hair and shoulders) don't count
+        x, y, half = cx / scale, cy / scale, width / scale
+        keep[max(0, int(y - 1.1 * half)):min(rows, int(y + 1.4 * half)), max(0, int(x - half)):min(cols, int(x + half))] = False
+    if keep.mean() < 0.3:
+        return False
+    values = gray.astype(np.float32)
+    mean = cv2.blur(values, (5, 5))
+    spread = np.sqrt(np.maximum(0.0, cv2.blur(values * values, (5, 5)) - mean * mean))
+    flat = float((spread < 1.5)[keep].mean())
+    edges = float((cv2.Canny(gray, 80, 200) > 0)[keep].mean())
+    return flat >= CONTENT_FLAT_MIN and edges >= CONTENT_EDGE_MIN
+
+
+def _content_box(frame: np.ndarray, faces: list[tuple[float, float, float, float]],
+                 scale: float) -> tuple[float, float] | None:
+    """The shared content's centre and width (source pixels) on a call layout: the
+    biggest block that stands out from the call's plain background and holds no face
+    (the webcam tiles do). None when there's no plain background around it (a chart
+    filling the frame) or nothing stands out."""
+    rows, cols = frame.shape[:2]
+    border = np.concatenate([frame[:4].reshape(-1, 3), frame[-4:].reshape(-1, 3),
+                             frame[:, :4].reshape(-1, 3), frame[:, -4:].reshape(-1, 3)]).astype(int)
+    background = np.median(border, axis=0)
+    if float(np.mean(np.abs(border - background).max(axis=1) < 14)) < 0.8:
+        return None  # no plain call background around the content
+    standing = (np.abs(frame.astype(int) - background).max(axis=2) > 18).astype(np.uint8)
+    standing = cv2.morphologyEx(standing, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    count, _labels, stats, _centres = cv2.connectedComponentsWithStats(standing, 8)
+    best: tuple[int, float, float] | None = None
+    for label in range(1, count):
+        x, y, w, h, area = stats[label]
+        if area < 0.02 * rows * cols:
+            continue
+        if any(x <= cx / scale <= x + w and y <= cy / scale <= y + h for cx, _a, cy, _w in faces):
+            continue  # a webcam tile
+        if best is None or area > best[0]:
+            best = (int(area), (x + w / 2) * scale, w * scale)
+    return (best[1], best[2]) if best else None
+
+
 def analyze_crop_plan(
     video_path: str | Path,
     start_time: float,
@@ -1157,6 +1220,9 @@ def analyze_crop_plan(
         ]
 
     samples = [(time, faces_in(frame)) for time, frame in zip(face_times, face_frames)]
+    content = [_content_like(frame, faces, scale, frame_width) for frame, (_t, faces) in zip(face_frames, samples)]
+    boxes = [_content_box(frame, faces, scale) if flag else None
+             for frame, (_t, faces), flag in zip(face_frames, samples, content)]
     cluster_distance = frame_width * FACE_CLUSTER_DISTANCE_RATIO
 
     cuts = _cut_times(cut_frames, frame_times)
@@ -1176,10 +1242,20 @@ def analyze_crop_plan(
         inner_start = max(shot_start, head if index == 0 else 0.0) + SAMPLE_MARGIN
         inner_end = min(shot_end, duration - tail if shot_end >= duration else shot_end) - SAMPLE_MARGIN
         shot_samples = [faces for t, faces in samples if inner_start <= t <= inner_end]
+        shot_content = [flag for (t, _faces), flag in zip(samples, content) if inner_start <= t <= inner_end]
+        embedded = bool(shot_content) and sum(shot_content) >= CONTENT_PRESENCE * len(shot_content)
+        # Content narrow enough for the 9:16 crop (a post, a phone screen, a tall chart) is
+        # framed on, so it's shown big; wider content is shown as the whole frame.
+        content_x: int | None = None
+        if embedded:
+            spans = [box for (t, _faces), box in zip(samples, boxes) if inner_start <= t <= inner_end and box]
+            if spans and len(spans) >= 0.5 * len(shot_content) and max(w for _c, w in spans) <= crop_width * CONTENT_CROP_FIT:
+                middle = statistics.median(c for c, _w in spans)
+                content_x = int(max(0, min(frame_width - crop_width, middle - crop_width / 2))) // 2 * 2
         if not shot_samples:  # a short shot: look at its middle frame
             middle = _frame_at(source, start_time + (inner_start + inner_end) / 2, (FACE_FRAME_WIDTH, face_height))
             shot_samples = [faces_in(middle)] if middle is not None else []
-        detections = [face for faces in shot_samples for face in faces]
+        detections = [] if embedded else [face for faces in shot_samples for face in faces]
         x: int | None = None
         has_face = False
         group = False
@@ -1212,12 +1288,14 @@ def analyze_crop_plan(
                 if inner_start <= t <= inner_end and faces
             ]
             moves = _reframes(track, x, crop_width, frame_width, start_time)
-        raw_shots.append((shot_start, shot_end, x if has_face else None, group, speakers, moves))
+        if content_x is not None:
+            x, has_face, group, speakers, moves = content_x, True, False, None, ()
+        raw_shots.append((shot_start, shot_end, x if has_face else None, group, speakers, moves, content_x is not None))
 
     # Shots without a face reuse the nearest face shot's position (or the center).
     shots: list[Shot] = []
-    known = [(s, x) for s, _e, x, _g, _p, _m in raw_shots if x is not None]
-    for shot_start, shot_end, x, group, speakers, moves in raw_shots:
+    known = [(s, x) for s, _e, x, _g, _p, _m, _c in raw_shots if x is not None]
+    for shot_start, shot_end, x, group, speakers, moves, framed in raw_shots:
         has_face = x is not None
         if x is None:
             x = min(known, key=lambda item: abs(item[0] - shot_start))[1] if known else center_x
@@ -1230,6 +1308,7 @@ def analyze_crop_plan(
                 group=group,
                 speakers=speakers,
                 moves=moves if has_face else (),
+                content=framed,
             )
         )
     return CropPlan(

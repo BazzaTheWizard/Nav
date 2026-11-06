@@ -190,6 +190,34 @@ def replace_clip_in_drive(folder_link: str, file_name: str, new_clip: str | Path
 _FOLDER_COUNT = re.compile(r"\b\d+ sample Shorts?\b")
 
 
+def remove_named_clip_in_drive(folder_link: str, file_name: str, count: int) -> bool:
+    """Take one clip (by its file name, as Make clips uploads them) out of a Drive folder:
+    the file goes to the Drive trash and the folder name says one Short fewer. ``count``:
+    how many clips the folder had. False if the file wasn't there (already removed)."""
+    match = _FOLDER_ID.search(folder_link or "")
+    if match is None:
+        raise ValueError(f"Not a Google Drive folder link: {folder_link!r}")
+    folder_id = match.group(1)
+    drive = build("drive", "v3", credentials=_get_user_credentials(), cache_discovery=False)
+    safe = file_name.replace("\\", "\\\\").replace("'", "\\'")
+    listing = (
+        drive.files()
+        .list(q=f"'{folder_id}' in parents and name = '{safe}' and trashed = false", fields="files(id,name)", pageSize=5)
+        .execute(num_retries=UPLOAD_RETRIES)
+        .get("files", [])
+    )
+    for item in listing:
+        drive.files().update(fileId=item["id"], body={"trashed": True}).execute(num_retries=UPLOAD_RETRIES)
+    if not listing:
+        return False
+    folder = drive.files().get(fileId=folder_id, fields="name").execute(num_retries=UPLOAD_RETRIES)
+    name = str(folder.get("name") or "")
+    renamed = _FOLDER_COUNT.sub(f"{count - 1} sample Short{'' if count - 1 == 1 else 's'}", name, count=1)
+    if renamed != name:
+        drive.files().update(fileId=folder_id, body={"name": renamed}).execute(num_retries=UPLOAD_RETRIES)
+    return True
+
+
 def remove_clip_in_drive(folder_link: str, index: int, count: int) -> None:
     """Take clip ``index`` (from 1) out of a pitch's Drive folder: its file goes to the
     Drive trash, later clips move up one number (clip_03.mp4 -> clip_02.mp4), and the

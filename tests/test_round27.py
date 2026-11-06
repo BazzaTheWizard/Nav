@@ -66,8 +66,8 @@ check("Signed values for waterfalls (+$3.2M, −$0.4M)",
       K.signed_value("+$3.2M") == 3.2 and K.signed_value("−$0.4M") == -0.4)
 check("Sentences split on . ? !", SPANS[0][2] == "Where's all this money going to come from?" and len(SPANS) == 6,
       str(len(SPANS)))
-check("The library: 14 graphics, 3 over the speaker and 11 charts (Round 29 added the fall-and-recovery curve)",
-      len(TEMPLATES) == 14 and sum(MODES[t] == "overlay" for t in TEMPLATES) == 3)
+check("The library: 15 graphics, 4 over the speaker and 11 charts (Round 29 added the fall-and-recovery curve, "
+      "Round 30 the micro-stat)", len(TEMPLATES) == 15 and sum(MODES[t] == "overlay" for t in TEMPLATES) == 4)
 
 # ---------- the checks: a breakdown chart (the S&P moment) ----------
 card_start, card_end = SPANS[2][0], SPANS[4][1] + 0.15
@@ -244,11 +244,14 @@ res = K.check_card(candle, WORDS, CLIP_START, CLIP_END)
 ok["candlestick_ema"] = candle
 check("Price chart with a file and a source passes (flagged as drawn from the file)", res.ok and res.warnings, str(res.errors))
 ok["metric_bars"] = good
-check("Every graphic has a passing example", set(ok) == set(TEMPLATES), str(set(TEMPLATES) - set(ok)))
+check("Every graphic has a passing example (the micro-stat's is in test_round30)",
+      set(ok) == set(TEMPLATES) - {"stat_pill"}, str(set(TEMPLATES) - set(ok)))
 
 # ---------- restraint: clip-wide caps and gaps ----------
-results = K.check_edit(ClipEdit(CLIP_START, CLIP_END, cards=[sp_card(), sp_card(start=card_start + 1)]), WORDS)
-check("At most 1 chart per clip", any("At most 1 chart" in e for e in results[1].errors), str(results[1].errors))
+results = K.check_edit(ClipEdit(CLIP_START, CLIP_END, cards=[sp_card(), sp_card(start=card_start + 1),
+                                                              sp_card(start=card_start + 2)]), WORDS)
+check("At most 2 charts per clip (Round 30: was 1)", any("At most 2 chart" in e for e in results[2].errors),
+      str(results[2].errors))
 check("Graphics need room between them", any("after the graphic before it" in e for e in results[1].errors))
 results = K.check_edit(ClipEdit(CLIP_START, CLIP_END, cards=[name, Card("speaker_title", 110.0, 113.3,
                                                                          rows=[CardRow("Sam")])]), WORDS)

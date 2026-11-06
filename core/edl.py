@@ -18,13 +18,14 @@ from typing import Any
 #   overlay: the speaker stays full-screen; type, wireframe boxes or a name card over the frame.
 #   split:   real multi-point data only; speaker on top, an animated chart below.
 TEMPLATES = (
-    "kinetic_range", "buckets", "speaker_title",
+    "kinetic_range", "buckets", "stat_pill", "speaker_title",
     "timeline", "metric_bars", "ranked_bars", "diverging_bar", "share_split", "trend_line",
     "arr_bridge", "sankey_flow", "cac_payback", "drawdown_curve", "candlestick_ema",
 )
 TEMPLATE_LABELS = {
     "kinetic_range": "A · Number or range over the speaker",
     "buckets": "B · 2–3 boxes over the speaker (concepts, steps, expected vs actual)",
+    "stat_pill": "A · Micro-stat in the corner (one number, or a short trend of 2–4)",
     "speaker_title": "Name card (guest's name and role)",
     "timeline": "C · Timeline (2–4 points in time)",
     "metric_bars": "C · Breakdown bars (2–4 numbers, one unit)",
@@ -38,7 +39,8 @@ TEMPLATE_LABELS = {
     "drawdown_curve": "C · Fall and recovery (a crash, a dip and the rebound)",
     "candlestick_ema": "C · Price chart (from a price file you upload, with its source)",
 }
-MODES = {name: ("overlay" if name in {"kinetic_range", "buckets", "speaker_title"} else "split") for name in TEMPLATES}
+MODES = {name: ("overlay" if name in {"kinetic_range", "buckets", "stat_pill", "speaker_title"} else "split")
+         for name in TEMPLATES}
 
 
 @dataclass
@@ -76,6 +78,12 @@ class Card:
     # left or right; x is the left edge for left, the right edge for right). Empty: the
     # standard lower-middle spot.
     place: str = ""
+    # Charts only (Round 30): a second, smaller layer under the chart that says what the
+    # numbers mean, built only from what was said: {"kind": "ratio" | "share", "of": [1, 2],
+    # "text": ...} (computed from two of the chart's own items) or {"kind": "earlier",
+    # "value": ..., "text": ..., "said": the sentence, "at": seconds} (a number the speaker
+    # said elsewhere in the same video). "value" is filled in by the checks. Empty: none.
+    context: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.template not in TEMPLATES:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from dataclasses import replace
 import tempfile
 import subprocess
 import uuid
@@ -30,7 +31,7 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
-from core.cards import CANVAS, EXIT, FPS, NAME_CARD_SIZE, SPLIT_TOP, Frames, parse_place
+from core.cards import CANVAS, EXIT, FPS, NAME_CARD_SIZE, SPLIT_TOP, STAT_PILL_SIZE, STAT_PILL_TOP, Frames, parse_place
 from core.edl import MODES, ClipEdit
 from core.subtitle_engine import CAPTION_MARGIN_V
 from core.video_renderer import _video_encoder_args
@@ -63,20 +64,77 @@ SEAM_CAPTIONS = (FRAME_H // 2 - 70, FRAME_H // 2 + 70)
 CAPTION_CLEARANCE = 24
 
 
+def _box_rows(card: Any) -> tuple[float, float, float] | None:
+    """(top, bottom, scale) of a name card or micro-stat (output rows); None for others."""
+    if card.template == "speaker_title":
+        _x, top, scale, _align = parse_place(card.place)
+        return top, top + NAME_CARD_SIZE[1] * scale, scale
+    if card.template == "stat_pill":
+        top = parse_place(card.place)[1] if card.place else STAT_PILL_TOP
+        return top, top + STAT_PILL_SIZE[1], 1.0
+    return None
+
+
 def keeps_bold_captions(card: Any, edit: ClipEdit, seams: list[tuple[float, float]] | None = None) -> bool:
-    """A name card placed clear of the bold captions (above the head on a close-up, or in
-    the guest's own panel) leaves them as they are: the hook's captions don't switch to the
-    small ones and back for it. A data graphic, or a name card in the standard lower spot,
-    still gets the small captions."""
-    if card.template != "speaker_title" or not card.place:
+    """A name card or micro-stat placed clear of the bold captions (above the head on a
+    close-up, in a corner, or in the guest's own panel) leaves them as they are: the
+    captions don't switch to the small ones and back for it. A data graphic, or a name
+    card in the standard lower spot, still gets the small captions."""
+    box = _box_rows(card)
+    if box is None or (card.template == "speaker_title" and not card.place):
         return False
-    _x, top, scale, _align = parse_place(card.place)
-    bottom = top + NAME_CARD_SIZE[1] * scale
+    top, bottom, _scale = box
     a, b = card.start - edit.start, card.end - edit.start
     spans = seams or []
     bands = ([SEAM_CAPTIONS] if any(s < b and a < e for s, e in spans) else []) \
         + ([] if any(s <= a and b <= e for s, e in spans) else [BOLD_CAPTIONS])
     return all(bottom + CAPTION_CLEARANCE <= low or top >= high + CAPTION_CLEARANCE for low, high in bands)
+
+
+CALM_CAPTIONS = (CAPTION_BOTTOM - 70, CAPTION_BOTTOM + 12)  # one small line, box included
+NAME_CARD_TOP_LIMIT, NAME_CARD_BOTTOM_LIMIT = 130, 1700  # the app's own bars cover the rest
+
+
+def _caption_bands(card: Any, edit: ClipEdit, seams: list[tuple[float, float]] | None) -> list[tuple[float, float]]:
+    """Where captions are drawn (output rows) while ``card`` is up."""
+    a, b = card.start - edit.start, card.end - edit.start
+    spans = seams or []
+    in_split = any(s < b and a < e for s, e in spans)
+    on_full = not any(s <= a and b <= e for s, e in spans)
+    if keeps_bold_captions(card, edit, seams):
+        return ([SEAM_CAPTIONS] if in_split else []) + ([BOLD_CAPTIONS] if on_full else [])
+    return ([SEAM_CAPTIONS] if in_split else []) + ([CALM_CAPTIONS] if on_full else [])
+
+
+def clear_of_captions(card: Any, edit: ClipEdit, seams: list[tuple[float, float]] | None = None) -> str:
+    """A name card's (or micro-stat's) place, checked against the captions actually drawn
+    while it's up, and moved clear of them if it would touch them: just above (or below)
+    them, a little smaller if it has to be (Round 30). The placer already avoids them;
+    this is the last check before drawing, so a card and a caption never overlap."""
+    box = _box_rows(card)
+    if box is None:
+        return card.place
+    x, top, scale, align = parse_place(card.place) if card.place or card.template == "speaker_title" \
+        else (56.0, float(STAT_PILL_TOP), 1.0, "left")
+    tall_at_one = (box[1] - box[0]) / box[2]
+    resizable = card.template == "speaker_title"
+
+    def touches(y: float, size: float) -> bool:
+        trial = replace(card, place=f"{x:.0f},{y:.0f},{size:.2f},{align}")
+        bottom = y + tall_at_one * size
+        return any(not (bottom + CAPTION_CLEARANCE <= low or y >= high + CAPTION_CLEARANCE)
+                   for low, high in _caption_bands(trial, edit, seams))
+
+    if not touches(top, scale):
+        return card.place
+    for size in ((scale, round(max(0.6, scale * 0.85), 2)) if resizable else (scale,)):
+        tall = tall_at_one * size
+        bands = sorted(_caption_bands(card, edit, seams))
+        spots = [low - CAPTION_CLEARANCE - tall for low, _high in bands] + [high + CAPTION_CLEARANCE for _low, high in bands]
+        for y in sorted(spots, key=lambda spot: abs(spot - top)):  # the nearest clear spot
+            if NAME_CARD_TOP_LIMIT <= y <= NAME_CARD_BOTTOM_LIMIT - tall and not touches(y, size):
+                return f"{x:.0f},{y:.0f},{size:.2f},{align}"
+    return card.place
 
 
 def words_outside(words: list[Any], edit: ClipEdit) -> list[Any]:
@@ -105,12 +163,24 @@ def _sentence_case(texts: list[str]) -> list[str]:
     return out
 
 
+def landed(card: Any, edit: ClipEdit, rate: Fraction | float = 30) -> tuple[float, float]:
+    """When a split chart's panel has landed and when it starts to leave (source seconds):
+    the steady part between the moves, on the same frames compose_cards uses."""
+    rate = Fraction(rate).limit_denominator(1001)
+    count = max(2, round(MOVE * float(rate)))
+    first_in = int(np.ceil((card.start - edit.start) * rate - 1e-6))
+    last_out = int(np.ceil((card.end - edit.start) * rate - 1e-6))
+    first_out = max(first_in + count, last_out - count)
+    return edit.start + float((first_in + count) / rate), edit.start + float(first_out / rate)
+
+
 def calm_captions(words: list[Any], edit: ClipEdit, path: Path,
-                  seams: list[tuple[float, float]] | None = None) -> Path:
+                  seams: list[tuple[float, float]] | None = None, rate: Fraction | float = 30) -> Path:
     """Small sentence-case captions on a soft dark box, for the time graphics are up.
     ``seams``: the clip's two-person split spans (clip seconds). There, over the speakers
     (not under a chart), the line sits on the seam between the panels like the usual
-    captions, never on a face."""
+    captions, never on a face. Under a split chart they show only while the panel is in
+    place (not while it slides past them: Round 30)."""
     events: list[tuple[float, float, str]] = []
     on_seam: set[int] = set()
     for card in edit.cards:
@@ -136,9 +206,17 @@ def calm_captions(words: list[Any], edit: ClipEdit, path: Path,
             start, end, text = events[k]
             if events[k + 1][0] - end < 0.6:
                 events[k] = (start, events[k + 1][0], text)
-        if events:
+        if len(events) > first_event:
             start, end, text = events[-1]
             events[-1] = (start, min(card.end, end + 0.4), text)
+        if MODES[card.template] == "split":
+            settled, leaving = landed(card, edit, rate)
+            kept = []
+            for start, end, text in events[first_event:]:
+                start, end = max(start, settled), min(end, leaving)
+                if end - start >= 0.25:
+                    kept.append((start, end, text))
+            events[first_event:] = kept
         if MODES[card.template] == "overlay":
             for k in range(first_event, len(events)):
                 middle = (events[k][0] + events[k][1]) / 2 - edit.start
@@ -185,16 +263,25 @@ def _frame_rate(path: Path) -> Fraction:
         return Fraction(30)
 
 
-def _decode(path: Path, start: float, count: int) -> list[np.ndarray]:
-    """``count`` frames (RGB, full size) from ``start`` seconds."""
-    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
-                            "-of", "csv=p=0", str(path)], capture_output=True, text=True).stdout.strip().split(",")
-    width, height = int(probe[0]), int(probe[1])
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, start):.4f}", "-i", str(path), "-frames:v",
-                          str(count), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
-    size = width * height * 3
-    frames = [np.frombuffer(raw[k * size:(k + 1) * size], np.uint8).reshape(height, width, 3)
-              for k in range(len(raw) // size)]
+def _decode(path: Path, start: float, count: int, rate: Fraction | None = None, chain: str = "",
+            size: tuple[int, int] | None = None) -> list[np.ndarray]:
+    """``count`` frames (RGB) from ``start`` seconds. ``rate``: sample the picture at the
+    clip's frame rate (as the steady split view does), so a 30 fps camera in a 24 fps clip
+    moves at its real speed during the move. ``chain``: FFmpeg filters to apply first,
+    whose output is ``size`` (w, h)."""
+    if size is None:
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                "stream=width,height", "-of", "csv=p=0", str(path)],
+                               capture_output=True, text=True).stdout.strip().split(",")
+        size = (int(probe[0]), int(probe[1]))
+    width, height = size
+    filters = ",".join(part for part in ((f"fps={rate}" if rate else ""), chain) if part)
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, start):.4f}", "-i", str(path),
+                          *(["-vf", filters] if filters else []), "-frames:v", str(count),
+                          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
+    frame_bytes = width * height * 3
+    frames = [np.frombuffer(raw[k * frame_bytes:(k + 1) * frame_bytes], np.uint8).reshape(height, width, 3)
+              for k in range(len(raw) // frame_bytes)]
     while frames and len(frames) < count:
         frames.append(frames[-1])
     return frames
@@ -206,11 +293,77 @@ def _ease(p: float) -> float:
     return 4 * p ** 3 if p < 0.5 else 1 - (-2 * p + 2) ** 3 / 2
 
 
+def strip_crop_top(scaled_height: int) -> int:
+    """The first row (of the picture scaled to 1080 wide) the top band shows, exactly as
+    FFmpeg's crop places it: rounded, then down to an even row (4:2:0 video). Measured:
+    52 for a 16:9 source, 122 for 4:3. The move lands on this row, so it can't jump 1-2 px
+    when the steady view takes over."""
+    return max(0, int(np.rint((scaled_height - SPLIT_TOP) * 0.35)) & ~1)
+
+
 def strip_rect(width: int, height: int) -> tuple[float, float, float, float]:
     """The source rectangle the top band shows (the camera's whole width; see compose_cards)."""
     scaled = round(FRAME_W * height / width / 2) * 2
-    top = max(0.0, (scaled - SPLIT_TOP) * 0.35)
+    top = strip_crop_top(scaled)
     return 0.0, top * width / FRAME_W, float(width), SPLIT_TOP * width / FRAME_W
+
+
+# The blurred-background layouts (see video_renderer): the whole camera picture, 1080 wide,
+# centred over a blurred copy of itself.
+BAND_LAYOUTS = frozenset({"blurred_background", "wide_blurred_background"})
+BLURRED_BACKDROP = ("scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
+                    "boxblur=5:2,eq=brightness=-0.15,scale=1080:1920")
+
+
+def picture_band(layout: str, width: int, height: int) -> tuple[float, float, float, float] | None:
+    """Where a blurred-background clip shows the whole camera picture (output x, y, w, h);
+    None for other layouts, or a non-widescreen source in the wide layout (its picture
+    carries black bars)."""
+    if layout not in BAND_LAYOUTS or width <= 0 or height <= 0:
+        return None
+    tall = round(FRAME_W * height / width / 2) * 2
+    if layout == "wide_blurred_background" and abs(tall - 608) > 2:
+        return None
+    top = int((FRAME_H - tall) / 2) // 2 * 2  # FFmpeg's overlay keeps an even row for 4:2:0
+    return 0.0, float(top), float(FRAME_W), float(tall)
+
+
+def _band_frame(picture: np.ndarray, backdrop: np.ndarray, chart: np.ndarray | None, eased: float,
+                band: tuple[float, float, float, float]) -> np.ndarray:
+    """One frame of the move for a blurred-background clip: the camera picture (1080 wide)
+    glides up from its place in the middle to the top band, trimming to the band's shape,
+    over the clip's own blurred background, while the panel slides up from the bottom.
+    The panel never touches the picture until both land."""
+    pic_h = picture.shape[0]
+    _x, band_top, _w, band_h = band
+    strip_top = float(strip_crop_top(pic_h))  # the steady view's crop of the picture
+    top = band_top * (1 - eased)
+    shown = band_h + (SPLIT_TOP - band_h) * eased
+    crop_top = strip_top * eased  # rows of the picture cut above, rising from 0 to the band's
+    out = backdrop.copy()
+    first, last = int(np.floor(top)), min(FRAME_H, int(np.ceil(top + shown)))
+    if last > first:
+        matrix = np.float32([[1, 0, 0], [0, 1, top - crop_top - first]])
+        rows = cv2.warpAffine(picture, matrix, (FRAME_W, last - first), flags=cv2.INTER_LANCZOS4,
+                              borderMode=cv2.BORDER_REPLICATE)
+        out[first:last] = rows
+    return _panel(out, chart, FRAME_H + (SPLIT_TOP - FRAME_H) * eased)
+
+
+def _panel(out: np.ndarray, chart: np.ndarray | None, band: float) -> np.ndarray:
+    """The dark panel from row ``band`` down (a soft sub-pixel top edge), its chart on it."""
+    canvas = np.array([int(CANVAS[k:k + 2], 16) for k in (1, 3, 5)], np.uint8)
+    edge = int(np.floor(band))
+    if edge < FRAME_H:
+        out[edge + 1:] = canvas
+        cover = 1.0 - (band - edge)
+        out[edge] = (out[edge] * (1 - cover) + canvas * cover).astype(np.uint8)
+    if chart is not None and band < FRAME_H:
+        shifted = cv2.warpAffine(chart, np.float32([[1, 0, 0], [0, 1, band]]), (FRAME_W, FRAME_H),
+                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+        alpha = shifted[:, :, 3:4].astype(np.float32) / 255
+        out[:] = (out * (1 - alpha) + shifted[:, :, :3] * alpha).astype(np.uint8)
+    return out
 
 
 def _move_frame(source: np.ndarray, base: np.ndarray, chart: np.ndarray | None, eased: float,
@@ -240,41 +393,54 @@ def _move_frame(source: np.ndarray, base: np.ndarray, chart: np.ndarray | None, 
         out[:rows] = cv2.warpAffine(source, matrix, (FRAME_W, rows), flags=cv2.INTER_LANCZOS4,
                                     borderMode=cv2.BORDER_REPLICATE)
         out[rows:] = 0
-    canvas = np.array([int(CANVAS[k:k + 2], 16) for k in (1, 3, 5)], np.uint8)
-    edge = int(np.floor(band))
-    if edge < FRAME_H:
-        out[edge + 1:] = canvas
-        cover = 1.0 - (band - edge)  # the edge row: partly covered (a soft, sub-pixel edge)
-        out[edge] = (out[edge] * (1 - cover) + canvas * cover).astype(np.uint8)
-    if chart is not None and band < FRAME_H:
-        shifted = cv2.warpAffine(chart, np.float32([[1, 0, 0], [0, 1, band]]), (FRAME_W, FRAME_H),
-                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
-        alpha = shifted[:, :, 3:4].astype(np.float32) / 255
-        out[:] = (out * (1 - alpha) + shifted[:, :, :3] * alpha).astype(np.uint8)
-    return out
+    return _panel(out, chart, band)
+
+
+def _size(path: Path) -> tuple[int, int]:
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                            "-of", "csv=p=0", str(path)], capture_output=True, text=True).stdout.strip().split(",")
+    try:
+        return int(probe[0]), int(probe[1])
+    except (ValueError, IndexError):
+        return 0, 0
 
 
 def split_moves(source_video: Path, base_clip: Path, edit_start: float, a: float, b: float, chart: Frames,
                 crop_at: Callable[[float], tuple[float, float, float, float] | None] | None, folder: Path,
-                rate: Fraction) -> list[tuple[int, int, str]]:
+                rate: Fraction, layout: str = "") -> list[tuple[int, int, str]]:
     """The frames of the move into (from ``a``) and out of (until ``b``) one split chart,
     as PNG sequences: [(first clip frame, frame count, pattern)]. Clip frames are
-    n / ``rate``; the move takes MOVE seconds each way."""
+    n / ``rate``; the move takes MOVE seconds each way.
+
+    Three kinds of move, by what the clip shows full screen: a plain crop of the camera
+    (``crop_at``: the picture zooms out into the top band); the blurred-background layout
+    (``layout``: the whole picture glides up from the middle into the band); anything else
+    (the panel slides up over the clip)."""
     folder.mkdir(parents=True, exist_ok=True)
     count = max(2, round(MOVE * float(rate)))
     first_in = int(np.ceil(a * rate - 1e-6))
     last_out = int(np.ceil(b * rate - 1e-6))  # the first full-screen frame after the chart
     first_out = max(first_in + count, last_out - count)
+    width, height = _size(source_video)
+    band = picture_band(layout, width, height)
     made = []
     for name, start_frame, rising in (("in", first_in, True), ("out", first_out, False)):
         times = [float((start_frame + j) / rate) for j in range(count)]
-        sources = _decode(source_video, edit_start + times[0], count)
-        bases = _decode(base_clip, times[0], count)
-        if not sources or not bases:
-            return []
         rect = crop_at(times[0] if rising else times[-1]) if crop_at else None
+        mode = "crop" if rect is not None else ("band" if band is not None else "over")
+        if mode == "band":
+            tall = int(band[3])
+            sources = _decode(source_video, edit_start + times[0], count, rate, "scale=1080:-2:flags=lanczos", (FRAME_W, tall))
+            bases = _decode(source_video, edit_start + times[0], count, rate, BLURRED_BACKDROP, (FRAME_W, FRAME_H))
+        else:
+            sources = _decode(source_video, edit_start + times[0], count, rate) if mode == "crop" else []
+            bases = _decode(base_clip, times[0], count)
+        if not bases or (mode != "over" and not sources):
+            return []
         for j, t in enumerate(times):
-            progress = (j + 1) / (count + 1)
+            # In: the last frame lands exactly on the chart view's own picture (eased 1). Out:
+            # the last frame is exactly the clip's own picture (eased 0). No snap either way.
+            progress = (j + 1) / count
             eased = _ease(progress if rising else 1 - progress)
             index = min(chart.count - 1, max(0, int(round((t - a) * FPS))))
             page = cv2.imread(chart.pattern % index, cv2.IMREAD_UNCHANGED)
@@ -282,7 +448,10 @@ def split_moves(source_video: Path, base_clip: Path, edit_start: float, a: float
             if page is not None:
                 page_rgba = np.zeros((FRAME_H, FRAME_W, 4), np.uint8)
                 page_rgba[:page.shape[0], :, :] = cv2.cvtColor(page, cv2.COLOR_BGRA2RGBA)[:FRAME_H]
-            frame = _move_frame(sources[j], bases[j], page_rgba, eased, rect)
+            if mode == "band":
+                frame = _band_frame(sources[j], bases[j], page_rgba, eased, band)
+            else:
+                frame = _move_frame(sources[j] if sources else bases[j], bases[j], page_rgba, eased, rect)
             cv2.imwrite(str(folder / f"{name}_{j:03d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         made.append((start_frame, count, str(folder / f"{name}_%03d.png")))
     return made
@@ -297,9 +466,11 @@ def compose_cards(
     output: Path,
     seams: list[tuple[float, float]] | None = None,
     crop_at: Callable[[float], tuple[float, float, float, float] | None] | None = None,
+    layout: str = "",
 ) -> Path:
     """Lay ``edit``'s rendered graphics over ``base_clip`` (edit.start-edit.end, ideally
-    rendered without captions while graphics are up: words_outside())."""
+    rendered without captions while graphics are up: words_outside()). ``layout``: the
+    clip's layout (the blurred-background ones get their own move into a chart)."""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("FFmpeg was not found. Install it with `brew install ffmpeg`.")
@@ -312,9 +483,8 @@ def compose_cards(
     duration = edit.end - edit.start
     windows = windows_of(edit)
     splits = [k for k, card in enumerate(edit.cards) if MODES[card.template] == "split"]
-    ass = calm_captions(words, edit, work / f"calm_{uuid.uuid4().hex}.ass", seams)
-
     rate = _frame_rate(base_clip)
+    ass = calm_captions(words, edit, work / f"calm_{uuid.uuid4().hex}.ass", seams, rate)
     inputs = ["-i", str(base_clip)]
     graph = ["[0:v]format=yuv420p[v0]"]  # the clip's own frame rate: no repeated or dropped frames
     next_input = 1
@@ -323,7 +493,7 @@ def compose_cards(
         labels = "".join(f"[sp{k}]" for k in splits)
         # The speaker's strip: a 2.35:1 band of the frame, a little above centre so heads
         # (which sit high in an interview frame) aren't cut.
-        graph.append(f"[1:v]scale={FRAME_W}:{SPLIT_TOP}:force_original_aspect_ratio=increase:flags=lanczos,"
+        graph.append(f"[1:v]fps={rate},scale={FRAME_W}:{SPLIT_TOP}:force_original_aspect_ratio=increase:flags=lanczos,"
                      f"crop={FRAME_W}:{SPLIT_TOP}:0:'(ih-oh)*0.35',setsar=1,split={len(splits)}{labels}")
         next_input = 2
     current, n = "v0", 0
@@ -361,21 +531,34 @@ def compose_cards(
             graph.append(f"color=c={_hex(CANVAS)}:s={FRAME_W}x{FRAME_H}:r={rate}:d={duration:.3f}[cv{k}]")
             graph.append(f"[cv{k}][sp{k}]overlay=0:0[sb{k}]")
             graph.append(f"[sb{k}][{graphic}]overlay=0:{SPLIT_TOP}:eof_action=repeat[split{k}]")
-            # The move in and out (drawn frames, see split_moves); the steady split view
-            # between them. Frame n of the clip is at n / rate; each part owns whole frames.
-            moves = split_moves(source_video, base_clip, edit.start, a, b, seq, crop_at, work / f"move{k}", rate)
+            # The move in, the steady split view and the move out, joined into one stream
+            # (frame-exact: the parts follow each other inside it), laid over the clip once.
+            # Before, each part was its own overlay; at 24 fps one FFmpeg build showed one
+            # frame of the plain clip between the move in and the chart.
+            moves = split_moves(source_video, base_clip, edit.start, a, b, seq, crop_at, work / f"move{k}", rate, layout)
             if len(moves) == 2:
-                steady = (moves[0][0] + moves[0][1], moves[1][0])
-                on = f"between(t\\,{(steady[0] - 0.5) / rate:.4f}\\,{(steady[1] - 0.5) / rate:.4f})"
-            graph.append(f"[{current}][split{k}]overlay=0:0:enable='{on}'[v{n + 1}]")
+                (first_in, count_in, in_pattern), (first_out, count_out, out_pattern) = moves
+                tick = f"{rate.denominator}/{rate.numerator}"
+                parts = []
+                for label, pattern in (("pi", in_pattern), ("po", out_pattern)):
+                    inputs += ["-framerate", str(rate), "-i", pattern]
+                    graph.append(f"[{next_input}:v]format=yuv420p,setsar=1,settb={tick},setpts=N[{label}{k}]")
+                    parts.append(f"[{label}{k}]")
+                    next_input += 1
+                steady_from, steady_to = first_in + count_in, first_out
+                if steady_to > steady_from:
+                    graph.append(f"[split{k}]trim=start_frame={steady_from}:end_frame={steady_to},"
+                                 f"format=yuv420p,setsar=1,settb={tick},setpts=N[ps{k}]")
+                    parts.insert(1, f"[ps{k}]")
+                else:
+                    graph.append(f"[split{k}]nullsink")
+                end_frame = first_out + count_out
+                graph.append(f"{''.join(parts)}concat=n={len(parts)}:v=1:a=0,settb={tick},setpts=N+{first_in}[span{k}]")
+                window = f"between(t\\,{(first_in - 0.5) / rate:.4f}\\,{(end_frame - 0.5) / rate:.4f})"
+                graph.append(f"[{current}][span{k}]overlay=0:0:eof_action=pass:enable='{window}'[v{n + 1}]")
+            else:
+                graph.append(f"[{current}][split{k}]overlay=0:0:enable='{on}'[v{n + 1}]")
             current, n = f"v{n + 1}", n + 1
-            for first, count, pattern in moves:
-                inputs += ["-framerate", str(rate), "-i", pattern]
-                graph.append(f"[{next_input}:v]setpts=PTS-STARTPTS+{float(first / rate):.4f}/TB[mv{n}]")
-                window = f"between(t\\,{(first - 0.5) / rate:.4f}\\,{(first + count - 0.5) / rate:.4f})"
-                graph.append(f"[{current}][mv{n}]overlay=0:0:eof_action=pass:enable='{window}'[v{n + 1}]")
-                next_input += 1
-                current, n = f"v{n + 1}", n + 1
     graph.append(f"[{current}]ass='{ass.name}':fontsdir='{FONTS}'[out]")
     command = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error", *inputs,
@@ -402,6 +585,7 @@ def render_with_cards(
     hook_seconds: float = 3.0,
     seams: list[tuple[float, float]] | None = None,
     crop_at: Callable[[float], tuple[float, float, float, float] | None] | None = None,
+    layout: str = "",
 ) -> tuple[Path | None, list[Any]]:
     """Check every card, render the ones that pass, have ``render_base(words)`` render
     the clip with those words' captions (none during graphics), and compose.
@@ -418,6 +602,9 @@ def render_with_cards(
     for card, check in zip(edit.cards, checks):
         if not check.ok:
             continue
+        place = clear_of_captions(card, edit, seams)
+        if place != card.place:
+            card = replace(card, place=place)
         try:
             frames.append(render_card(card, edit.brand, Path(work_dir) / "cards"))
         except CardRenderError as exc:
@@ -432,4 +619,4 @@ def render_with_cards(
                      cards=[card for card in passed if not keeps_bold_captions(card, edit, seams)])
     base = render_base(words_outside(words, quiet))
     calm = [w for w in words if any(_during(w, card) for card in quiet.cards)]
-    return compose_cards(Path(base), source_video, keep, frames, calm, output, seams, crop_at), checks
+    return compose_cards(Path(base), source_video, keep, frames, calm, output, seams, crop_at, layout), checks

@@ -238,6 +238,18 @@ def record_manual_page(name: str, url: str, channel_title: str, video_title: str
     return entry
 
 
+def update_manual_page(name: str, **fields: Any) -> None:
+    """Change a saved Make-clips page's record (e.g. its clip count after a removal)."""
+    pages = manual_pages()
+    for page in pages:
+        if page.get("page_name") == name:
+            page.update(fields)
+    MANUAL_PAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = MANUAL_PAGES_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(pages, indent=2), encoding="utf-8")
+    temporary.replace(MANUAL_PAGES_PATH)
+
+
 def replace_clip(
     name: str,
     file_name: str,
