@@ -245,8 +245,10 @@ ctx_card = Card("metric_bars", 100.0, 110.0, headline="Overnight sell-off",
 K.check_card(ctx_card, talk, 96.0, 120.0, 3.0)
 drawn = render_card(ctx_card, BrandKit(), tmp / "cards")
 last = cv2.imread(drawn.pattern % (drawn.count - 30), cv2.IMREAD_UNCHANGED)
-lower = last[560:900, :, 3]
-check("The context layer is drawn under the chart", float((lower > 0).mean()) > 0.01)
+from core import cards as C31  # noqa: E402
+footer = last[C31.CARD_Y + C31.CARD_H - C31.FOOTER_H + 2:C31.CARD_Y + C31.CARD_H - 2, C31.CARD_X + 20:C31.CARD_X + C31.CARD_W - 20]
+lit = (footer[:, :, :3].max(axis=2) > 150) & (footer[:, :, 3] > 200)
+check("The context layer is drawn in the card's footer (Round 31: the 'In context' strip)", int(lit.sum()) > 400, str(int(lit.sum())))
 pill_frames = render_card(pill, BrandKit(), tmp / "cards")
 check("The micro-stat is drawn small, on frosted glass, top left", pill_frames.blur and pill_frames.blur[0][1] < 400
       and pill_frames.blur[0][2] < 640, str(pill_frames.blur))

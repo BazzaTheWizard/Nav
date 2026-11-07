@@ -41,7 +41,7 @@ FONTS = Path(__file__).resolve().parents[1] / "assets" / "fonts"
 MOVE = 0.4  # seconds (10 frames at 25 fps, 12 at 30): the move into and out of the split view
 CAPTION_BOTTOM = 1440  # calm captions sit with their bottom here (above where apps cover the screen)
 CAPTION_CHARS = 30
-BLUR = "boxblur=18:2"
+BLUR = "boxblur=15:2"  # behind glass pills: two 31-px box passes, a Gaussian of about 12.6 px (CSS blur(12px), Round 31)
 
 
 def _hex(color: str) -> str:

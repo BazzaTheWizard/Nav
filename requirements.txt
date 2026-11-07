@@ -18,3 +18,4 @@ pillow
 requests
 certifi
 boto3  # clip pages (Cloudflare R2)
+playwright  # graphics: renders each chart frame by frame (then: .venv/bin/playwright install chromium)

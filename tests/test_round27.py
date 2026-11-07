@@ -288,8 +288,19 @@ check("Over-the-speaker graphics are full frame; charts are the lower 76% (Round
       all(sizes[t] == ((1080, 1920, 0) if MODES[t] == "overlay" else (1080, 1460, 460)) for t in sizes), str(sizes))
 frames = drawn["metric_bars"]
 first, middle, last = (Image.open(frames.pattern % k) for k in (0, frames.count // 2, frames.count - 1))
-check("Chart frames: clear at the start, drawn mid-way (the canvas is laid under them)",
-      first.getchannel("A").getextrema()[1] < 40 and middle.getchannel("A").getextrema()[1] == 255)
+
+
+def bright(img):
+    """Pixels of drawn data (light and opaque): the card itself is dark."""
+    import numpy as np
+    px = np.array(img.convert("RGBA")).astype(int)
+    return int(((px[:, :, :3].min(axis=2) > 200) & (px[:, :, 3] > 200)).sum())
+
+
+# Round 31: the empty Bento card rides in with the panel (it's on frame 0); its data draws once it lands.
+check("Chart frames: the empty card on frame 0 (it rides in with the panel), the data drawn mid-way",
+      first.getpixel((540, 400))[3] == 255 and first.getpixel((10, 1200))[3] == 0 and bright(first) < 40
+      and bright(middle) > 2000, f"{first.getpixel((540, 400))} {bright(first)} {bright(middle)}")
 lt = drawn["speaker_title"]
 mid = Image.open(lt.pattern % (lt.count // 2))
 check("Name card: transparent frame with a frosted pill in the lower middle",
@@ -298,7 +309,12 @@ check("Name card: transparent frame with a frosted pill in the lower middle",
 end = Image.open(lt.pattern % (lt.count - 1))
 lasts = {t: Image.open(f.pattern % (f.count - 1)).getchannel("A").getextrema()[1] for t, f in drawn.items()
          if not isinstance(f, Exception)}
-check("Every graphic leaves smoothly: fully faded on its last frame (no pop)", max(lasts.values()) < 8, str(lasts))
+overlays_last = {t: a for t, a in lasts.items() if MODES[t] == "overlay"}
+charts_last = {t: a for t, a in lasts.items() if MODES[t] == "split"}
+check("Over-the-speaker graphics leave smoothly: fully faded on their last frame (no pop)",
+      len(overlays_last) == 3 and max(overlays_last.values()) < 8, str(overlays_last))
+check("A chart's card stays whole to its last frame: it leaves with the panel, which slides it off (Round 31)",
+      len(charts_last) == 11 and min(charts_last.values()) == 255, str(charts_last))
 again = C.render_card(good, brand, tmp / "cards")
 check("Unchanged graphics are reused, not drawn again", again.pattern == frames.pattern)
 try:

@@ -422,7 +422,8 @@ check("The move's first frame is the full-screen picture itself (no jump into th
 sx, sy, sw, sh = strip_rect(W_, H_)
 band = cv2.resize(gradient[int(sy):int(sy + sh), :], (1080, 460), interpolation=cv2.INTER_AREA)
 check("...and its last frame is the 24% band (the camera's whole width) over the panel",
-      float(np.abs(end[:450].astype(int) - band[:450].astype(int)).mean()) < 3.0 and tuple(end[1800, 540]) == (5, 6, 8))
+      float(np.abs(end[:450].astype(int) - band[:450].astype(int)).mean()) < 3.0
+      and tuple(int(v) for v in end[1800, 540]) == tuple(int(__import__("core.cards", fromlist=["CANVAS"]).CANVAS[k:k + 2], 16) for k in (1, 3, 5)))
 
 # ---------- frame times survive a decoder message cutting into FFmpeg's log ----------
 true_times = [round(k * 0.04, 2) for k in range(40)]

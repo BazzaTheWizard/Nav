@@ -182,6 +182,7 @@ async function page(slug, url, env) {
   .cta .actions { display: flex; gap: 12px; flex-wrap: wrap; }
   footer { color: var(--dim); font-size: 13px; padding: 40px 0 48px; }
   footer .wrap { padding-top: 0; padding-bottom: 0; }
+  footer .credit { margin-top: 8px; font-size: 12px; }
   @media (max-width: 760px) {
     header.intro { padding: 32px 0 24px; }
     .swipe { display: block; }
@@ -218,7 +219,7 @@ async function page(slug, url, env) {
     </div>
   </section>
 </main>
-<footer><div class="wrap">${SENDER} · ${AGENCY} · <a href="${SITE}">${SITE.replace(/^https?:\/\//, "")}</a></div></footer>
+<footer><div class="wrap">${SENDER} · ${AGENCY} · <a href="${SITE}">${SITE.replace(/^https?:\/\//, "")}</a><div class="credit">Price charts: TradingView Lightweight Charts™, © TradingView, Inc. · <a href="https://www.tradingview.com/">tradingview.com</a></div></div></footer>
 <script>
 (() => {
   const page = ${JSON.stringify(slug)};

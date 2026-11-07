@@ -27,3 +27,6 @@ storage/transcripts/
 storage/pitches/
 storage/logs/
 storage/*.lock
+claude_review/
+scratch/
+*_workspace_copy.tgz

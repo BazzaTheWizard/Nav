@@ -70,7 +70,7 @@ from core import long_video
 from core.lead_harvester import lead_profile, subscriber_range
 from core.card_checks import LIMITS as CARD_LIMITS, check_edit
 from core.graphics_director import VideoInfo
-from core.cards import CANVAS as CARD_CANVAS, MIN_CONTRAST, contrast
+from core.cards import CARD_BG as CARD_CANVAS, MIN_CONTRAST, contrast  # Round 31: the accent is read on the card
 from core.dynamic_layout import render_with_cards
 from core.edl import (
     BRAND_KIT_PATH,
