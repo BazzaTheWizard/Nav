@@ -256,9 +256,13 @@ check("The prompt states the limit and when the title is up", "At most 2 graphic
 named = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0,
                  ask=answer(speaker={"name": "Dana Reyes", "role": "CEO, Northwind Labs"}))
 card = next((c for c in named.edit.cards if c.template == "speaker_title"), None)
-check("Name card from the video's own title and description, right after the title",
-      card is not None and card.rows[0].label == "Dana Reyes" and card.rows[0].detail == "CEO, Northwind Labs"
-      and abs(card.start - 104.2) < 1e-6 and abs(card.end - card.start - 3.3) < 1e-6, str(named.notes))
+known = G._GUESTS.get((INFO.title, INFO.channel), [])
+# Round 33: the speaker is named from the video's own title and description, but with no face track
+# (no crop plan here) nobody can see who is on screen, so the card is never guessed into a spot.
+check("The speaker is named from the video's own title and description (Dana Reyes, CEO, Northwind Labs)",
+      [(s.name, s.role) for s in known] == [("Dana Reyes", "CEO, Northwind Labs")], str(known))
+check("...but with no face track, no name card is guessed onto whoever is on screen",
+      card is None and any("no face track" in n for n in named.notes), str(named.notes))
 G._GUESTS.clear()  # Round 29: a video's guest is remembered for its other clips; start fresh here
 made_up = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=answer(speaker={"name": "Sam Altman", "role": "CEO"}))
 check("...never a name that isn't in the title or description",
@@ -268,8 +272,9 @@ check("...a role it can't find there is left off", G.grounded_name({"name": "Dan
       == ("Dana Reyes", ""))
 both = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0,
                 ask=answer(change, speaker={"name": "Dana Reyes", "role": "CEO, Northwind Labs"}))
-check("The name card makes room for the data graphic (no overlap, 1.5 s apart)",
-      len(both.edit.cards) == 2 and all(r.ok for r in K.check_edit(both.edit, talk, 4.0)), str(both.notes))
+check("The data graphic is kept and passes (no name card is guessed without a face track)",
+      [c.template for c in both.edit.cards if c.template != "speaker_title"] and
+      all(r.ok for r in K.check_edit(both.edit, talk, 4.0)), str(both.notes))
 none = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=lambda p, s: None)
 bento = lambda d: [c for c in d.edit.cards if c.template != "speaker_title"]  # noqa: E731
 check("No AI key: it says why, and the clip still gets a visual from the transcript (Round 32: never zero)",
@@ -319,8 +324,8 @@ first_pass = K.check_card(number, crash, 95.0, 140.0)
 second_pass = K.check_card(number, crash, 95.0, 140.0)
 check("A number's line may quote the words that led up to it, on every check", first_pass.ok and second_pass.ok
       and abs(number.start - (number.rows[0].reveal_at - 0.12)) < 1e-6, str(first_pass.errors + second_pass.errors))
-check("A number graphic leaves a few seconds after its number (not at the end of a long sentence)",
-      abs(number.end - (number.rows[0].reveal_at + K.OVERLAY_HOLD)) < 1e-6, f"{number.start:.2f}-{number.end:.2f}")
+check("A number graphic leaves once it has been read: 4.5-6 s (Round 33), not at the end of a long sentence",
+      K.MIN_OVERLAY_SECONDS <= number.end - number.start <= K.BENTO_MAX_SECONDS, f"{number.start:.2f}-{number.end:.2f}")
 check("\"the last hundred years\" is 100", [(n.value, n.scale) for n in K.spoken_numbers(
     words_from("based on the last hundred years of history"))] == [(100.0, None)])
 
@@ -409,7 +414,9 @@ app.session_state["clip_render_contexts"] = {key: {
     "end_time": clip_end, "pin_title": True, "graphics_notes": ["Added kinetic_range ($2M → $8M) at 0:05.1: test"]}}
 from dataclasses import asdict  # noqa: E402
 
-app.session_state["card_drafts"] = {key: [asdict(c) for c in both.edit.cards]}
+# Round 33: the director no longer guesses a name card without a face track; here one is added by hand
+by_hand = Card("speaker_title", 104.2, 107.5, rows=[CardRow("Dana Reyes", detail="CEO, Northwind Labs")])
+app.session_state["card_drafts"] = {key: [asdict(c) for c in sorted(both.edit.cards + [by_hand], key=lambda c: c.start)]}
 app.run()
 check("App runs", not app.exception, str([e.value for e in app.exception][:1]))
 check("Make clips: Highlights and Series only", list(app.radio(key="clip_mode").options)

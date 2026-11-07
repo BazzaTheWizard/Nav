@@ -20,7 +20,8 @@ Round 32: every clip gets 1-2 Bento visuals, at least BENTO_SPACING apart.
   ending or a name card). If nothing survives: a second, qualitative-only AI request, and
   then a visual built from the transcript itself, so no clip ships without one.
 Name cards are planned first and separately (core.name_cards.plan_name_cards): one per
-identified speaker, guest and host, never counted as a Bento visual.
+speaker whose face is certain, on their own shot while they talk (Round 33), never
+counted as a Bento visual.
 """
 from __future__ import annotations
 
@@ -94,8 +95,10 @@ RULES
    It cannot start before HOOK_END s (the title is on screen) or run into the last
    2 seconds. One exception: when the clip's hook itself is the data moment (a
    kinetic_range number or change said in the first HOOK_END s), give that sentence and
-   the next; it comes in right after the title as a recap. A number or box graphic stays
-   up only a few seconds, so never stretch one over sentences that don't need it.
+   the next; it comes in right after the title as a recap. Every visual is on screen 4.5 to
+   6 s: it builds in about a second, then holds still so the viewer can read it. So a
+   moment needs about 6 s of clip after it starts (before the last 2 s); never pick one
+   said right at the end.
 7. Show, don't tell. When the speaker describes a relationship, show its shape instead of
    printing a number they just said: a fall and a recovery (a crash, a dip, a drawdown,
    "and then it came back") -> drawdown_curve; a comparison -> bars; dated points ->
@@ -711,25 +714,26 @@ class _Picker:
 
 
 def _plan_names(speakers: list[Speaker], clip_words: list[Any], clip_start: float, clip_end: float, hook: float,
-                plan: Any, source: Any, taken: list[Card], notes: list[str] | None = None) -> list[Card]:
+                plan: Any, source: Any, taken: list[Card], notes: list[str] | None = None,
+                video_words: list[Any] | None = None, channel: str = "") -> list[Card]:
     """Every identified speaker's name card (core.name_cards), clear of ``taken``; each
-    one checked like any graphic."""
+    one checked like any graphic. Round 33: only on the speaker's own face while they talk;
+    with no crop plan (or no way to see faces) there is no card: never a guess."""
     from core import name_cards
 
     if not speakers:
         return []
-    speakers = [s for s in speakers if s.kind != "host"] + [s for s in speakers if s.kind == "host"]  # the guest first
-    cards: list[Card] | None = None
+    cards: list[Card] = []
     said: list[str] = []
-    if plan is not None and source is not None:
+    if plan is None or source is None:
+        said.append("No name cards: this layout has no face track to check who is on screen.")
+    else:
         try:
-            cards, said = name_cards.plan_name_cards(source, plan, clip_start, clip_end, hook, taken, speakers)
-        except Exception as exc:  # noqa: BLE001 - the clip still gets its name cards, in the standard spot
+            cards, said = name_cards.plan_name_cards(source, plan, clip_start, clip_end, hook, taken, speakers,
+                                                     words=clip_words, video_words=video_words, channel=channel)
+        except Exception as exc:  # noqa: BLE001 - the clip renders without name cards
             logger.warning("Name card placement failed: %s", exc)
-            said = [f"Placing the name cards on faces failed ({exc}); they go in the standard spot."]
-    if cards is None:
-        cards, more = name_cards.sequential_cards(speakers, clip_start, clip_end, hook, taken)
-        said += more
+            said = [f"No name cards: placing them on faces failed ({exc})."]
     kept: list[Card] = []
     for card in cards:
         result = check_edit(ClipEdit(clip_start, clip_end, cards=sorted(taken + kept + [card], key=lambda c: c.start)),
@@ -798,10 +802,12 @@ def direct(
 
     # 1. Name cards first: one per identified speaker, never counted as a Bento visual.
     speakers = video_speakers(answer, info)
-    names = _plan_names(speakers, clip_words, clip_start, clip_end, hook, plan, source, [], direction.notes)
+    names = _plan_names(speakers, clip_words, clip_start, clip_end, hook, plan, source, [], direction.notes,
+                        video_words, info.channel)
 
     def replan(taken: list[Card]) -> list[Card]:
-        return _plan_names(speakers, clip_words, clip_start, clip_end, hook, plan, source, taken)
+        return _plan_names(speakers, clip_words, clip_start, clip_end, hook, plan, source, taken,
+                           video_words=video_words, channel=info.channel)
 
     # 2. Bento visuals: Tier 1 (quantitative) first, Tier 2 (qualitative) as the fallback.
     limit = max_graphics(duration)

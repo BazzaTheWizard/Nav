@@ -84,8 +84,12 @@ def sp_card(**over):
 good = sp_card()
 result = K.check_card(good, WORDS, CLIP_START, CLIP_END)
 check("The S&P chart passes", result.ok, str(result.errors))
-check("Each number appears on the word it's said",
-      [r.reveal_at for r in good.rows] == [at("$17"), at("11"), at("five")], str([r.reveal_at for r in good.rows]))
+# Round 33: the first number comes in on its word; the rest follow in the order said, all within
+# BUILD_SECONDS, so the finished chart can then hold still long enough to read.
+reveals = [r.reveal_at for r in good.rows]
+check("Each number appears in the order said, the first on its word, all within 1 s",
+      reveals[0] == at("$17") and reveals == sorted(reveals) and reveals[-1] - reveals[0] <= K.BUILD_SECONDS + 1e-6,
+      str(reveals))
 
 
 def errors_of(card, words=WORDS, start=CLIP_START, end=CLIP_END, **kw):
@@ -104,8 +108,11 @@ bad = errors_of(sp_card(start=CLIP_START + 3.5), hook_seconds=4.0)
 check("Nothing while the 4 s title card is up", any("first 4 s" in e for e in bad), str(bad))
 bad = errors_of(sp_card(end=CLIP_END - 0.5))
 check("Nothing in the last 2 s (the payoff)", any("last 2 s" in e for e in bad), str(bad))
-bad = errors_of(sp_card(end=card_start + 1.5))
-check("Charts stay at least 2.5 s", any("at least 2.5 s" in e for e in bad), str(bad))
+short = sp_card(rows=[CardRow("Top-line revenue", "$17T"), CardRow("Expenses", "~$11–12T", highlight=True)],
+                end=at("expenses") + 0.3)
+bad = errors_of(short)
+check("A chart set too short is lengthened to be read (Round 33: 5-6 s, 3.5 s of it still)",
+      not bad and K.MIN_CARD_SECONDS <= short.end - short.start <= 6.7, f"{bad} {short.end - short.start:.2f}")
 bad = errors_of(sp_card(rows=[CardRow("A label that is far too long to fit", "$17T"), CardRow("E", "~$11–12T")]))
 check("Character limits", any("label is" in e for e in bad), str(bad))
 bad = errors_of(sp_card(rows=[CardRow("Revenue", "$17T"), CardRow("Expenses", "~$11–12T"),
@@ -123,7 +130,8 @@ def moment(text, template, rows, start=100.0, **over):
     lead, tail = len(LEAD.split()), len(TAIL.split())
     inside = words[lead:len(words) - tail]
     card = Card(template, start=inside[0].start, end=inside[-1].end + 0.15, rows=rows, **over)
-    return card, K.check_card(card, words, start, words[-1].end + 0.2), words
+    # Round 33: the clip goes on 6 s past the moment, so the graphic has room to be read before the ending
+    return card, K.check_card(card, words, start, words[-1].end + 6.2), words
 
 
 ok = {}
@@ -139,8 +147,10 @@ card, res, words = moment("There are three kinds of founders here: builders, the
                           "buckets", [CardRow("Builders"), CardRow("Sellers", dashed=True),
                                       CardRow("Operators", highlight=True)])
 ok["buckets"] = card
-check("B: boxes appear in order, each on its word", res.ok and [r.reveal_at for r in card.rows]
-      == [at("builders", words), at("sellers", words), at("operators", words)], str(res.errors))
+check("B: boxes appear in order, the first on its word, all within 1 s (Round 33)", res.ok
+      and card.rows[0].reveal_at == at("builders", words)
+      and [r.reveal_at for r in card.rows] == sorted(r.reveal_at for r in card.rows)
+      and card.rows[-1].reveal_at - card.rows[0].reveal_at <= K.BUILD_SECONDS + 1e-6, str(res.errors))
 _, res, _ = moment("There are three kinds of founders here: builders, then sellers, and finally operators.",
                    "buckets", [CardRow("Operators"), CardRow("Builders")])
 check("B: boxes out of spoken order are stopped", not res.ok, str(res.errors))
@@ -156,9 +166,9 @@ words = words_from(f"{LEAD} {TL} {TAIL}", start=100.0)
 late = next(w for w in words if w.text == "Then").start
 recap = Card("timeline", start=late, end=words[-len(TAIL.split()) - 1].end + 0.15,
              rows=[CardRow("", "20 yrs ago", detail="The bombing scenario"), CardRow("", "96 hrs", detail="The orders")])
-res = K.check_card(recap, words, 100.0, words[-1].end + 0.2)
-check("C: a point said earlier in the clip is drawn in as a recap", res.ok
-      and abs(recap.rows[0].reveal_at - (late + 0.2)) < 1e-6, str(res.errors))
+res = K.check_card(recap, words, 100.0, words[-1].end + 6.2)
+check("C: a point said earlier in the clip is drawn in as a recap, as the chart lands", res.ok
+      and abs(recap.rows[0].reveal_at - (recap.start + 0.45)) < 1e-6, str(res.errors))
 _, res, _ = moment(TL, "timeline", [CardRow("", "30 yrs ago", detail="The bombing scenario"),
                                     CardRow("", "96 hrs", detail="Orders to execute the plans")])
 check("C: a point that wasn't said is stopped", any("30 yrs ago" in e for e in res.errors), str(res.errors))
@@ -368,6 +378,7 @@ def render_base(kept_words):
 
 edit = ClipEdit(100.0, SHOW_END, cards=show_cards, brand=BrandKit())
 made, checks = render_with_cards(source, edit, SHOW, tmp / "with_graphics.mp4", tmp / "work", render_base, hook_seconds=3.0)
+chart_start, chart_end = show_cards[2].start, show_cards[2].end  # Round 33: paced (in as its first number is said)
 check("Clip with a name card, a number and a chart made", made is not None and made.is_file() and all(c.ok for c in checks),
       str([c.errors for c in checks]))
 check("The clip is rendered without bold captions under the graphics",

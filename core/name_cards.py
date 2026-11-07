@@ -1,14 +1,14 @@
-"""Where and when the guest's name card goes (Round 29), and since Round 32 every
-identified speaker's (plan_name_cards, at the end).
+"""Where and when each speaker's name card goes.
 
-Every clip gets the guest's name card (when the guest's name is in the video's own title
-or description). It never counts toward the clip's graphics limit and never overlaps a
-data graphic.
-
-Who: the guest's face (core.speaker_id): the card only goes where that face is.
-When: ideally the guest's first solo shot after the title. When the clip opens on a
-two-person split (or has no early solo shot), the card goes inside the guest's own panel
-while they're talking (mouth movement), compact.
+Round 33: a name card is only ever on the right face, while that person talks.
+Who: core.name_cards.identify ties each named speaker to a face only when it's certain (a
+self-introduction on camera, the face that keeps coming back on the channel for the host,
+or screen time when it can't be anyone else). A speaker who can't be pinned to a face gets
+no card: never the wrong name on someone.
+When: once per speaker (and once per face), on their first verified talking moment after
+the title: the camera on them alone (or their own panel of a split while they do most of
+the talking), their words running for 1.75 s and their mouth moving, from 3.5 s in. There
+is no "right after the title, whoever is on screen" fallback any more.
 Where: around the face, never on it. The eyes-to-chin area is off limits; so are the
 captions (the calm line during graphics, or the seam between split panels) and the
 bottom strip the apps cover. The spot nearest the usual lower-middle wins.
@@ -54,6 +54,7 @@ class Option:
     scale: float
     prefer: float  # the card's preferred top edge
     talking: Callable[[float, float], float] | None = None  # share of the talking that's the guest's
+    source_face: tuple[float, float, float] | None = None  # the face in source pixels (cx, cy, w): its mouth
 
 
 def place(name: str, role: str, option: Option, size: tuple[int, int] | None = None,
@@ -138,7 +139,7 @@ def options(source: str | Path, plan: Any, clip_start: float, clip_end: float, g
             scale = FRAME[1] / plan.crop_height
             cx, cy, fw = (float(np.median([getattr(h, k) for h in hits])) for k in ("cx", "cy", "w"))
             face = ((cx - shot.x) * scale, (cy - plan.y) * scale, fw * scale)
-            found.append(Option(a, b, "solo", face, FULL_REGION, 1.0, NAME_CARD_TOP))
+            found.append(Option(a, b, "solo", face, FULL_REGION, 1.0, NAME_CARD_TOP, source_face=(cx, cy, fw)))
     return found
 
 
@@ -258,8 +259,13 @@ def stat_place(source: str | Path, plan: Any, clip_start: float, clip_end: float
         return STAT_DEFAULT
 
 
-# --- Round 32: a name card for every identified speaker --------------------------------
-NAME_DELAY = 0.2  # a name card comes in this long after the title card clears
+# --- Round 33: a name card only on the right face, while that person talks ---------------
+NAME_DELAY = 0.2  # a name card comes in at least this long after the title card clears
+EARLIEST = 3.5  # ...and never before this many seconds into the clip
+SPEAKING_RUN = 1.75  # seconds of the speaker's own talking the card waits for (1.5-2.0 s)
+MIN_SPEECH = 1.5  # ...of which at least this much is words (not a pause)
+_IDENTIFIED: dict[tuple, tuple[dict, list[str]]] = {}
+PANEL_TALKING = 0.6  # in a split, the speaker does at least this share of the mouth movement
 
 
 def _free(t: float, taken: list[Card]) -> bool:
@@ -272,92 +278,140 @@ def _free(t: float, taken: list[Card]) -> bool:
     return True
 
 
-def _next_free(t: float, latest: float, taken: list[Card]) -> float | None:
-    while t + NAME_CARD_SECONDS <= latest + 1e-9:
-        if _free(t, taken):
-            return round(t, 3)
-        t += 0.1
-    return None
+def _speech(words: list[Any], t0: float, t1: float) -> float:
+    """Seconds of words said in [t0, t1]."""
+    return sum(max(0.0, min(float(w.end), t1) - max(float(w.start), t0)) for w in words)
 
 
-def sequential_cards(speakers: list[Any], clip_start: float, clip_end: float, hook: float, taken: list[Card],
-                     panels: dict[str, Option] | None = None) -> tuple[list[Card], list[str]]:
-    """Speakers never seen alone in a solo shot (a clip that stays in a split or two-shot,
-    or no crop plan to tell): their name cards one after the other, right after the title,
-    each in the speaker's own panel when it's known, else in the standard spot."""
-    earliest, latest = clip_start + hook + NAME_DELAY, clip_end - PAYOFF_SECONDS
-    placed: list[Card] = []
+def _starts_talking(words: list[Any], t: float) -> bool:
+    """Someone is talking from t: a word under way at t, or starting within 0.35 s."""
+    return any(float(w.start) <= t + 0.35 and float(w.end) > t for w in words)
+
+
+def _speaking_meter(source: str | Path, option: Option) -> Callable[[float, float], float | None]:
+    """share(t0, t1): how much of [t0, t1] the face of this solo shot is talking
+    (core.speaker_id: its mouth against its forehead), measured once per shot; None when
+    it can't be measured."""
+    cache: list[np.ndarray | None] = []
+
+    def share(t0: float, t1: float) -> float | None:
+        if option.source_face is None:
+            return None
+        if not cache:
+            cx, cy, w = option.source_face
+            cache.append(S.mouth_activity(source, option.start, option.end, [(cx, cy, w), (cx, cy - 0.78 * w, w)]))
+        activity = cache[0]
+        if activity is None:
+            return None
+        lo, hi = int((t0 - option.start) * S.MOUTH_FPS), int((t1 - option.start) * S.MOUTH_FPS)
+        part = activity[max(0, lo):max(lo + 2, hi)]
+        if part.shape[0] < 4:
+            return None
+        return float(np.mean(part[:, 0] > S.SPEAKING_RATIO * (part[:, 1] + 0.5)))
+
+    return share
+
+
+def identify(source: str | Path, plan: Any, speakers: list[Any], video_words: list[Any] | None = None,
+             channel: str = "", video_key: str = "") -> tuple[dict[str, tuple[tuple[float, ...], str]], list[str]]:
+    """Which face is which named speaker: {name: (face feature, how we know)}. Only what's
+    certain: a speaker who introduces themself on camera ("I'm Steve Eisman"); the host as
+    the one face that comes back across the channel's videos; and screen time only when
+    it can't be anyone else (one person in the video, or one guest who is clearly on screen
+    most). Anyone else gets no card: better none than the wrong name on a face."""
+    duration = S.video_duration(source)
+    people = S.solo_people(source, duration, plan.frame_width) if duration else []
     notes: list[str] = []
-    t = earliest
+    ids: dict[str, tuple[tuple[float, ...], str]] = {}
+
+    def claimed(face: tuple[float, ...]) -> bool:
+        return any(S.similarity(face, other) >= S.SAME_PERSON for other, _how in ids.values())
+
+    for name, at in S.introductions(video_words or [], [s.name for s in speakers]):
+        if name not in ids:
+            face = S.face_while(source, at, plan.frame_width)
+            if face is not None and not claimed(face):
+                ids[name] = (face, f"introduces themself at {int(at // 60)}:{int(at % 60):02d}")
+    recurring = S.recurring_faces(channel, video_key, people) if channel else []
+    S.remember_people(channel, video_key, people)
+    hosts = [s for s in speakers if s.kind == "host" and s.name not in ids]
+    returning = [face for face in recurring if not claimed(face)]
+    if len(hosts) == 1 and len(returning) == 1:
+        ids[hosts[0].name] = (returning[0], "the face that comes back on the channel")
+    free = [(face, seen) for face, seen in people if not claimed(face)
+            and not any(S.similarity(face, r) >= S.SAME_PERSON for r in recurring)]
+    guests = [s for s in speakers if s.kind != "host" and s.name not in ids]
+    if len(people) == 1 and len(speakers) == 1 and free:
+        ids[speakers[0].name] = (free[0][0], "the only person in the video")
+    elif len(guests) == 1 and free:
+        top, runner_up = free[0][1], (free[1][1] if len(free) > 1 else 0)
+        if top >= 4 and top >= 1.5 * runner_up:
+            ids[guests[0].name] = (free[0][0], "the guest: alone on screen most, by far")
+            rest = [(face, seen) for face, seen in free[1:] if seen >= 3]
+            hosts = [s for s in speakers if s.kind == "host" and s.name not in ids]
+            if len(hosts) == 1 and len(speakers) == 2 and len(rest) == 1:
+                ids[hosts[0].name] = (rest[0][0], "the host: the only other person alone on screen")
     for speaker in speakers:
-        when = _next_free(t, latest, taken + placed)
-        if when is None:
-            notes.append(f"No name card for {speaker.name}: no free moment after the title.")
-            continue
-        spot = ""
-        option = (panels or {}).get(speaker.name)
-        if option is not None and option.start <= when and when + NAME_CARD_SECONDS <= option.end:
-            spot = place(speaker.name, speaker.role, option) or ""
-        card = Card("speaker_title", start=when, end=when + NAME_CARD_SECONDS,
-                    rows=[CardRow(speaker.name, detail=speaker.role)], place=spot)
-        placed.append(card)
-        notes.append(f"Added {speaker.name}'s name card at {when - clip_start:.1f} s, right after the title"
-                     f"{' in their panel' if spot else ''} (no solo shot of them in this clip).")
-        t = card.end + NAME_GAP
-    return placed, notes
+        if speaker.name not in ids:
+            notes.append(f"No name card for {speaker.name}: can't tell which face is theirs for sure "
+                         "(no self-introduction, not a face the channel keeps coming back to, and screen "
+                         "time doesn't single them out).")
+    return ids, notes
 
 
 def plan_name_cards(source: str | Path, plan: Any, clip_start: float, clip_end: float, hook: float,
-                    taken: list[Card], speakers: list[Any]) -> tuple[list[Card], list[str]]:
-    """Round 32: one name card per identified speaker (``speakers``: objects with name,
-    role and kind "guest" or "host"), decoupled from the Bento visuals: they never count
-    toward them. Each speaker's card comes in the first time the camera is on them alone
-    (a solo shot), after the title clears; a clip that opens on their solo shot gets it
-    right after the title. Speakers the clip never isolates (it stays in a split or a
-    two-shot) get theirs one after the other right after the title.
-
-    Who is who: the guest is the face alone on screen most across the video, the host the
-    next one (core.speaker_id.people_faces). Two guests can't be told apart that way, so
-    theirs go one after the other. A speaker whose face is known but who is never on screen
-    in this clip (and the clip never shows two people at once) gets no card."""
-    duration = S.video_duration(source)
-    faces = S.people_faces(source, duration, plan.frame_width, len(speakers)) if duration else []
-    guests = [s for s in speakers if s.kind != "host"]
-    ordered = guests + [s for s in speakers if s.kind == "host"]
-    earliest, latest = clip_start + hook + NAME_DELAY, clip_end - PAYOFF_SECONDS
-    split = plan.split_view(clip_start, clip_end)
-    shared = bool(split and split.windows) or any(
-        shot.group and shot.end > clip_start and shot.start < clip_end for shot in plan.shots)
+                    taken: list[Card], speakers: list[Any], words: list[Any] | None = None,
+                    video_words: list[Any] | None = None, channel: str = "") -> tuple[list[Card], list[str]]:
+    """Round 33: one name card per identified speaker, and only where it's right. It comes in
+    once, on the speaker's first verified talking moment after the title (from EARLIEST s):
+    the camera on them alone (or their own panel of a split, while they do most of the
+    talking), their voice running for SPEAKING_RUN s (the transcript's words) and their
+    mouth moving (core.speaker_id). Never on another person's face, never twice for one
+    speaker or one face, never over a listener. ``words``: the clip's words (source
+    seconds); ``video_words``: the whole video's (for self-introductions)."""
+    key = (str(source), channel, tuple((sp.name, sp.kind) for sp in speakers))
+    if key not in _IDENTIFIED:  # once per video: a re-plan around a chart doesn't look again
+        _IDENTIFIED[key] = identify(source, plan, speakers, video_words, channel, Path(str(source)).stem)
+    ids, notes = _IDENTIFIED[key][0], list(_IDENTIFIED[key][1])
+    earliest = clip_start + max(hook + NAME_DELAY, EARLIEST)
+    latest = clip_end - PAYOFF_SECONDS
+    spoken = [w for w in (words or []) if float(w.end) > clip_start and float(w.start) < clip_end]
     placed: list[Card] = []
-    notes: list[str] = []
-    waiting: list[Any] = []
-    panels: dict[str, Option] = {}
-    for k, speaker in enumerate(ordered):
-        face = faces[k] if k < len(faces) and not (len(guests) > 1 and speaker.kind != "host") else None
-        if face is None and len(ordered) == 1:
-            found = options(source, plan, clip_start, clip_end, None, _most_on_screen(plan, clip_start, clip_end))
-        elif face is not None:
-            found = options(source, plan, clip_start, clip_end, face)
-        else:
-            found = []
-        card = None
-        for option in sorted((o for o in found if o.kind == "solo"), key=lambda o: o.start):
-            when = slot(option, taken + placed, earliest, latest)
-            spot = place(speaker.name, speaker.role, option) if when is not None else None
-            if when is not None and spot is not None:
-                card = Card("speaker_title", start=when, end=when + NAME_CARD_SECONDS,
-                            rows=[CardRow(speaker.name, detail=speaker.role)], place=spot)
+    faces_used: list[tuple[float, ...]] = []
+    for speaker in sorted(speakers, key=lambda s: s.kind == "host"):  # the guest first
+        if speaker.name not in ids:
+            continue
+        face, how = ids[speaker.name]
+        if any(S.similarity(face, other) >= S.SAME_PERSON for other in faces_used):
+            notes.append(f"No name card for {speaker.name}: that face already has a name card in this clip.")
+            continue
+        card, why = None, "they're never on screen alone while talking in this clip"
+        for option in sorted(options(source, plan, clip_start, clip_end, face), key=lambda o: o.start):
+            meter = _speaking_meter(source, option) if option.kind == "solo" else None
+            t = max(option.start + 0.3, earliest)
+            last = min(option.end - 0.2 - NAME_CARD_SECONDS, latest - NAME_CARD_SECONDS)
+            while t <= last + 1e-9 and card is None:
+                ok = (_free(t, taken + placed) and _starts_talking(spoken, t)
+                      and _speech(spoken, t, t + SPEAKING_RUN) >= MIN_SPEECH)
+                if ok and option.kind == "solo":
+                    share = meter(t, t + SPEAKING_RUN) if meter else None
+                    opening = meter(t, t + 0.6) if meter else None  # ...and talking as the card comes in
+                    ok = share is None or (share >= S.SPEAKING_SHARE and (opening is None or opening >= S.SPEAKING_SHARE))
+                elif ok:
+                    ok = option.talking is not None and option.talking(t, t + SPEAKING_RUN) >= PANEL_TALKING
+                spot = place(speaker.name, speaker.role, option) if ok else None
+                if spot:
+                    card = Card("speaker_title", start=round(t, 3), end=round(t + NAME_CARD_SECONDS, 3),
+                                rows=[CardRow(speaker.name, detail=speaker.role)], place=spot)
+                    why = "on their solo shot" if option.kind == "solo" else "in their panel of the split"
+                t += 0.25
+            if card is not None:
                 break
-        if card is not None:
-            placed.append(card)
-            notes.append(f"Added {speaker.name}'s name card at {card.start - clip_start:.1f} s, on their first solo shot.")
+        if card is None:
+            notes.append(f"No name card for {speaker.name}: {why}.")
             continue
-        in_panel = [o for o in found if o.kind == "panel"]
-        if in_panel:
-            panels[speaker.name] = in_panel[0]
-        if face is not None and not found and not shared:
-            notes.append(f"No name card for {speaker.name}: they aren't on screen in this clip.")
-            continue
-        waiting.append(speaker)
-    more, more_notes = sequential_cards(waiting, clip_start, clip_end, hook, taken + placed, panels)
-    return sorted(placed + more, key=lambda c: c.start), notes + more_notes
+        placed.append(card)
+        faces_used.append(face)
+        notes.append(f"Added {speaker.name}'s name card at {card.start - clip_start:.1f} s, {why}, while they talk "
+                     f"(who: {how}).")
+    return sorted(placed, key=lambda c: c.start), notes

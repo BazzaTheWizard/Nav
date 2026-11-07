@@ -100,9 +100,30 @@ MIN_CONTRAST = 4.5  # WCAG AA for text
 EASE = "cubic-bezier(0.16, 1, 0.3, 1)"  # entrances: fast in, long gentle settle
 EASE_OUT_EXIT = "cubic-bezier(0.65, 0, 0.35, 1)"  # exits: damped ease-in-out, no snap at either end
 POP = "cubic-bezier(0.34, 1.56, 0.64, 1)"  # points popping in, a touch of overshoot
+
+
+def spring_easing(stiffness: float = 170.0, damping: float = 22.0, mass: float = 1.0, samples: int = 40) -> str:
+    """Round 33: Remotion's spring() as a CSS easing: the damped spring is solved
+    (x'' = -k (x - 1) - c x', from rest at 0) until it settles, and sampled into a
+    linear() curve, so a Web Animation seeks it frame-exactly like any other easing.
+    The defaults overshoot about 2% and settle: an entrance that lands, not a slide."""
+    dt, x, v, path = 1 / 600, 0.0, 0.0, [0.0]
+    for _step in range(6000):  # 10 s at most
+        a = (-stiffness * (x - 1.0) - damping * v) / mass
+        v += a * dt
+        x += v * dt
+        path.append(x)
+        if abs(x - 1.0) < 1e-3 and abs(v) < 1e-2 and len(path) > 60:
+            break
+    path[-1] = 1.0
+    points = [path[round(k * (len(path) - 1) / samples)] for k in range(samples + 1)]
+    return "linear(" + ", ".join(f"{value:.4f}" for value in points) + ")"
+
+
+SPRING = spring_easing()  # entrances: elements rise into place on a spring
 EXIT = 0.4  # seconds (12 frames): over-the-speaker graphics slide and fade out over their last 0.4 s
 FIRST = 0.35  # nothing inside the card starts before this (it would draw while the panel slides)
-ROLL = 0.8  # seconds a number takes to roll up to its value
+ROLL = 0.7  # seconds a number takes to roll up to its value (odometer digits, Round 33)
 
 EYEBROWS = {
     "timeline": "Timeline", "metric_bars": "Breakdown", "ranked_bars": "Ranking", "diverging_bar": "Head to head",
@@ -167,7 +188,8 @@ class Motion:
 
     def fade_up(self, selector: str, t: float, rise: int = 14, length: float = 0.4) -> None:
         self.tween(selector, "opacity", t, t + length * 0.8, "0", "1")
-        self.tween(selector, "transform", t, t + length, f"translateY({rise}px)", "translateY(0px)")
+        # Round 33: the rise is a spring (Remotion), a little longer than the fade so it lands
+        self.tween(selector, "transform", t, t + length * 1.25, f"translateY({rise}px)", "translateY(0px)", SPRING)
 
     def wipe_x(self, selector: str, t0: float, t1: float, x_from: float, x_to: float, width: float = CARD_W,
                easing: str = EASE) -> None:
@@ -240,6 +262,11 @@ body {{ font-family: Geist, Inter, sans-serif; color: {INK}; -webkit-font-smooth
 .lyr svg {{ position: absolute; left: 0; top: 0; overflow: visible; }}
 .lab {{ font-size: 30px; font-weight: 520; color: {SOFT}; white-space: nowrap; }}
 .val {{ font-size: 40px; font-weight: 700; letter-spacing: -.02em; white-space: nowrap; }}
+.od {{ position: relative; display: inline-block; -webkit-text-fill-color: transparent;
+  -webkit-mask-image: linear-gradient(180deg, transparent 0%, #000 22%, #000 78%, transparent 100%); }}
+.od::before {{ content: "0\\A 1\\A 2\\A 3\\A 4\\A 5\\A 6\\A 7\\A 8\\A 9"; white-space: pre; position: absolute; left: 0; top: 0;
+  width: 100%; text-align: center; line-height: var(--h); -webkit-text-fill-color: currentColor;
+  transform: translateY(calc(var(--y, 0) * -1 * var(--h))); }}
 .axis {{ font-family: "JetBrains Mono", monospace; font-size: 22px; font-weight: 500; color: {AXIS}; white-space: nowrap; }}
 """
 
@@ -536,6 +563,10 @@ def _card_css(accent: str, header_h: int, plot_h: int, footer: bool) -> str:
     return f"""
 .card {{ position: absolute; left: {CARD_X}px; top: {CARD_Y}px; width: {CARD_W}px; height: {CARD_H}px;
   border-radius: {RADIUS}px; background: {CARD_BG}; overflow: hidden; }}
+.spot {{ position: absolute; left: -260px; top: -320px; width: 1000px; height: 760px; pointer-events: none;
+  background: radial-gradient(closest-side, rgba(255,255,255,.05), rgba(255,255,255,0)); }}
+.beam {{ position: absolute; left: 0; top: 0; width: 260px; height: 1px; pointer-events: none; opacity: 0;
+  background: linear-gradient(90deg, {_rgba(accent, 0)}, {_rgba(accent, 0.95)} 60%, rgba(255,255,255,.95) 85%, {_rgba(accent, 0)}); }}
 .rim {{ position: absolute; inset: 0; border-radius: {RADIUS}px; padding: 1px; pointer-events: none;
   background: linear-gradient(180deg, rgba(255,255,255,.16) 0%, rgba(255,255,255,.04) 100%);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor;
@@ -766,6 +797,7 @@ def _trend_line(card: Card, accent: str, ph: int) -> Chart:
     ys = [base - (base - top) * v / peak for v in values]
     data = [{"i": k, "v": v, "c": accent if row.highlight else INK} for k, (v, row) in enumerate(zip(values, card.rows))]
     css = f"""
+.bdg {{ display: inline-block; padding: 2px 16px 4px; border-radius: 12px; box-shadow: 0 8px 28px rgba(0,0,0,.45); }}
 .pv {{ position: absolute; width: 260px; margin-left: -130px; text-align: center; font-size: 36px; font-weight: 700;
   letter-spacing: -.03em; white-space: nowrap; }}
 .px {{ position: absolute; top: {base + 22}px; width: 200px; margin-left: -100px; text-align: center; }}
@@ -776,7 +808,11 @@ def _trend_line(card: Card, accent: str, ph: int) -> Chart:
             f'<stop offset="0" stop-color="{accent}" stop-opacity=".26"/><stop offset="1" stop-color="{accent}" stop-opacity="0"/>'
             f"</linearGradient>")
     js = (f"NAV.onBuild(() => {{ const pts = {_data(data)};"
-          f" NAV.plot('#tbase', {{{common}, marks: [Plot.ruleY([0], {{stroke: {json.dumps(RULE)}, strokeWidth: 2,"
+          f" NAV.plot('#tbase', {{{common}, marks: ["
+          # Round 33: faint dashed gridlines (institutional charts), no labels: the points carry the numbers
+          f" Plot.ruleY(d3.ticks(0, {peak}, 4).filter(v => v > 0 && v < {peak} * 0.98), {{stroke: {json.dumps(GRID)},"
+          f" strokeWidth: 1.5, strokeDasharray: '3,7', insetLeft: {left - 30}, insetRight: {CARD_W - right - 30}}}),"
+          f" Plot.ruleY([0], {{stroke: {json.dumps(RULE)}, strokeWidth: 2,"
           f" insetLeft: {left - 30}, insetRight: {CARD_W - right - 30}}})]}});"
           f" NAV.plot('#tarea', {{{common}, marks: [NAV.defs({json.dumps(grad)}), Plot.areaY(pts, {{x: 'i', y: 'v', fill: 'url(#ag)', curve: 'monotone-x'}})]}});"
           f" NAV.plot('#tline', {{{common}, marks: [Plot.lineY(pts, {{x: 'i', y: 'v', stroke: {json.dumps(INK)}, strokeWidth: {STROKE},"
@@ -788,8 +824,11 @@ def _trend_line(card: Card, accent: str, ph: int) -> Chart:
              '<div class="lyr" id="tdots"></div>']
     times = [_at(card, r.reveal_at, 0.55 + 0.6 * k) for k, r in enumerate(card.rows)]
     for k, (row, x, y) in enumerate(zip(card.rows, xs, ys)):
-        parts.append(f'<div class="pv num" id="pv{k}" style="left:{x:.0f}px;top:{y - 70:.0f}px;color:{accent if row.highlight else INK}">'
-                     f'{_roll(m, row.value, times[k] + 0.05, align="center")}</div>'
+        value = _roll(m, row.value, times[k] + 0.05, align="center")
+        if row.highlight:  # Round 33: the point that matters wears a price-tag callout (TradingView)
+            value = f'<span class="bdg" style="background:{accent}">{value}</span>'
+        parts.append(f'<div class="pv num" id="pv{k}" style="left:{x:.0f}px;top:{y - (78 if row.highlight else 70):.0f}px;'
+                     f'color:{CARD_BG if row.highlight else INK}">{value}</div>'
                      f'<div class="px axis" id="px{k}" style="left:{x:.0f}px">{_e(row.label)}</div>')
     m.wipe_x("#tbase", FIRST, FIRST + 0.5, left - 30, right + 31)
     for k, t in enumerate(times):
@@ -1382,8 +1421,23 @@ window.NAV = (() => {
     const places = (m.split('.')[1] || '').length; let s = (parseFloat(m.replace(/,/g, '')) * p).toFixed(places);
     if (m.includes(',')) { const [i, f] = s.split('.'); s = i.replace(/\B(?=(\d{3})+(?!\d))/g, ',') + (f !== undefined ? '.' + f : ''); }
     return s; });
-  const rolls = t => { for (const el of document.querySelectorAll('[data-roll]'))
-    el.textContent = rollText(el.dataset.roll, prog(t, +el.dataset.t0, +el.dataset.t1)); };
+  // Round 33: odometer digits (NumberFlow). Each digit of a number is its own column of
+  // 0-9 that rolls up to its value (the digits a beat apart, left to right), while the
+  // text itself stays the final value: the width never changes and nothing shifts.
+  const odometer = el => {
+    if (el.dataset.odo) return; el.dataset.odo = '1';
+    const text = el.textContent; el.textContent = '';
+    for (const ch of text) {
+      if (/\d/.test(ch)) { const d = document.createElement('span'); d.className = 'od'; d.dataset.d = ch; d.textContent = ch;
+        el.append(d); } else el.append(document.createTextNode(ch)); }
+    for (const d of el.querySelectorAll('.od')) {
+      d.style.setProperty('--h', d.getBoundingClientRect().height + 'px'); }
+  };
+  const rolls = t => { for (const el of document.querySelectorAll('[data-roll]')) {
+    const t0 = +el.dataset.t0, t1 = +el.dataset.t1, cells = el.querySelectorAll('.od');
+    if (!cells.length) { el.textContent = rollText(el.dataset.roll, prog(t, t0, t1)); continue; }
+    cells.forEach((d, i) => { const p = prog(t, t0 + 0.035 * i, t1); d.style.setProperty('--y', (+d.dataset.d * p).toFixed(4)); });
+  } };
   const alpha = (hex, a) => { const h = hex.replace('#', ''); const n = parseInt(h, 16);
     return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${Math.max(0, Math.min(1, a))})`; };
   const plot = (sel, opts) => { opts = Object.assign({margin: 0, style: 'overflow: visible; background: transparent;'}, opts);
@@ -1393,7 +1447,7 @@ window.NAV = (() => {
   const defs = markup => () => { const d = document.createElementNS('http://www.w3.org/2000/svg', 'defs'); d.innerHTML = markup; return d; };
   const tag = (svg, cls, prefix, single) => svg.querySelectorAll('g.' + cls + ' > *').forEach((el, i) => { el.id = single ? prefix : prefix + i; });
   const builds = [], hooks = []; let paint = false;
-  return {ease, prog, rollText, rolls, alpha, plot, defs, tag, builds, hooks,
+  return {ease, prog, rollText, rolls, odometer, alpha, plot, defs, tag, builds, hooks,
           onBuild: f => builds.push(f), onFrame: f => hooks.push(f), canvas: () => { paint = true; }, needsPaint: () => paint};
 })();
 window.seekToFrame = async (frameIndex, fps) => {
@@ -1425,7 +1479,8 @@ _SETUP = """async (tracks) => {
   for (const el of document.querySelectorAll('.fit')) if (el.scrollWidth > el.clientWidth + 1) over.push(el.textContent);
   for (const el of document.querySelectorAll('.fitv')) if (tall(el)) over.push(el.textContent);
   for (const el of document.querySelectorAll('[data-roll]')) {  // a rolling number keeps its final width: nothing shifts
-    el.style.display = 'inline-block'; el.style.minWidth = el.offsetWidth + 'px'; el.style.textAlign = el.dataset.align; }
+    el.style.display = 'inline-block'; el.style.minWidth = el.offsetWidth + 'px'; el.style.textAlign = el.dataset.align;
+    NAV.odometer(el); }
   for (const t of tracks) document.querySelectorAll(t.sel).forEach(el => {
     const a = el.animate(t.kf, {duration: t.ms, fill: 'both'}); a.pause(); a.currentTime = 0; });
   return over;
@@ -1475,6 +1530,11 @@ def _split_scene(card: Card, brand: BrandKit) -> tuple[str, str, str, Motion, tu
     fx, fy = chart.focal or (CARD_W / 2, plot_h / 2)
     glow = f'<div class="glow" id="glow" style="left:{fx - 320:.0f}px;top:{fy - 320:.0f}px"></div>'
     m.tween("#glow", "opacity", FIRST, FIRST + 0.8, "0", "1")
+    # Round 33 (Magic UI / Aceternity): a soft spotlight from the top left, and one beam of
+    # light running along the card's top edge as it lands. Once, then still.
+    m.tween("#beam", "transform", FIRST, FIRST + 1.1, "translateX(-260px)", f"translateX({CARD_W}px)", EASE_OUT_EXIT)
+    m.tween("#beam", "opacity", FIRST, FIRST + 0.15, "0", "1")
+    m.tween("#beam", "opacity", FIRST + 0.9, FIRST + 1.1, "1", "0")
     css = _card_css(accent, header_h, plot_h, footer) + chart.css
     foot = ""
     if context:
@@ -1483,7 +1543,7 @@ def _split_scene(card: Card, brand: BrandKit) -> tuple[str, str, str, Motion, tu
         m.merge(extra)
     elif footer:
         foot = chart.key
-    body = (f'<div class="card">{GRAIN}<div class="hdr">{"".join(header)}</div><div class="plot"><div class="dots"></div>'
+    body = (f'<div class="card">{GRAIN}<div class="spot"></div><div class="beam" id="beam"></div><div class="hdr">{"".join(header)}</div><div class="plot"><div class="dots"></div>'
             f'{glow}{chart.body}</div><div class="ftr">{foot}</div><div class="rim"></div></div>')
     return css, body, chart.js, m, chart.libs
 
@@ -1507,6 +1567,64 @@ def scene(card: Card, brand: BrandKit) -> tuple[str, Motion, int, int, int]:
             f"<script>{RUNTIME}</script>{_scripts(libs)}</head><body><div class='stage'>{body}</div>"
             f"<script>{script}</script></body></html>")
     return page, motion, width, height, top
+
+
+def _lead(card: Card) -> float:
+    """How long after the card starts its first item comes in: a chart's once its panel has
+    landed; an overlay's at once."""
+    return FIRST + 0.1 if MODES[card.template] == "split" else 0.12
+
+
+def pace_reveals(card: Card) -> None:
+    """Round 33 (mutates ``card``): the card starts as its first item is said (no empty card
+    waiting for its words), and every item starts coming in within BUILD_SECONDS of the
+    first, in the order said (a list said slowly is drawn in quicker than it's said, so the
+    finished graphic can hold still long enough to read). Items with no time of their own
+    come in a beat after the one before. A context layer follows the last item."""
+    from core.card_checks import BUILD_SECONDS
+
+    rows = card.rows
+    if not rows or card.template == "speaker_title":
+        return
+    lead = _lead(card)
+    known = [t for row in rows for t in (row.reveal_at, row.reveal_to) if t is not None]
+    first = min(known) if known else card.start + lead
+    if first - card.start > lead:
+        card.start = round(first - lead, 3)
+    base = max(first, card.start + lead)
+    span = (max(known) - first) if known else 0.0
+    squeeze = min(1.0, BUILD_SECONDS / span) if span > 1e-9 else 1.0
+
+    def paced(t: float) -> float:
+        return round(base + (t - first) * squeeze, 3)
+
+    previous = None
+    for row in rows:
+        if row.reveal_at is None:
+            row.reveal_at = round(min(base + BUILD_SECONDS, (previous if previous is not None else base - 0.25) + 0.25), 3)
+        else:
+            row.reveal_at = paced(row.reveal_at)
+        if row.reveal_to is not None:
+            row.reveal_to = max(paced(row.reveal_to), row.reveal_at + 0.25)
+        previous = row.reveal_to if row.reveal_to is not None else row.reveal_at
+    if card.context.get("reveal") is not None:
+        card.context["reveal"] = round(max(t for row in rows for t in (row.reveal_at, row.reveal_to) if t is not None)
+                                       + 0.4, 3)
+
+
+def settle_time(card: Card) -> float:
+    """Seconds from the card's start until nothing in it moves any more (its way out not
+    counted): what the hold is measured from."""
+    try:
+        if MODES[card.template] == "overlay":
+            motion = OVERLAYS[card.template](card, BrandKit().accent)[2]
+        elif card.template == "candlestick_ema" and not Path(card.data_path).is_file():
+            return 2.6
+        else:
+            motion = _split_scene(card, BrandKit())[3]
+        return round(motion.last(), 3)
+    except Exception:  # noqa: BLE001 - a card the builder can't draw is caught at render time
+        return _lead(card) + 1.0 + ROLL
 
 
 def compact(card: Card) -> Card | None:

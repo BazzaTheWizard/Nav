@@ -12,11 +12,17 @@ that person speaks.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
+import re
 import subprocess
+import tempfile
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
 import cv2
 import numpy as np
 
@@ -236,3 +242,124 @@ def mouth_activity(
     window = max(1, int(MOUTH_FPS))
     kernel = np.ones(window) / window
     return np.stack([np.convolve(per_face[:, k], kernel, "same") for k in range(len(faces))], axis=1)
+
+
+# --- Round 33: who is speaking, and who is who --------------------------------------------
+# A light active-speaker check in the spirit of LR-ASD / TalkNet (no extra model): while a
+# person talks, their mouth moves far more than their forehead; head and camera motion move
+# both alike, so the ratio of the two is what tells a speaker from a listener.
+SPEAKING_RATIO = 1.15  # mouth motion this many times the forehead's (plus a noise floor): talking
+SPEAKING_SHARE = 0.4  # ...in at least this share of the window's frames (an animated talker moves his head a lot)
+
+
+def speaking_share(source: str | Path, start: float, end: float, face: tuple[float, float, float]) -> float | None:
+    """The share of [start, end] in which this face (source pixels: centre x, centre y,
+    width) is talking, from its mouth moving against its forehead; None when it can't be
+    measured (too short, the face too small, or the frames can't be read)."""
+    cx, cy, w = face
+    if w < 24:
+        return None
+    # mouth_activity crops at cy + 0.30 w: the forehead box is the same crop moved up.
+    activity = mouth_activity(source, start, end, [(cx, cy, w), (cx, cy - 0.78 * w, w)])
+    if activity is None or activity.shape[0] < 4:
+        return None
+    mouth, brow = activity[:, 0], activity[:, 1]
+    return float(np.mean(mouth > SPEAKING_RATIO * (brow + 0.5)))
+
+
+def is_speaking(source: str | Path, start: float, end: float, face: tuple[float, float, float]) -> bool | None:
+    share = speaking_share(source, start, end, face)
+    return None if share is None else share >= SPEAKING_SHARE
+
+
+def solo_people(source: str | Path, duration: float, frame_width: int) -> list[tuple[tuple[float, ...], int]]:
+    """(face feature, solo frames seen) of each person seen alone across the video, most seen
+    first; empty when the faces can't be read."""
+    groups, _solos = _solo_groups(source, duration, frame_width)
+    return [(_mean(group), len(group)) for group in groups]
+
+
+def _people_dir() -> Path:
+    if os.getenv("NAV_PEOPLE_DIR"):
+        return Path(os.environ["NAV_PEOPLE_DIR"])
+    if os.getenv("NAV_NO_CLIP_PAGES") == "1":  # tests never write to your real face memory
+        return Path(tempfile.gettempdir()) / f"nav-people-{os.getpid()}"
+    return PROJECT_ROOT / "storage" / "people"
+
+
+def _channel_file(channel: str) -> Path | None:
+    slug = re.sub(r"[^a-z0-9]+", "-", channel.lower()).strip("-")
+    return _people_dir() / f"{slug[:80]}.json" if slug else None
+
+
+def remember_people(channel: str, video_key: str, people: list[tuple[tuple[float, ...], int]]) -> None:
+    """Keep this video's solo faces under its channel (storage/people/<channel>.json): the
+    face that comes back video after video on one channel is its host."""
+    path = _channel_file(channel)
+    if path is None or not video_key or not people:
+        return
+    try:
+        data = json.loads(path.read_text()) if path.is_file() else {}
+    except (OSError, ValueError):
+        data = {}
+    videos = data.get("videos") if isinstance(data.get("videos"), dict) else {}
+    videos[video_key] = [{"face": [round(v, 5) for v in face], "seen": seen} for face, seen in people[:4]]
+    if len(videos) > 40:  # the newest 40 videos are plenty
+        videos = dict(list(videos.items())[-40:])
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"channel": channel, "videos": videos}))
+        temporary.replace(path)
+    except OSError:
+        logger.warning("Could not save the channel's faces.", exc_info=True)
+
+
+def recurring_faces(channel: str, video_key: str, people: list[tuple[tuple[float, ...], int]]) -> list[tuple[float, ...]]:
+    """This video's faces that were also seen alone in another video of the channel (the
+    host comes back; guests don't)."""
+    path = _channel_file(channel)
+    if path is None or not path.is_file():
+        return []
+    try:
+        videos = json.loads(path.read_text()).get("videos") or {}
+    except (OSError, ValueError, AttributeError):
+        return []
+    others = [tuple(entry["face"]) for key, faces in videos.items() if key != video_key
+              for entry in faces if isinstance(entry, dict) and entry.get("face")]
+    return [face for face, _seen in people if any(similarity(face, other) >= SAME_PERSON for other in others)]
+
+
+_INTRO = re.compile(r"\b(?:i'?m|i am|my name is|my name's|this is)\s+([a-z][a-z'\-]+)(?:\s+([a-z][a-z'\-]+))?")
+
+
+def introductions(words: list[Any], names: list[str]) -> list[tuple[str, float]]:
+    """(name, when) for each speaker who introduces themself in the video ("I'm Steve",
+    "my name is Michael Tanguma", "this is Steve Eisman"), in source seconds."""
+    if not words or not names:
+        return []
+    tokens = [re.sub(r"[^a-z'\-]", "", str(w.text).lower()) for w in words]
+    text, starts, at = "", [], 0
+    for token, word in zip(tokens, words):
+        starts.append((len(text), float(word.start)))
+        text += token + " "
+    found: list[tuple[str, float]] = []
+    for match in _INTRO.finditer(text):
+        said = [part for part in match.groups() if part]
+        for name in names:
+            parts = [p.lower() for p in re.findall(r"[A-Za-z'\-]+", name)]
+            if parts and said[0] == parts[0] and (len(said) < 2 or len(parts) < 2 or said[1] == parts[1]
+                                                  or said[1] not in {p.lower() for n in names for p in n.split()}):
+                at = next((t for pos, t in reversed(starts) if pos <= match.start(1)), 0.0)
+                found.append((name, at))
+    return found
+
+
+def face_while(source: str | Path, start: float, frame_width: int) -> tuple[float, ...] | None:
+    """The one face on screen just after ``start`` (two samples, the same person alone in
+    both), or None."""
+    seen = faces_at(source, [start + 0.3, start + 1.0], frame_width)
+    if len(seen) == 2 and all(len(faces) == 1 for faces in seen) \
+            and similarity(seen[0][0].feature, seen[1][0].feature) >= SAME_PERSON:
+        return _mean([seen[0][0], seen[1][0]])
+    return None

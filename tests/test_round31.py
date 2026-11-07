@@ -214,7 +214,10 @@ def frame_hashes(template, order):
         for k in order:
             view.evaluate(C._SEEK, [k, C.FPS])
             out[k] = np.array(Image.open(__import__("io").BytesIO(view.screenshot(omit_background=True)))).astype(np.int16)
-        rolled = view.evaluate("() => [...document.querySelectorAll('[data-roll]')].map(e => e.textContent)")
+        # Round 33: odometer digits: what shows is each digit column's position (the text stays the final value)
+        rolled = view.evaluate("() => [...document.querySelectorAll('[data-roll]')].map(e => [...e.childNodes].map(n =>"
+                               " n.classList && n.classList.contains('od') ? String(Math.round(+getComputedStyle(n)"
+                               ".getPropertyValue('--y') || 0) % 10) : n.textContent).join(''))")
         browser.close()
     return out, requests, rolled
 
@@ -245,7 +248,7 @@ if "metric_bars" in good:
           and all(ok for ok, _ in results), str([d for ok, d in results if not ok]))
 
 # ---------- numbers roll up as they're said ----------
-_h, _r, mid_roll = frame_hashes("metric_bars", [int((0.9 + 0.3) * 30)])
+_h, _r, mid_roll = frame_hashes("metric_bars", [int((0.9 + 0.1) * 30)])
 _h, _r, end_roll = frame_hashes("metric_bars", [int(3.5 * 30)])
 check("Numbers roll up to their value from the word where they're said, then hold it exactly",
       end_roll == ["$4.2M", "$1.1M", "$0.9M–$1.3M"] and mid_roll[0] != "$4.2M" and re.fullmatch(r"\$\d\.\dM", mid_roll[0])

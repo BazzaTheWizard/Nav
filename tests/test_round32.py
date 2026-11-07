@@ -39,8 +39,6 @@ def check(name, cond, detail=""):
 
 import core.card_checks as K  # noqa: E402
 import core.graphics_director as G  # noqa: E402
-import core.name_cards as N  # noqa: E402
-import core.speaker_id as S  # noqa: E402
 from core.edl import MODES, TEMPLATES, Card, CardRow, ClipEdit  # noqa: E402
 from core.transcriber import Word  # noqa: E402
 
@@ -244,7 +242,9 @@ for (title, (start, text)), answer, expected in zip(CLIPS.items(), ANSWERS, EXPE
     check(f"\"{title}\": 1-2 Bento visuals, {G.BENTO_SPACING:g}+ s apart ({', '.join(c.template for c in bento)})",
           1 <= len(bento) <= 2 and all(g >= G.BENTO_SPACING for g in gaps) and expected <= {c.template for c in bento},
           " | ".join(direction.notes))
-    check("...a name card for each speaker, guest and host", sorted(names) == ["David George", "Jack Altman"], str(names))
+    # Round 33: without a crop plan nobody can see who is on screen, so no name card is guessed
+    check("...no face track here: no name card is guessed (Round 33)", names == []
+          and any("no face track" in note for note in direction.notes), str(names))
     check("...and every graphic passes the renderer's own check", all(r.ok for r in K.check_edit(direction.edit, spoken, 4.0)))
     made.append(direction)
 autonomy = next(c for c in made[0].edit.cards if c.template == "metric_bars")
@@ -303,58 +303,8 @@ check("...but the host whose name is the channel's is a speaker (\"Lex Fridman\"
       G.grounded_name({"name": "Lex Fridman", "role": "Host", "kind": "host"}, G.VideoInfo(channel="Lex Fridman"))
       == ("Lex Fridman", "Host"))
 
-GUEST_FACE, HOST_FACE = (1.0, 0.0), (0.0, 1.0)
-
-
-def solo(start, end):
-    return N.Option(start, end, "solo", (540, 850, 240), N.FULL_REGION, 1.0, 1150)
-
-
-def panel(start, end):
-    return N.Option(start, end, "panel", (515, 1392, 375), N.BOTTOM_PANEL, N.PANEL_SCALE, N.BOTTOM_PANEL[0])
-
-
-def plan_cards(shots_by_face, split=False, people=(GUEST_FACE, HOST_FACE), taken=()):
-    plan = SimpleNamespace(frame_width=1920, shots=[SimpleNamespace(start=100.0, end=140.0, group=False)],
-                           split_view=lambda a, b: SimpleNamespace(windows=[(0.0, b - a, 0, 0, 0, 0)]) if split else None)
-    real = (N.options, S.people_faces, S.video_duration)
-    N.options = lambda source, plan_, a, b, guest, fallback_x=None: list(shots_by_face.get(guest, []))
-    S.people_faces = lambda source, duration, width, most=2: list(people)[:most]
-    S.video_duration = lambda source: 600.0
-    try:
-        return N.plan_name_cards("x.mp4", plan, 100.0, 140.0, 4.0, list(taken),
-                                 [G.Speaker("Jack Altman", "Host", "host"), G.Speaker("David George", "General Partner")])
-    finally:
-        N.options, S.people_faces, S.video_duration = real
-
-
-cards, notes = plan_cards({GUEST_FACE: [solo(100.0, 112.0)], HOST_FACE: [solo(114.0, 124.0)]})
-when = {c.rows[0].label: round(c.start, 2) for c in cards}
-check("A clip that opens on the guest's solo shot: their card right after the title (4.2 s)",
-      when.get("David George") == 104.2, str(when))
-check("...the host's on the first time the camera is on them alone (14.3 s)", when.get("Jack Altman") == 114.3, str(when))
-cards, notes = plan_cards({GUEST_FACE: [solo(115.0, 125.0)], HOST_FACE: [panel(100.0, 115.0)]}, split=True)
-when = {c.rows[0].label: round(c.start, 2) for c in cards}
-check("The guest's first solo shot is later (15 s): their card then; the host, never alone, right after the title",
-      when == {"David George": 115.3, "Jack Altman": 104.2}, f"{when} {notes}")
-cards, notes = plan_cards({GUEST_FACE: [panel(100.0, 140.0)], HOST_FACE: [panel(100.0, 140.0)]}, split=True)
-when = [(c.rows[0].label, round(c.start, 2), round(c.end, 2)) for c in cards]
-check("A clip that stays in the split: the cards one after the other, right after the title (guest first)",
-      when == [("David George", 104.2, 107.5), ("Jack Altman", 107.8, 111.1)], str(when))
-check("...each in their own panel of the split", all(c.place and float(c.place.split(",")[2]) < 1 for c in cards),
-      str([c.place for c in cards]))
-check("Two speakers' cards back to back pass the checks (a 0.3 s gap between name cards)",
-      all(r.ok for r in K.check_edit(ClipEdit(100.0, 140.0, cards=cards), [], 4.0)))
-cards, notes = plan_cards({GUEST_FACE: [solo(100.0, 140.0)]})
-check("A speaker whose face is known but who is never on screen in this clip gets no card",
-      [c.rows[0].label for c in cards] == ["David George"] and any("aren't on screen" in n for n in notes), str(notes))
-cards, notes = plan_cards({}, people=())
-check("Faces can't be matched: every speaker still gets a card, right after the title",
-      [c.rows[0].label for c in cards] == ["David George", "Jack Altman"], str(notes))
-chart = Card("metric_bars", 104.0, 112.0, rows=[CardRow("a", "1"), CardRow("b", "2")])
-cards, _ = plan_cards({GUEST_FACE: [panel(100.0, 140.0)], HOST_FACE: [panel(100.0, 140.0)]}, split=True, taken=[chart])
-check("Name cards keep clear of a Bento visual (never on top of a chart)",
-      all(c.start >= chart.end + K.MIN_GAP for c in cards), str([(c.rows[0].label, c.start) for c in cards]))
+# Round 33: where and when name cards go is checked in test_round33 (identity first, then a
+# verified talking moment on the speaker's own shot; no 'right after the title' fallback).
 two = [Card("speaker_title", 104.2, 107.5, rows=[CardRow("David George")]),
        Card("speaker_title", 107.8, 111.1, rows=[CardRow("Jack Altman")]),
        Card("kinetic_range", 113.0, 116.0, rows=[CardRow("", "1")]), Card("kinetic_range", 126.0, 129.0, rows=[CardRow("", "2")])]

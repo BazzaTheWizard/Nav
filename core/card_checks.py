@@ -25,8 +25,12 @@ from typing import Any
 
 from core.edl import MODES, Card, ClipEdit
 
-MIN_CARD_SECONDS = 2.5  # shorter than this, a chart is gone before anyone reads it
-MIN_OVERLAY_SECONDS = 2.0
+MIN_CARD_SECONDS = 5.0  # Round 33: a chart is on screen 5-6 s (shorter, it is gone before anyone reads it)
+MIN_OVERLAY_SECONDS = 4.5  # a number or boxes over the speaker: 4.5-6 s
+BUILD_SECONDS = 1.0  # every item of a graphic starts coming in within this long of the first
+READ_HOLD = 3.5  # ...then the finished graphic holds completely still at least this long
+BENTO_MAX_SECONDS = 6.0  # and leaves: no graphic outstays what there is to read
+EXIT_SECONDS = 0.4  # the way out (an overlay fades and slides, a chart's panel slides down)
 HOOK_SECONDS = 3.0  # the first seconds stay full-screen: the hook is the speaker
 PAYOFF_SECONDS = 2.0  # the clip ends full-screen too, on the speaker's punchline
 MAX_CARDS = 2  # charts (split view) per clip (Round 30: was 1)
@@ -44,8 +48,7 @@ _NUMBER_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight",
 MIN_GAP = 1.5  # seconds of plain video between two graphics
 RECAP_SECONDS = 3.0  # a number said in the hook can come back right after the title, as a recap
 LINE_LOOKBACK = 8.0  # the line under a number may quote words said this long before it
-OVERLAY_HOLD = 2.6  # a number or box graphic leaves this long after its last item comes in
-MAX_OVERLAY_SECONDS = 5.0  # ...and is never up longer than this (it covers the speaker)
+MAX_OVERLAY_SECONDS = BENTO_MAX_SECONDS  # a graphic over the speaker is never up longer than this
 LIMITS = {"eyebrow": 30, "headline": 30, "label": 26, "value": 14, "footnote": 58, "box": 20, "detail": 30,
           "context": 44, "name": 28, "role": 42}
 _ASIDES = {"dunno", "guess", "maybe", "like", "whatever"}  # "I dunno, five, six months?": an aside, not evidence
@@ -495,6 +498,38 @@ def _check_change(row: Any, window: list[Any], tokens: list[str], numbers: list[
 
 def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
                hook_seconds: float = HOOK_SECONDS) -> CardCheck:
+    """Check one card (see _check_card), then pace it (Round 33): a data graphic comes in as
+    its first item is said, builds within BUILD_SECONDS, holds still READ_HOLD seconds and is
+    on screen MIN_OVERLAY_SECONDS / MIN_CARD_SECONDS to BENTO_MAX_SECONDS."""
+    result = _check_card(card, words, clip_start, clip_end, hook_seconds)
+    if result.ok and card.template != "speaker_title":
+        pace(card, clip_end, result.errors)
+    return result
+
+
+def pace(card: Card, clip_end: float, errors: list[str]) -> None:
+    """Round 33's reading pace for a data graphic (mutates ``card``): never an empty card
+    waiting for its words (it comes in as its first item is said), every item in within
+    BUILD_SECONDS (later ones are drawn in sooner, in the order said), then everything still
+    for READ_HOLD seconds before it leaves. Its length follows: 4.5-6 s."""
+    from core.cards import pace_reveals, settle_time  # the renderer knows when its motion ends
+
+    overlay = MODES.get(card.template) == "overlay"
+    said = [t for row in card.rows for t in (row.reveal_at, row.reveal_to) if t is not None]
+    last_said = max(said, default=card.start)  # stays on screen until its last number is said: a second check agrees
+    pace_reveals(card)
+    settled = settle_time(card)  # seconds from card.start until nothing in it moves
+    shortest = MIN_OVERLAY_SECONDS if overlay else MIN_CARD_SECONDS
+    needed = max(shortest, settled + READ_HOLD + EXIT_SECONDS)
+    card.end = round(max(card.start + max(needed, min(card.end - card.start, BENTO_MAX_SECONDS)),
+                         min(card.end, last_said + 0.3)), 3)
+    if card.end > clip_end - PAYOFF_SECONDS + 1e-6:
+        errors.append(f"Needs {needed:.1f} s on screen to be read (built by {settled:.1f} s, then "
+                      f"{READ_HOLD:g} s still), and that runs into the last {PAYOFF_SECONDS:.0f} s: move it earlier.")
+
+
+def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
+                hook_seconds: float = HOOK_SECONDS) -> CardCheck:
     """Check one card against what was said, and set each item's ``reveal_at`` (and a
     range's ``reveal_to``) to the word where it's said. Errors stop the card; warnings
     are for you to look at. ``hook_seconds``: how long the opening stays clear (at least
@@ -502,9 +537,7 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
     result = CardCheck()
     errors = result.errors
     overlay = MODES.get(card.template) == "overlay"
-    shortest = MIN_OVERLAY_SECONDS if overlay else MIN_CARD_SECONDS
-    if card.end - card.start < shortest:
-        errors.append(f"On screen {card.end - card.start:.1f} s; this needs at least {shortest} s.")
+    # How long it stays is set by pace() (Round 33): long enough to read, from what it shows.
     hook = max(HOOK_SECONDS, hook_seconds)
     if card.template == "kinetic_range" and card.start < clip_start + hook < card.end - MIN_OVERLAY_SECONDS:
         # Said under the title (the hook): the number comes in right after the title,
@@ -575,7 +608,6 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
                 if rows[0].reveal_to < rows[0].reveal_at + 0.3:
                     rows[0].reveal_to = rows[0].reveal_at + 0.6
             card.start = max(card.start, rows[0].reveal_at - 0.12)
-            _hold_overlay(card, rows, errors)
         return result
     if card.template == "drawdown_curve":
         _check_drawdown(rows, window, tokens, numbers, errors)
@@ -689,7 +721,6 @@ def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
         first = min((row.reveal_at for row in rows if row.reveal_at is not None), default=card.start)
         # No empty frames: an overlay starts exactly as its first item comes in.
         card.start = max(card.start, first - 0.12)
-        _hold_overlay(card, rows, errors)
     return result
 
 
@@ -913,16 +944,6 @@ def _check_drawdown(rows: list[Any], window: list[Any], tokens: list[str], numbe
         keys = [_clean(word) for word in recovery.label.split() if len(_clean(word)) >= 3]
         after = [w for w in window if float(w.start) > fall.reveal_at and _clean(w.text) in keys]
         recovery.reveal_at = max(float(after[0].start) if after else fall.reveal_at + 1.2, fall.reveal_at + 0.8)
-
-
-def _hold_overlay(card: Card, rows: list[Any], errors: list[str]) -> None:
-    """A number or box graphic covers the speaker, so it stays only as long as it's needed:
-    OVERLAY_HOLD after its last item comes in, never over MAX_OVERLAY_SECONDS."""
-    last = max((t for row in rows for t in (row.reveal_at, row.reveal_to) if t is not None), default=card.start)
-    longest = max(MAX_OVERLAY_SECONDS, last - card.start + 1.5)  # boxes said slowly still get 1.5 s each
-    card.end = min(card.end, max(last + OVERLAY_HOLD, card.start + MIN_OVERLAY_SECONDS), card.start + longest)
-    if card.end - card.start < MIN_OVERLAY_SECONDS:
-        errors.append(f"Only {card.end - card.start:.1f} s after the first item appears; extend the end.")
 
 
 def _shape_checks(card: Card, errors: list[str]) -> None:

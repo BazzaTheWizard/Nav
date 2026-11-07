@@ -243,8 +243,9 @@ answers = iter([{"graphics": [], "speaker": {"name": "Jonathan Bragdon", "role":
                 {"graphics": [], "speaker": None}])
 first = G.direct(words, 100.0, 139.0, info=INFO, hook_seconds=4.0, ask=lambda p, s: json.dumps(next(answers)))
 second = G.direct(words, 100.0, 139.0, info=INFO, hook_seconds=4.0, ask=lambda p, s: json.dumps(next(answers)))
-check("Every clip of the video gets the guest's name, even when the AI leaves it out for one clip",
-      any(c.template == "speaker_title" for c in second.edit.cards), str(second.notes))
+check("Every clip of the video keeps the guest's name, even when the AI leaves it out for one clip",
+      "Jonathan Bragdon" in [s.name for s in G._GUESTS.get((INFO.title, INFO.channel), [])]
+      and any("no face track" in n for n in second.notes), str(second.notes))
 check("...and never the host's", G.grounded_name({"name": "Decile Group", "role": ""}, INFO) is None)
 
 # ---------- calm captions sit on the seam in a two-person split ----------
