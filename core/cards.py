@@ -98,11 +98,9 @@ LIBRARIES = {
 }
 MIN_CONTRAST = 4.5  # WCAG AA for text
 EASE = "cubic-bezier(0.16, 1, 0.3, 1)"  # entrances: fast in, long gentle settle
-EASE_IN = "cubic-bezier(0.55, 0, 0.75, 0.2)"  # accelerating
 EASE_OUT_EXIT = "cubic-bezier(0.65, 0, 0.35, 1)"  # exits: damped ease-in-out, no snap at either end
 POP = "cubic-bezier(0.34, 1.56, 0.64, 1)"  # points popping in, a touch of overshoot
 EXIT = 0.4  # seconds (12 frames): over-the-speaker graphics slide and fade out over their last 0.4 s
-LAND = 0.4  # the panel's move (core.dynamic_layout.MOVE): a split chart's card rides in with it
 FIRST = 0.35  # nothing inside the card starts before this (it would draw while the panel slides)
 ROLL = 0.8  # seconds a number takes to roll up to its value
 
@@ -323,7 +321,8 @@ def _kinetic_range(card: Card, accent: str) -> tuple[str, str, Motion]:
     t = _rel(card, row.reveal_at, 0.0)
     joiner = "→" if change else "–"
     t2 = max(t + 0.25, _rel(card, row.reveal_to, t + 0.5)) if second else t
-    rest = (f'<span class="rest"><span class="dash">{joiner}</span><span>{_roll(m, second, t2, align="left")}</span></span>'
+    rest = (f'<span class="rest" style="display:inline-flex;gap:22px;align-items:baseline"><span class="dash">{joiner}</span>'
+            f'<span>{_roll(m, second, t2, align="left")}</span></span>'
             if second else "")
     body = (f'<div class="scrim"></div><div class="wrap"><div class="nums num fit"><span class="a">'
             f'{_roll(m, first, t, align="right" if second else "center")}</span>{rest}</div>'
@@ -586,21 +585,24 @@ def _bar_rows(card: Card, accent: str, m: Motion, ph: int, times: list[float]) -
     (a range drawn solid to its low end and hatched to its high end). Plot draws the bars
     on a linear scale from zero to the largest value."""
     n = len(card.rows)
-    block = 88  # label line 52 + gap 14 + bar 22
-    pitch = min(170.0, (ph - 70) / n)
+    big = n <= 3  # Round 33: two or three bars get thicker bars and bigger type (no thin lines in an empty card)
+    bar = 34 if big else 22
+    block = 66 + bar  # label line 52 + gap 14 + the bar
+    pitch = min(190.0 if big else 170.0, (ph - 70) / n)
     top = (ph - ((n - 1) * pitch + block)) / 2
     ys = [top + k * pitch for k in range(n)]
     peak = _top(card)
-    value_w = max(len(row.value) for row in card.rows) * 28 + 32  # JetBrains Mono at 46px: 28 px a character
+    value_px = 54 if big else 46
+    value_w = max(len(row.value) for row in card.rows) * round(value_px * 0.6) + 32  # JetBrains Mono: 0.6 em a character
     data, labels = [], []
     for k, row in enumerate(card.rows):
         numbers = parse_value(row.value).numbers or [0.0]
         low, high = min(numbers), max(numbers)
-        data.append({"y": round(ys[k] + 66, 1), "low": low, "high": high,
+        data.append({"y": round(ys[k] + 66, 1), "h": bar, "low": low, "high": high,
                      "solid": accent if row.highlight else LIGHT, "hatch": f"url(#hatch{1 if row.highlight else 0})"})
         labels.append(f'<div class="lab fit" id="l{k}" style="left:{PAD}px;top:{ys[k]:.0f}px;width:{IW - value_w}px;'
-                      f'color:{INK if row.highlight else SOFT}">{_e(row.label)}</div>'
-                      f'<div class="val num" id="v{k}" style="right:{PAD}px;top:{ys[k] - 3:.0f}px;'
+                      f'color:{INK if row.highlight else SOFT}{";font-size:40px" if big else ""}">{_e(row.label)}</div>'
+                      f'<div class="val num" id="v{k}" style="right:{PAD}px;top:{ys[k] - 3:.0f}px;font-size:{value_px}px;'
                       f'color:{accent if row.highlight else INK}">{_roll(m, row.value, times[k])}</div>')
     hatch = (f'<pattern id="hatch0" patternUnits="userSpaceOnUse" width="7" height="7" patternTransform="rotate(45)">'
              f'<rect width="3" height="7" fill="rgba(230,233,238,.6)"/></pattern>'
@@ -609,9 +611,9 @@ def _bar_rows(card: Card, accent: str, m: Motion, ph: int, times: list[float]) -
     js = (f"NAV.onBuild(() => {{ const rows = {_data(data)};"
           f" const svg = NAV.plot('#bars', {{width: {CARD_W}, height: {ph}, x: {{domain: [0, {peak}], range: [{PAD}, {CARD_W - PAD}]}},"
           f" y: {{type: 'identity'}}, color: {{type: 'identity'}}, marks: [NAV.defs({json.dumps(hatch)}),"
-          f" Plot.rect(rows, {{x1: 0, x2: {peak}, y1: 'y', y2: d => d.y + 22, fill: {json.dumps(TRACK)}, className: 'trk'}}),"
-          f" Plot.rect(rows, {{x1: 0, x2: 'low', y1: 'y', y2: d => d.y + 22, fill: 'solid', className: 'sol'}}),"
-          f" Plot.rect(rows, {{x1: 'low', x2: 'high', y1: 'y', y2: d => d.y + 22, fill: 'hatch', className: 'rng'}})]}});"
+          f" Plot.rect(rows, {{x1: 0, x2: {peak}, y1: 'y', y2: d => d.y + d.h, rx: {bar // 4}, fill: {json.dumps(TRACK)}, className: 'trk'}}),"
+          f" Plot.rect(rows, {{x1: 0, x2: 'low', y1: 'y', y2: d => d.y + d.h, rx: {bar // 4}, fill: 'solid', className: 'sol'}}),"
+          f" Plot.rect(rows, {{x1: 'low', x2: 'high', y1: 'y', y2: d => d.y + d.h, fill: 'hatch', className: 'rng'}})]}});"
           + _plot_tags("svg", [("trk", "t"), ("sol", "s"), ("rng", "r")]) + " });")
     return '<div class="lyr" id="bars"></div>' + "".join(labels), js, ys
 
@@ -809,11 +811,14 @@ def _timeline(card: Card, accent: str, ph: int) -> Chart:
     n = len(card.rows)
     left, right, axis_y = PAD + 150, CARD_W - PAD - 150, ph * 0.5 + 10
     xs = [left + (right - left) * k / (n - 1) for k in range(n)]
+    big = n <= 3  # Round 33: two or three moments are set large
+    when_px, what_px = (76, 36) if big else (56, 32)
     css = f"""
-.when {{ position: absolute; top: {axis_y - 136:.0f}px; width: 320px; margin-left: -160px; text-align: center;
-  font-size: 56px; font-weight: 700; letter-spacing: -.03em; white-space: nowrap; }}
-.what {{ position: absolute; top: {axis_y + 56:.0f}px; width: 300px; margin-left: -150px; text-align: center;
-  font-size: 32px; font-weight: 500; line-height: 1.22; color: {SOFT}; max-height: 84px; overflow: hidden; }}
+.when {{ position: absolute; top: {axis_y - 60 - when_px * 1.36:.0f}px; width: 320px; margin-left: -160px; text-align: center;
+  font-size: {when_px}px; font-weight: 700; letter-spacing: -.04em; white-space: nowrap; }}
+.what {{ position: absolute; top: {axis_y + 60:.0f}px; width: 300px; margin-left: -150px; text-align: center;
+  font-size: {what_px}px; font-weight: 500; line-height: 1.22; color: {SOFT}; max-height: {what_px * 1.22 * 2 + 4:.0f}px;
+  overflow: hidden; }}
 """
     common = (f"width: {CARD_W}, height: {ph}, x: {{type: 'point', domain: d3.range({n}), range: [{left}, {right}], padding: 0}},"
               f" y: {{type: 'identity'}}")
@@ -1252,23 +1257,31 @@ def _comparison_card(card: Card, accent: str, ph: int) -> Chart:
     "Then we did, and it worked"). Each side lands on its words; the side the point is
     about (highlight, else the second) takes the accent and the other steps back."""
     main = next((k for k, row in enumerate(card.rows) if row.highlight), len(card.rows) - 1)
-    gap, top = 64, 30
+    gap, top = 64, 24
     side_w, side_h = (IW - gap) / 2, ph - 2 * top
+    # Round 33: a "then → now" contrast (the tags or headings say when) gets an arrow between
+    # the sides; "them vs us" keeps VS. Each side's words sit in its middle, not stacked at
+    # the top over an empty half, and a large faint numeral anchors each side.
+    words = {w for row in card.rows for w in re.findall(r"[a-z]+", f"{row.value} {row.label}".lower())}
+    temporal = bool(words & {"before", "after", "then", "now", "today", "old", "new", "was", "became", "used"})
     css = f"""
-.cmp {{ position: absolute; top: {top}px; width: {side_w:.0f}px; height: {side_h:.0f}px; border-radius: 16px;
-  border: 1px solid rgba(255,255,255,.10); background: rgba(255,255,255,.025); padding: 40px 34px 34px; }}
-.cmp .tag {{ display: inline-block; max-width: 100%; height: 46px; line-height: 44px; padding: 0 18px; border-radius: 23px;
+.cmp {{ position: absolute; top: {top}px; width: {side_w:.0f}px; height: {side_h:.0f}px; border-radius: 18px;
+  border: 1px solid rgba(255,255,255,.10); background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.012));
+  padding: 34px 34px 34px 38px; display: flex; flex-direction: column; justify-content: center; overflow: hidden; }}
+.cmp .tag {{ align-self: flex-start; max-width: 100%; height: 46px; line-height: 44px; padding: 0 18px; border-radius: 23px;
   border: 1px solid rgba(255,255,255,.18); font-size: 24px; font-weight: 650; color: {SOFT}; white-space: nowrap;
-  overflow: hidden; margin-bottom: 26px; }}
-.cmp .head {{ font-family: "Instrument Serif", Georgia, serif; font-size: 58px; line-height: 1.04; letter-spacing: -.01em;
-  max-height: 126px; overflow: hidden; }}
-.cmp .line {{ margin-top: 22px; font-size: 31px; font-weight: 500; line-height: 1.28; color: {SOFT}; max-height: 160px;
-  overflow: hidden; }}
+  overflow: hidden; margin-bottom: 28px; flex: none; }}
+.cmp .head {{ font-family: "Instrument Serif", Georgia, serif; font-size: 66px; line-height: 1.06; letter-spacing: -.012em;
+  max-height: 216px; overflow: hidden; flex: none; }}
+.cmp .line {{ margin-top: 24px; font-size: 32px; font-weight: 500; line-height: 1.3; color: {SOFT}; max-height: 168px;
+  overflow: hidden; flex: none; }}
+.cmp .ix {{ position: absolute; right: 22px; bottom: -18px; font-family: "Instrument Serif", Georgia, serif; font-size: 200px;
+  line-height: 1; color: rgba(255,255,255,.035); pointer-events: none; }}
 .cmp .edge {{ position: absolute; left: 0; top: 22px; bottom: 22px; width: 4px; border-radius: 2px; background: {accent};
   opacity: 0; }}
-.vs {{ position: absolute; left: {PAD + side_w + gap / 2 - 30:.0f}px; top: {ph / 2 - 30:.0f}px; width: 60px; height: 60px;
-  border-radius: 30px; background: {CARD_BG}; border: 1px solid {RULE}; color: {SOFT}; font-size: 20px; font-weight: 700;
-  letter-spacing: .08em; display: flex; align-items: center; justify-content: center; }}
+.vs {{ position: absolute; left: {PAD + side_w + gap / 2 - 32:.0f}px; top: {ph / 2 - 32:.0f}px; width: 64px; height: 64px;
+  border-radius: 32px; background: {CARD_BG}; border: 1px solid {RULE}; color: {SOFT}; font-size: {28 if temporal else 20}px;
+  font-weight: 700; letter-spacing: {0 if temporal else .08}em; display: flex; align-items: center; justify-content: center; }}
 """
     m = Motion()
     parts = []
@@ -1277,11 +1290,14 @@ def _comparison_card(card: Card, accent: str, ph: int) -> Chart:
         left = PAD + k * (side_w + gap)
         tag = f'<div class="tag num fit" id="ct{k}">{_e(row.value)}</div>' if row.value.strip() else ""
         line = f'<div class="line fitv">{_e(row.detail)}</div>' if row.detail.strip() else ""
-        parts.append(f'<div class="cmp" id="c{k}" style="left:{left:.0f}px"><div class="edge" id="ce{k}"></div>{tag}'
+        parts.append(f'<div class="cmp" id="c{k}" style="left:{left:.0f}px"><div class="ix">{k + 1:02d}</div>'
+                     f'<div class="edge" id="ce{k}"></div>{tag}'
                      f'<div class="head fitv" id="ch{k}">{_e(row.label)}</div>{line}</div>')
         m.fade_up(f"#c{k}", times[k], rise=18, length=0.45)
-    parts.append('<div class="vs" id="vs">VS</div>')
+    parts.append(f'<div class="vs" id="vs">{"→" if temporal else "VS"}</div>')
     m.tween("#vs", "opacity", times[0] + 0.2, times[0] + 0.5, "0", "1")
+    if temporal:
+        m.tween("#vs", "transform", times[-1] - 0.1, times[-1] + 0.35, "translateX(-8px)", "translateX(0px)")
     t = times[main] + 0.35
     m.tween(f"#c{main}", "borderColor", t, t + 0.3, "rgba(255,255,255,.10)", _rgba(accent, 0.55))
     m.tween(f"#c{main}", "backgroundColor", t, t + 0.3, "rgba(255,255,255,.025)", _rgba(accent, 0.08))
@@ -1298,15 +1314,16 @@ def _step_sequence(card: Card, accent: str, ph: int) -> Chart:
     """Round 32: the speaker's framework as 2-4 steps in the order said. A rail draws down
     from step to step as each one is said; the newest step is the active one."""
     n = len(card.rows)
-    pitch = min(176.0, (ph - 60) / n)
+    pitch = min(200.0 if n <= 3 else 176.0, (ph - 60) / n)
     top = (ph - pitch * n) / 2
     dot_x = PAD + 34
     text_x = PAD + 100
+    size = 60 if n <= 3 else 50  # Round 33: fewer steps, bigger type (the card's room is used)
     css = f"""
 .step {{ position: absolute; left: {text_x}px; right: {PAD}px; height: {pitch:.0f}px; display: flex; flex-direction: column;
   justify-content: center; }}
-.step .lbl {{ font-size: 48px; font-weight: 650; letter-spacing: -.015em; line-height: 1.08; white-space: nowrap; overflow: hidden; }}
-.step .dtl {{ margin-top: 8px; font-size: 30px; font-weight: 500; color: {SOFT}; white-space: nowrap; overflow: hidden; }}
+.step .lbl {{ font-size: {size}px; font-weight: 650; letter-spacing: -.02em; line-height: 1.08; white-space: nowrap; overflow: hidden; }}
+.step .dtl {{ margin-top: 10px; font-size: {32 if n <= 3 else 30}px; font-weight: 500; color: {SOFT}; white-space: nowrap; overflow: hidden; }}
 .dot {{ position: absolute; left: {dot_x - 30}px; width: 60px; height: 60px; border-radius: 30px; border: {STROKE}px solid {RULE};
   background: {CARD_BG}; color: {SOFT}; font-size: 24px; font-weight: 700; display: flex; align-items: center;
   justify-content: center; }}
@@ -1340,15 +1357,6 @@ def _step_sequence(card: Card, accent: str, ph: int) -> Chart:
     return Chart(css, "".join(parts), m, "", (), focal)
 
 
-def _nice_step(raw: float) -> float:
-    exponent = 10 ** math.floor(math.log10(raw)) if raw > 0 else 1.0
-    return next(s * exponent for s in (1, 2, 2.5, 5, 10) if s * exponent >= raw)
-
-
-def _fmt(value: float) -> str:
-    return f"{value:,.0f}" if abs(value) >= 100 else f"{value:,.2f}".rstrip("0").rstrip(".")
-
-
 OVERLAYS = {"stat_pill": _stat_pill, "kinetic_range": _kinetic_range, "buckets": _buckets, "speaker_title": _speaker_title}
 CHARTS = {
     "drawdown_curve": _drawdown_curve, "timeline": _timeline, "metric_bars": _metric_bars, "ranked_bars": _ranked_bars,
@@ -1356,7 +1364,6 @@ CHARTS = {
     "sankey_flow": _sankey_flow, "cac_payback": _cac_payback, "candlestick_ema": _candlestick_ema,
     "comparison_card": _comparison_card, "step_sequence": _step_sequence,
 }
-BUILDERS = {**OVERLAYS, **CHARTS}
 
 # The page's runtime: easing, rolling numbers, Plot helpers and the frame clock.
 RUNTIME = r"""
@@ -1405,10 +1412,18 @@ _SETUP = """async (tracks) => {
   for (const build of NAV.builds) await build();
   const fit = el => { let size = parseFloat(getComputedStyle(el).fontSize), floor = size * 0.62;
     while (el.scrollWidth > el.clientWidth + 1 && size > floor) { size -= 2; el.style.fontSize = size + 'px'; } };
+  // Round 33: a block of wrapped text (.fitv) is too tall only by a whole line: a display
+  // face's glyphs (Instrument Serif) reach past a tight line box by a few pixels, which
+  // isn't overflow. It shrinks to fit like .fit does, down to 72% of its size.
+  const slack = el => 0.3 * parseFloat(getComputedStyle(el).fontSize);
+  const tall = el => el.scrollHeight > el.clientHeight + slack(el);
+  const fitv = el => { let size = parseFloat(getComputedStyle(el).fontSize), floor = size * 0.72;
+    while (tall(el) && size > floor) { size -= 2; el.style.fontSize = size + 'px'; } };
   document.querySelectorAll('.fit').forEach(fit);
+  document.querySelectorAll('.fitv').forEach(fitv);
   const over = [];
   for (const el of document.querySelectorAll('.fit')) if (el.scrollWidth > el.clientWidth + 1) over.push(el.textContent);
-  for (const el of document.querySelectorAll('.fitv')) if (el.scrollHeight > el.clientHeight + 1) over.push(el.textContent);
+  for (const el of document.querySelectorAll('.fitv')) if (tall(el)) over.push(el.textContent);
   for (const el of document.querySelectorAll('[data-roll]')) {  // a rolling number keeps its final width: nothing shifts
     el.style.display = 'inline-block'; el.style.minWidth = el.offsetWidth + 'px'; el.style.textAlign = el.dataset.align; }
   for (const t of tracks) document.querySelectorAll(t.sel).forEach(el => {
@@ -1492,6 +1507,21 @@ def scene(card: Card, brand: BrandKit) -> tuple[str, Motion, int, int, int]:
             f"<script>{RUNTIME}</script>{_scripts(libs)}</head><body><div class='stage'>{body}</div>"
             f"<script>{script}</script></body></html>")
     return page, motion, width, height, top
+
+
+def compact(card: Card) -> Card | None:
+    """Round 33: a shorter version of a chart whose text didn't fit (the headline and the
+    secondary lines dropped; every number and label the checks passed stays), or None when
+    there's nothing to drop. The clip keeps its visual instead of losing it at render time."""
+    from dataclasses import replace as _replace
+
+    if MODES[card.template] != "split":
+        return None
+    rows = [_replace(row, detail="") if row.detail and card.template in {"comparison_card", "step_sequence"} else row
+            for row in card.rows]
+    if not card.headline and rows == card.rows:
+        return None
+    return _replace(card, headline="", rows=rows)
 
 
 def render_card(card: Card, brand: BrandKit, out_dir: Path) -> Frames:

@@ -306,11 +306,6 @@ def _is_finished(record: dict[str, Any]) -> bool:
     return str(record.get("status", "")).strip().lower() in FINISHED_LEAD_STATUSES
 
 
-def _active_cached_leads() -> list[dict[str, Any]]:
-    """Leads still worth seeing in the app (not sent or completed)."""
-    return [record for record in _latest_lead_records() if not _is_finished(record)]
-
-
 FORCEABLE_PREVIEW = 30  # per group
 
 
@@ -2147,9 +2142,6 @@ NAME_CARD_SECONDS = 3.3
 
 
 # --- 📨 Sent, for Make clips (Round 32): like the Outbox, batches are marked as sent -------
-MADE_VIEWS = {"to send": "📦 To send", "sent": "📨 Sent", "all": "All"}
-
-
 def _sent_date(stamp: Any) -> str:
     try:
         return datetime.fromisoformat(str(stamp)).astimezone().strftime("%b %d, %Y")

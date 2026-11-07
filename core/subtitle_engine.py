@@ -150,6 +150,21 @@ CAPTION_MARGIN_H = 110
 HOOK_MARGIN_V = 300
 HOOK_MAX_CHARACTERS = 70
 HIGHLIGHT_COLOUR = "&H00FFFF&"  # yellow (ASS colours are BGR)
+# Round 33: numbers stay green (#34D399, the charts' gain colour) for the whole caption
+# line, so the figure the clip is about reads at a glance even before it's spoken. The
+# spoken word is still yellow. NUMBER_EMPHASIS=off in .env turns it off.
+NUMBER_COLOUR = "&H99D334&"
+_NUMBER_TOKEN = re.compile(r"^[\"'(~≈+\-−]*[$€£]?\d")  # "$5T", "40%", "~12X"; not "Q3", "GPT4" or "W3"
+_YEAR_TOKEN = re.compile(r"[\"'(]?(?:19|20)\d\d(?:S|'S)?[.,!?;:)\"']*")  # "2023", "1990S": a when, not a figure
+
+
+def is_figure(token: str) -> bool:
+    """A caption word that is a figure (money, a share, a multiple, a count), not a year."""
+    return bool(_NUMBER_TOKEN.match(token)) and not _YEAR_TOKEN.fullmatch(token)
+
+
+def number_emphasis() -> bool:
+    return (os.getenv("NUMBER_EMPHASIS") or "on").strip().lower() not in {"off", "0", "false", "no"}
 # Caption look. "bold" (default): thick outline and a soft drop shadow.
 # "classic": the look before round 12. Pick one with CAPTION_STYLE=classic in .env.
 CAPTION_STYLES = {
@@ -275,6 +290,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     blur = f"\\blur{look['blur']}" if look["blur"] else ""
     soften = f"{{{blur}}}" if blur else ""
     preset = emphasis_preset(emphasis, look)
+    numbers = number_emphasis()
     # After the spoken word: back to the plain style (keeping the soft edge).
     restore = f"{{\\r{blur}}}"
 
@@ -317,8 +333,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             continue
 
         tokens = [_safe_ass_text(word.text.upper()) for word in group]
+        shown = [f"{{\\c{NUMBER_COLOUR}}}{token}{restore}" if numbers and is_figure(token) else token
+                 for token in tokens]  # how each word looks while it isn't the spoken one
         if not highlight_active_word:
-            add_event(event_start_cs, event_end_cs, " ".join(tokens))
+            add_event(event_start_cs, event_end_cs, " ".join(shown))
         elif len(group) == 1:
             # A one-word card: the word itself is the spoken word.
             pulse = _pulse(preset, look["outline"], (event_end_cs - event_start_cs) * 10)
@@ -336,7 +354,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     preset, look["outline"], (boundaries[word_index + 1] - boundaries[word_index]) * 10
                 )
                 text = " ".join(
-                    f"{{\\c{HIGHLIGHT_COLOUR}{pulse}}}{token}{restore}" if i == word_index else token
+                    f"{{\\c{HIGHLIGHT_COLOUR}{pulse}}}{token}{restore}" if i == word_index else shown[i]
                     for i, token in enumerate(tokens)
                 )
                 add_event(boundaries[word_index], boundaries[word_index + 1], text, line_start_cs=event_start_cs)

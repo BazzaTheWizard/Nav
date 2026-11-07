@@ -18,7 +18,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import ssl
 import subprocess
 import sys

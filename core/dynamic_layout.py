@@ -20,10 +20,10 @@ from __future__ import annotations
 
 import re
 import shutil
-from dataclasses import replace
-import tempfile
 import subprocess
+import tempfile
 import uuid
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
@@ -189,19 +189,19 @@ def calm_captions(words: list[Any], edit: ClipEdit, path: Path,
         texts = _sentence_case([str(w.text).strip() for w in inside])
         group: list[tuple[Any, str]] = []
 
-        def flush() -> None:
+        def flush(group: list[tuple[Any, str]], opened: float) -> None:
             if group:
-                start = max(float(group[0][0].start), card.start)
+                start = max(float(group[0][0].start), opened)
                 events.append((start, float(group[-1][0].end), " ".join(t for _, t in group)))
                 group.clear()
 
         for word, text in zip(inside, texts):
             if group and len(" ".join(t for _, t in group)) + len(text) + 1 > CAPTION_CHARS:
-                flush()
+                flush(group, card.start)
             group.append((word, text))
             if text.endswith((".", "?", "!", ",")) and len(" ".join(t for _, t in group)) > CAPTION_CHARS * 0.6:
-                flush()
-        flush()
+                flush(group, card.start)
+        flush(group, card.start)
         for k in range(len(events) - 1):  # each line stays until the next one (no flicker)
             start, end, text = events[k]
             if events[k + 1][0] - end < 0.6:
@@ -602,7 +602,7 @@ def render_with_cards(
     a split chart to start from exactly that picture); None where it isn't a plain crop.
     Returns (the clip with graphics, or None when no card passed; one CardCheck per card)."""
     from core.card_checks import check_edit
-    from core.cards import CardRenderError, render_card
+    from core.cards import CardRenderError, compact, render_card
 
     checks = check_edit(edit, words, hook_seconds)
     passed, frames = [], []
@@ -615,8 +615,15 @@ def render_with_cards(
         try:
             frames.append(render_card(card, edit.brand, Path(work_dir) / "cards"))
         except CardRenderError as exc:
-            check.errors.append(str(exc))
-            continue
+            shorter = compact(card) if str(exc).startswith("Too long") else None
+            try:  # Round 33: text that doesn't fit costs the headline or a line, not the visual
+                if shorter is None:
+                    raise exc
+                frames.append(render_card(shorter, edit.brand, Path(work_dir) / "cards"))
+                card = shorter
+            except CardRenderError as final:
+                check.errors.append(str(final))
+                continue
         passed.append(card)
     if not passed:
         return None, checks
