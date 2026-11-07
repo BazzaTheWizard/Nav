@@ -23,7 +23,7 @@ TEMPLATES = (
     "kinetic_range", "buckets", "stat_pill", "speaker_title",
     "timeline", "metric_bars", "ranked_bars", "diverging_bar", "share_split", "trend_line",
     "arr_bridge", "sankey_flow", "cac_payback", "drawdown_curve", "candlestick_ema",
-    "comparison_card", "step_sequence",
+    "comparison_card", "step_sequence", "market_line",
 )
 TEMPLATE_LABELS = {
     "kinetic_range": "A · Number or range over the speaker",
@@ -43,6 +43,7 @@ TEMPLATE_LABELS = {
     "candlestick_ema": "C · Price chart (from a price file you upload, with its source)",
     "comparison_card": "C · Comparison card (two sides of the speaker's contrast, in their words)",
     "step_sequence": "C · Step sequence (2–4 steps of the speaker's framework, in order)",
+    "market_line": "C · Market data (a real price, rate or revenue series, with its source)",
 }
 MODES = {name: ("overlay" if name in {"kinetic_range", "buckets", "stat_pill", "speaker_title"} else "split")
          for name in TEMPLATES}
@@ -89,6 +90,10 @@ class Card:
     # "value": ..., "text": ..., "said": the sentence, "at": seconds} (a number the speaker
     # said elsewhere in the same video). "value" is filled in by the checks. Empty: none.
     context: dict[str, Any] = field(default_factory=dict)
+    # Round 35: the company (or market) the card is about, a core.entity_enricher key
+    # ("nvidia", "stripe", "inflation"): its logo goes in the header and its colour is the
+    # card's accent. Empty: the client's accent, no logo.
+    entity: str = ""
 
     def __post_init__(self) -> None:
         if self.template not in TEMPLATES:

@@ -76,6 +76,10 @@ CARDS = {
                                                                                     row("Back to new highs", "18 months", at=2.2)]),
     "candlestick_ema": Card("candlestick_ema", S, S + 3.5, headline="The S&P", source="Sample data",
                             data_path=price_file(tmp / "prices.csv")),
+    # Round 35: real market data (date, value; a price file's closes work too), with its source
+    "market_line": Card("market_line", S, S + 5.4, headline="The S&P since 2020", source="Yahoo Finance",
+                        footnote="Sep 2026, daily", data_path=str(tmp / "prices.csv"),
+                        rows=[CardRow("Sep 1", "$100"), CardRow("Sep 28", "$162"), CardRow("Change", "+62%", True)]),
     "speaker_title": Card("speaker_title", S, S + 3.3, rows=[CardRow("Jonathan Bragdon", detail="Founder")]),
     "stat_pill": Card("stat_pill", S, S + 3, rows=[row("ARR", "40M", at=0.4)]),
     "kinetic_range": Card("kinetic_range", S, S + 3, rows=[row("a year in fees", "$850–$1,700", True, 0.5)]),
@@ -131,7 +135,8 @@ check("Three zones: header 18%, chart 68%, footer 14%",
       and abs((C.CARD_H - C.HEADER_H - C.FOOTER_H) / C.CARD_H - 0.68) < 0.005)
 check("Canvas #040507 around a #090C12 card with a 20 px radius and a top-lit 1 px rim",
       C.CANVAS == "#040507" and C.CARD_BG == "#090C12" and C.RADIUS == 20
-      and "rgba(255,255,255,.16) 0%, rgba(255,255,255,.04) 100%" in pages["metric_bars"])
+      and "rgba(255,255,255,.12) 26%, rgba(255,255,255,.035) 100%" in pages["metric_bars"]  # Round 35: accent-lit corner
+      and '<div class="spec-top"></div>' in pages["metric_bars"])
 check("Studio texture: a 3.5% dot grid, the accent's glow at 6%, 2% noise",
       "rgba(255,255,255,.035)" in pages["trend_line"] and "rgba(244,196,48,0.06)" in pages["trend_line"]
       and "feTurbulence" in pages["trend_line"] and 'opacity=".02"' in pages["trend_line"])
@@ -155,7 +160,7 @@ for template, card in CARDS.items():
     except Exception as exc:  # noqa: BLE001
         drawn[template] = exc
 broken = {t: str(f)[:200] for t, f in drawn.items() if isinstance(f, Exception)}
-check("All 17 graphics draw on the new engine", not broken, str(broken))
+check(f"All {len(CARDS)} graphics draw on the new engine", not broken, str(broken))
 good = {t: f for t, f in drawn.items() if not isinstance(f, Exception)}
 
 
@@ -184,12 +189,15 @@ for t in ("metric_bars", "arr_bridge", "sankey_flow", "candlestick_ema", "drawdo
               f"{early} -> {late}")
 if "arr_bridge" in good:
     f = good["arr_bridge"]
-    mids = [lit(rgba(f, k)) for k in (int(0.9 * 30), int(1.5 * 30), int(2.6 * 30))]
+    # Round 35: the entrance plays on a faster clock (core.cards' time-warp): the same story moments, sooner
+    warp = C.scene(CARDS["arr_bridge"], brand)[1]
+    mids = [lit(rgba(f, k)) for k in (round(warp.real(t) * 30) for t in (0.9, 1.5, 2.6))]
     check("ECharts waterfall: its bars grow frame by frame from our clock (more drawn at each step)",
           mids[0] < mids[1] < mids[2], str(mids))
 if "candlestick_ema" in good:
     f = good["candlestick_ema"]
-    steps = [lit(rgba(f, k)) + int((rgba(f, k)[:, :, 1] > 150).sum()) for k in (20, 40, 70)]
+    warp = C.scene(CARDS["candlestick_ema"], brand)[1]
+    steps = [lit(rgba(f, k)) + int((rgba(f, k)[:, :, 1] > 150).sum()) for k in (round(warp.real(t / 30) * 30) for t in (20, 40, 70))]
     check("Lightweight Charts: candles come in left to right from our clock", steps[0] < steps[1] < steps[2], str(steps))
     page_dom = pages["candlestick_ema"]
     check("...and no TradingView logo or link is drawn into the video", "tradingview.com" not in page_dom.lower())
@@ -248,7 +256,7 @@ if "metric_bars" in good:
           and all(ok for ok, _ in results), str([d for ok, d in results if not ok]))
 
 # ---------- numbers roll up as they're said ----------
-_h, _r, mid_roll = frame_hashes("metric_bars", [int((0.9 + 0.1) * 30)])
+_h, _r, mid_roll = frame_hashes("metric_bars", [round(C.scene(CARDS["metric_bars"], brand)[1].real(0.9 + 0.1) * 30)])
 _h, _r, end_roll = frame_hashes("metric_bars", [int(3.5 * 30)])
 check("Numbers roll up to their value from the word where they're said, then hold it exactly",
       end_roll == ["$4.2M", "$1.1M", "$0.9M–$1.3M"] and mid_roll[0] != "$4.2M" and re.fullmatch(r"\$\d\.\dM", mid_roll[0])

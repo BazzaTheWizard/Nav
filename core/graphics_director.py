@@ -748,6 +748,30 @@ def _plan_names(speakers: list[Speaker], clip_words: list[Any], clip_start: floa
     return kept
 
 
+MARKET_STRENGTH = 7  # a real-data chart of a market the speaker names: as strong as a good idea from the AI
+
+
+def _brand_entities(cards: list[Card], notes: list[str]) -> None:
+    """Round 35: a Bento card about one company (named in its own text) wears its logo and
+    colour (core.entity_enricher); the logo is fetched now, once, so the render is offline."""
+    from core import entity_enricher
+
+    for card in cards:
+        if not card.entity:
+            text = " ".join([card.eyebrow, card.headline] + [f"{r.label} {r.detail}" for r in card.rows])
+            card.entity = entity_enricher.card_entity(text)
+        if card.entity:
+            try:
+                found = entity_enricher.enrich(card.entity)
+            except Exception as exc:  # noqa: BLE001 - a logo is a bonus
+                logger.warning("Logo for %s failed: %s", card.entity, exc)
+                continue
+            if found is not None:
+                notes.append(f"{_what(card)} wears {found.name}'s "
+                             + ("logo and " if found.logo_kind and found.logo_kind != "initials" else "")
+                             + (f"colour ({found.color})." if found.color else "logo."))
+
+
 def direct(
     words: list[Any],
     clip_start: float,
@@ -827,6 +851,19 @@ def direct(
             weak.append((strength, card, reason))
             continue
         picker.offer(card, strength, reason)
+    # Round 35: a market the speaker names without saying its numbers ("NVIDIA's run", "the
+    # 2008 crash", "inflation") gets a chart of the real data, with its source (core.market_data).
+    if len(picker.chosen) < limit:
+        from core import market_data
+
+        try:
+            for card, reason in market_data.market_cards(clip_words, clip_start, clip_end):
+                if len(picker.chosen) >= limit:
+                    break
+                picker.offer(card, MARKET_STRENGTH, reason)
+        except Exception as exc:  # noqa: BLE001 - market data is a bonus, never a reason to fail
+            logger.warning("Market data failed: %s", exc)
+            direction.notes.append(f"Market data unavailable ({exc}).")
     if not picker.chosen:  # never zero: a second look at what was scored low
         for strength, card, reason in weak:
             if picker.offer(card, strength, f"{reason} (taken on a second look: the clip needs one visual)"):
@@ -854,6 +891,7 @@ def direct(
             edit.cards.remove(card)
             direction.notes.append(f"Dropped {card.template}: {result.errors[0]}")
     bento = [c for c in edit.cards if c.template != "speaker_title"]
+    _brand_entities(bento, direction.notes)
     if len(bento) < MIN_BENTO:
         direction.notes.append("No Bento visual: nothing in this clip passed the checks"
                                + (f" ({picker.errors[0]})" if picker.errors else "") + ".")

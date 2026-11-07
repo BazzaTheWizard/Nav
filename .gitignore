@@ -30,3 +30,7 @@ storage/*.lock
 claude_review/
 scratch/
 *_workspace_copy.tgz
+# Round 35: caches (market data, fetched logos) and the channel face memory (Round 34)
+cache/
+assets/logos/
+storage/people/

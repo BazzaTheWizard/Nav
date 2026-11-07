@@ -2128,6 +2128,9 @@ CARD_GUIDE: dict[str, tuple[str, dict[str, str]]] = {
                        {"label": "Label (speaker's words)", "value": "Number as said"}),
     "candlestick_ema": ("Drawn from a price file you upload (CSV: date, open, high, low, close, volume), not from "
                         "speech. The chart shows its source.", {}),
+    "market_line": ("Real data for a company, index, crypto or macro series the speaker names (Yahoo Finance, FRED, "
+                    "SEC filings), with its source on the chart. Added automatically when a speaker names one without "
+                    "its numbers; here you pick it yourself.", {}),
     "comparison_card": ("Two sides of the speaker's contrast (then vs now, them vs us), each a heading and a line in "
                         "their words, with an optional short tag. Tick 'Focus' on the side the point lands on.",
                         {"label": "Heading (speaker's words)", "detail": "Line (speaker's words)", "value": "Tag (optional)",
@@ -2137,7 +2140,7 @@ CARD_GUIDE: dict[str, tuple[str, dict[str, str]]] = {
 }
 CARD_ROWS = {"kinetic_range": 1, "buckets": 3, "stat_pill": 1, "timeline": 3, "metric_bars": 3, "ranked_bars": 3,
              "diverging_bar": 2, "share_split": 3, "trend_line": 4, "arr_bridge": 4, "sankey_flow": 4,
-             "cac_payback": 2, "drawdown_curve": 2, "comparison_card": 2, "step_sequence": 3}
+             "cac_payback": 2, "drawdown_curve": 2, "comparison_card": 2, "step_sequence": 3, "market_line": 0}
 NAME_CARD_SECONDS = 3.3
 
 
@@ -2286,6 +2289,8 @@ def _new_card(template: str, key: str, clip: Any, spans: list[tuple[float, float
     if MODES[template] == "split":
         headline = st.text_input("Title (optional, a few words)", max_chars=CARD_LIMITS["headline"],
                                  key=f"card_title_{key}_{template}")
+    if template == "market_line":  # Round 35: real data, fetched now (core.market_data)
+        return _market_card(key, clip, spans[first][0], spans[max(first, last)][1])
     rows: list[CardRow] = []
     source, data_path = "", ""
     if template == "candlestick_ema":
@@ -2323,6 +2328,40 @@ def _new_card(template: str, key: str, clip: Any, spans: list[tuple[float, float
         return None
     return Card(template, start=spans[first][0], end=spans[max(first, last)][1] + 0.15, headline=headline.strip(),
                 rows=rows, source=source.strip(), data_path=data_path)
+
+
+def _market_card(key: str, clip: Any, start: float, end: float) -> Card | None:
+    """Round 35: a market_line card from what you pick: the series is fetched (and cached)
+    when you press 'Check and add'."""
+    from datetime import date
+
+    from core import entity_enricher, market_data
+
+    what_col, kind_col, since_col = st.columns([3, 2, 1])
+    what = what_col.text_input("Company, ticker or market", placeholder="NVIDIA, NVDA, bitcoin, inflation, S&P 500",
+                               key=f"market_what_{key}")
+    kind = kind_col.radio("Data", ["Price or rate", "Revenue (SEC filings)"], horizontal=True, key=f"market_kind_{key}")
+    since = since_col.number_input("Since", min_value=1990, max_value=date.today().year,
+                                   value=date.today().year - 5, step=1, key=f"market_since_{key}")
+    if not st.button("✔ Check and add", key=f"card_add_{key}"):
+        return None
+    entity = entity_enricher.resolve(what)
+    if entity is None:
+        st.error(f"“{what}” isn't one of the companies and markets the graphics know (core/entity_enricher.py lists them).")
+        return None
+    revenue = kind.startswith("Revenue")
+    moment = market_data.Moment(entity.key, "revenue" if revenue else "macro" if entity.kind == "macro" else "price",
+                                start, end, date(int(since), 1, 1), date.today(), "")
+    try:
+        card = market_data.market_card(moment, clip.end_time)
+    except market_data.MarketDataError as exc:
+        st.error(f"No data: {exc}")
+        return None
+    if card is None:
+        st.error("Not enough data points for that period.")
+        return None
+    entity_enricher.enrich(entity.key)
+    return card
 
 
 def _render_clip_version(

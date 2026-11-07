@@ -54,7 +54,7 @@ from pathlib import Path
 from core.card_checks import parse_value, signed_value
 from core.edl import MODES, BrandKit, Card
 
-ENGINE = "r31"  # part of every cached render's key: a new engine draws everything again
+ENGINE = "r35"  # part of every cached render's key: a new engine draws everything again
 FPS = 30
 FRAME_W, FRAME_H = 1080, 1920
 SPLIT_TOP = 460  # 24/76 split: the speaker's strip (a 2.35:1 band of the frame), the chart below
@@ -123,7 +123,8 @@ def spring_easing(stiffness: float = 170.0, damping: float = 22.0, mass: float =
 SPRING = spring_easing()  # entrances: elements rise into place on a spring
 EXIT = 0.4  # seconds (12 frames): over-the-speaker graphics slide and fade out over their last 0.4 s
 FIRST = 0.35  # nothing inside the card starts before this (it would draw while the panel slides)
-ROLL = 0.7  # seconds a number takes to roll up to its value (odometer digits, Round 33)
+ROLL = 0.55  # seconds a number takes to roll up to its value (odometer digits, Round 33)
+ENTRANCE_END = 1.2  # Round 35: everything is in and still by 1.2 s (Vizzu / Motion Canvas): the rest is reading time
 
 EYEBROWS = {
     "timeline": "Timeline", "metric_bars": "Breakdown", "ranked_bars": "Ranking", "diverging_bar": "Head to head",
@@ -131,7 +132,8 @@ EYEBROWS = {
     "cac_payback": "CAC payback", "drawdown_curve": "Drawdown", "candlestick_ema": "Price action",
     "comparison_card": "The contrast", "step_sequence": "Step by step",
 }
-KEYED = {"candlestick_ema"}  # charts whose footer always holds their key (a source, a legend)
+KEYED = {"candlestick_ema", "market_line"}  # charts whose footer always holds their key (a source, a legend)
+DATA_CHARTS = {"candlestick_ema", "market_line"}  # drawn from a data file (with its source), not from speech
 
 
 @dataclass
@@ -178,6 +180,39 @@ class Motion:
     def __init__(self) -> None:
         self.tracks: dict[tuple[str, str], list[tuple[float, str, str]]] = {}
         self.spans: list[tuple[float, float]] = []
+        self.cues: list[tuple[float, str]] = []  # Round 35: (story seconds, "tick"): a sound on a highlight
+        # Round 35: the entrance time-warp (see warp_to): story time runs k times faster from
+        # ``a`` until the choreography is done at real time ``b``; after it, story = real + delta.
+        self.warp: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 0.0)
+
+    def cue(self, t: float, kind: str = "tick") -> None:
+        """A micro sound effect at story second t (core.audio_polish mixes it in)."""
+        self.cues.append((max(0.0, t), kind))
+
+    def story(self, t: float) -> float:
+        """The choreography's own clock at real second t (the entrance is played faster)."""
+        a, b, k, delta = self.warp
+        if k == 1.0 or t <= a:
+            return t
+        return a + (t - a) * k if t <= b else t + delta
+
+    def real(self, story_t: float) -> float:
+        """The real second at which story second ``story_t`` plays."""
+        a, b, k, delta = self.warp
+        if k == 1.0 or story_t <= a:
+            return story_t
+        return a + (story_t - a) / k if story_t <= a + (b - a) * k else story_t - delta
+
+    def warp_to(self, start: float, done_by: float = ENTRANCE_END) -> None:
+        """Round 35: play the entrance (from ``start``) faster when its choreography would
+        still be moving after ``done_by``, so the graphic is complete and still by then.
+        Every chart's own timing is kept in proportion; only the clock runs faster."""
+        settle = self.last()
+        if settle <= done_by or settle <= start:
+            self.warp = (0.0, 0.0, 1.0, 0.0)
+            return
+        k = (settle - start) / (done_by - start)
+        self.warp = (start, done_by, k, settle - done_by)
 
     def tween(self, selector: str, prop: str, t0: float, t1: float, a: str, b: str, easing: str = EASE) -> None:
         t0, t1 = max(0.0, t0), max(0.0, t1)
@@ -210,9 +245,14 @@ class Motion:
         return max((t1 for _, t1 in self.spans), default=0.0)
 
     def moving(self, t: float) -> bool:
-        return any(t0 - 0.5 / FPS <= t <= t1 + 1.5 / FPS for t0, t1 in self.spans)
+        """Something changes at real second t (a frame to draw, not reuse)."""
+        k = self.warp[2]
+        story, pad = self.story(t), max(1.0, k)
+        return any(t0 - 0.5 * pad / FPS <= story <= t1 + 1.5 * pad / FPS for t0, t1 in self.spans)
 
     def js(self, total: float) -> list[dict]:
+        """The Web Animations for a graphic ``total`` real seconds long (in story time)."""
+        total = total + self.warp[3]
         out = []
         for (selector, prop), points in self.tracks.items():
             points = sorted(points, key=lambda p: p[0])
@@ -284,8 +324,19 @@ def _at(card: Card, time: float | None, fallback: float) -> float:
     return max(FIRST, _rel(card, time, fallback))
 
 
+SCALES = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
+
+
+def _amounts(text: str) -> list[float]:
+    """The numbers in a value at their full size: "$817B" and "$1T" are drawn to one scale
+    (Round 35: a bar of $1T was drawn as 1, next to 817)."""
+    value = parse_value(text)
+    factor = SCALES.get(str(value.scale or "").upper(), 1.0)
+    return [n * factor for n in value.numbers]
+
+
 def _num(text: str) -> float:
-    return max(parse_value(text).numbers or [0.0])
+    return max(_amounts(text) or [0.0])
 
 
 def _roll(m: Motion, text: str, t0: float, length: float = ROLL, align: str = "right") -> str:
@@ -305,7 +356,7 @@ def _split_range(value: str) -> tuple[str, str]:
 
 
 def _top(card: Card) -> float:
-    return max((max(parse_value(r.value).numbers or [0.0]) for r in card.rows), default=0.0) or 1.0
+    return max((max(_amounts(r.value) or [0.0]) for r in card.rows), default=0.0) or 1.0
 
 
 def _data(value: object) -> str:
@@ -561,14 +612,26 @@ def _context_footer(card: Card, accent: str) -> tuple[str, str, Motion]:
 
 def _card_css(accent: str, header_h: int, plot_h: int, footer: bool) -> str:
     return f"""
+:root {{ --brand-accent: {accent}; }}
 .card {{ position: absolute; left: {CARD_X}px; top: {CARD_Y}px; width: {CARD_W}px; height: {CARD_H}px;
-  border-radius: {RADIUS}px; background: {CARD_BG}; overflow: hidden; }}
+  border-radius: {RADIUS}px; overflow: hidden;
+  background: radial-gradient(58% 46% at 10% -4%, {_rgba(accent, 0.09)}, rgba(0,0,0,0) 72%),
+    radial-gradient(52% 44% at 104% 14%, rgba(99,102,241,.065), rgba(0,0,0,0) 70%),
+    radial-gradient(70% 55% at 50% 118%, rgba(14,165,233,.05), rgba(0,0,0,0) 72%),
+    linear-gradient(180deg, #0B0F16 0%, {CARD_BG} 46%, #07090E 100%); }}
+.spec-top {{ position: absolute; left: 32px; right: 32px; top: 0; height: 1px; pointer-events: none;
+  background: linear-gradient(90deg, rgba(255,255,255,0), rgba(255,255,255,.42) 30%, rgba(255,255,255,.42) 70%, rgba(255,255,255,0)); }}
+.logo {{ flex: none; width: 64px; height: 64px; border-radius: 16px; background: #F5F6F8; display: flex; align-items: center;
+  justify-content: center; box-shadow: 0 0 0 1px rgba(255,255,255,.14), 0 10px 26px rgba(0,0,0,.45); overflow: hidden; }}
+.logo img {{ width: 46px; height: 46px; object-fit: contain; }}
+.logo.badge {{ background: {accent}; }}
+.logo.badge img {{ width: 64px; height: 64px; }}
 .spot {{ position: absolute; left: -260px; top: -320px; width: 1000px; height: 760px; pointer-events: none;
-  background: radial-gradient(closest-side, rgba(255,255,255,.05), rgba(255,255,255,0)); }}
+  background: radial-gradient(closest-side, {_rgba(accent, 0.07)}, rgba(255,255,255,.02) 55%, rgba(255,255,255,0)); }}
 .beam {{ position: absolute; left: 0; top: 0; width: 260px; height: 1px; pointer-events: none; opacity: 0;
   background: linear-gradient(90deg, {_rgba(accent, 0)}, {_rgba(accent, 0.95)} 60%, rgba(255,255,255,.95) 85%, {_rgba(accent, 0)}); }}
 .rim {{ position: absolute; inset: 0; border-radius: {RADIUS}px; padding: 1px; pointer-events: none;
-  background: linear-gradient(180deg, rgba(255,255,255,.16) 0%, rgba(255,255,255,.04) 100%);
+  background: linear-gradient(160deg, {_rgba(accent, 0.34)} 0%, rgba(255,255,255,.12) 26%, rgba(255,255,255,.035) 100%);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor;
   mask-composite: exclude; }}
 .grain {{ position: absolute; inset: 0; width: {CARD_W}px; height: {CARD_H}px; pointer-events: none; }}
@@ -627,7 +690,7 @@ def _bar_rows(card: Card, accent: str, m: Motion, ph: int, times: list[float]) -
     value_w = max(len(row.value) for row in card.rows) * round(value_px * 0.6) + 32  # JetBrains Mono: 0.6 em a character
     data, labels = [], []
     for k, row in enumerate(card.rows):
-        numbers = parse_value(row.value).numbers or [0.0]
+        numbers = _amounts(row.value) or [0.0]
         low, high = min(numbers), max(numbers)
         data.append({"y": round(ys[k] + 66, 1), "h": bar, "low": low, "high": high,
                      "solid": accent if row.highlight else LIGHT, "hatch": f"url(#hatch{1 if row.highlight else 0})"})
@@ -1291,6 +1354,113 @@ def _candlestick_ema(card: Card, accent: str, ph: int) -> Chart:
     return Chart(css, '<div id="lw"></div>', m, js, ("lightweight",), (CARD_W * 0.7, ph * 0.4), key=key)
 
 
+def with_entity(card: Card, brand: BrandKit) -> BrandKit:
+    """Round 35: a card about one company wears that company's colour (core.entity_enricher:
+    taken from its cached logo, lifted until it reads on the card) as its accent: the rim,
+    the spotlight, the glow and the punchline bar. Other cards keep the client's accent."""
+    if not card.entity:
+        return brand
+    from core import entity_enricher
+
+    found = entity_enricher.cached(card.entity)
+    if found is None or not found.color:
+        return brand
+    return BrandKit(wordmark=brand.wordmark, accent=found.color, logo_path=brand.logo_path, show_name=brand.show_name)
+
+
+def read_series(path: str) -> list[tuple[str, float]]:
+    """(date, value) rows of a data file (CSV with date and value columns, oldest first)."""
+    rows = []
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        for raw in csv.DictReader(handle):
+            item = {k.strip().lower(): v for k, v in raw.items() if k}
+            try:
+                rows.append((str(item["date"]).strip(), float(str(item.get("value", item.get("close"))).replace(",", ""))))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return rows
+
+
+MARKET_JS = """NAV.onBuild(() => {
+  const D = __DATA__;
+  const chart = LightweightCharts.createChart(document.getElementById('lw'), {width: __W__, height: __H__, autoSize: false,
+    layout: {background: {type: 'solid', color: 'rgba(0,0,0,0)'}, textColor: __SOFT__, fontFamily: 'JetBrains Mono', fontSize: 21,
+      attributionLogo: false},
+    grid: {vertLines: {visible: false}, horzLines: {color: 'rgba(255,255,255,0.055)', style: 2}},
+    rightPriceScale: {borderVisible: false, scaleMargins: {top: 0.14, bottom: 0.06}, entireTextOnly: true},
+    timeScale: {visible: false, borderVisible: false, rightOffset: 0},
+    crosshair: {vertLine: {visible: false, labelVisible: false}, horzLine: {visible: false, labelVisible: false}},
+    handleScroll: false, handleScale: false});
+  const area = chart.addSeries(LightweightCharts.AreaSeries, {lineColor: __ACCENT__, lineWidth: 3,
+    topColor: NAV.alpha(__ACCENT__, 0.34), bottomColor: NAV.alpha(__ACCENT__, 0.0), lastValueVisible: false,
+    priceLineVisible: false, crosshairMarkerVisible: false, priceFormat: {type: 'custom', formatter: v => D.fmt(v)},
+    autoscaleInfoProvider: () => ({priceRange: {minValue: D.low, maxValue: D.high}})});
+  D.fmt = v => D.prefix + (Math.abs(v) >= 1000 ? v.toLocaleString('en-US', {maximumFractionDigits: 0}) : v.toFixed(D.places)) + D.suffix;
+  NAV.canvas();
+  let shown = -1;
+  const draw = t => {
+    const c = Math.max(1, Math.round(D.n * NAV.prog(t, __T0__, __T1__)));
+    if (c === shown) return;
+    shown = c;
+    area.setData(D.points.map((d, i) => i < c ? d : {time: d.time}));
+    chart.timeScale().setVisibleLogicalRange({from: -0.5, to: D.n - 0.5});
+  };
+  NAV.onFrame(draw); draw(0);
+});"""
+
+
+def _market_line(card: Card, accent: str, ph: int) -> Chart:
+    """Round 35: a real market or macro series (core.market_data: a stock's run or crash,
+    inflation, rates, the S&P 500, a company's revenue from its SEC filings), drawn by
+    TradingView Lightweight Charts as an area with a gradient fill. The line grows from
+    left to right on a fixed scale, a price tag marks where it ends, and the footer names
+    the source and the period. Rows: the first point, the last point, and (highlighted)
+    the change between them, which goes in the header's change pill."""
+    series = read_series(card.data_path)
+    step = max(1, math.ceil(len(series) / 260))  # at most 260 points: a smooth line, quick to draw
+    picked = series[::step]
+    if picked[-1] != series[-1]:
+        picked.append(series[-1])
+    values = [v for _, v in picked]
+    low, high = min(values), max(values)
+    pad = (high - low) * 0.08 or abs(high) * 0.05 or 1.0
+    last = card.rows[1].value if len(card.rows) > 1 else ""
+    prefix = "$" if last.strip().startswith("$") else ""
+    suffix = "%" if last.strip().endswith("%") else ""
+    places = 1 if suffix == "%" else 0 if max(abs(low), abs(high)) >= 100 else 1 if max(abs(low), abs(high)) >= 10 else 2
+    points = [{"time": 1_500_000_000 + 86_400 * k, "value": round(v, 6)} for k, v in enumerate(values)]
+    data = {"n": len(points), "points": points, "low": low - pad, "high": high + pad, "prefix": prefix,
+            "suffix": suffix, "places": places}
+    t0, t1 = FIRST + 0.1, FIRST + 0.75
+    h = ph - 96
+    js = _js(MARKET_JS, DATA=_data(data), W=IW, H=h, SOFT=json.dumps(SOFT), ACCENT=json.dumps(accent), T0=t0, T1=t1)
+    m = Motion()
+    m.hold(t0, t1)
+    m.tween("#lw", "opacity", t0 - 0.05, t0 + 0.2, "0", "1")
+    # where it ends: a price tag at the end of the line, as the line gets there
+    y_end = 14 + h * (0.14 + 0.80 * (data["high"] - values[-1]) / (data["high"] - data["low"]))
+    tag = (f'<div class="mtag num" id="mtag" style="top:{y_end - 26:.0f}px;background:{accent}">'
+           f'{_roll(m, last, t1 - 0.1, 0.4, "right")}</div>') if last else ""
+    if tag:
+        m.fade_up("#mtag", t1 - 0.1, rise=6, length=0.3)
+    first_label = card.rows[0].label if card.rows else ""
+    last_label = card.rows[1].label if len(card.rows) > 1 else ""
+    first_value = card.rows[0].value if card.rows else ""
+    axis = (f'<div class="maxis" id="maxis"><span><b class="num">{_e(first_value)}</b>{_e(first_label)}</span>'
+            f'<span>{_e(last_label)}</span></div>')
+    m.tween("#maxis", "opacity", t0, t0 + 0.3, "0", "1")
+    css = f"""#lw {{ position: absolute; left: {PAD}px; top: 14px; width: {IW}px; height: {h}px; }}
+.mtag {{ position: absolute; right: {PAD + 96}px; height: 52px; line-height: 52px; padding: 0 16px; border-radius: 12px;
+  color: {CARD_BG}; font-size: 30px; font-weight: 700; box-shadow: 0 8px 28px rgba(0,0,0,.45); }}
+.maxis {{ position: absolute; left: {PAD}px; right: {PAD + 96}px; bottom: 26px; display: flex; justify-content: space-between;
+  font-size: 22px; font-weight: 500; color: {SOFT}; white-space: nowrap; }}
+.maxis b {{ color: {INK}; font-weight: 700; margin-right: 12px; }}"""
+    key = (f'<div class="key" id="ckey"><span class="src">{_e("Source: " + card.source)}</span>'
+           f'<span class="lg">{_e(card.footnote)}</span></div>')
+    m.tween("#ckey", "opacity", 0.3, 0.6, "0", "1")
+    return Chart(css, f'<div id="lw"></div>{tag}{axis}', m, js, ("lightweight",), (CARD_W * 0.72, y_end), key=key)
+
+
 def _comparison_card(card: Card, accent: str, ph: int) -> Chart:
     """Round 32: the speaker's contrast as two sides of one card ("We didn't market" vs
     "Then we did, and it worked"). Each side lands on its words; the side the point is
@@ -1338,6 +1508,7 @@ def _comparison_card(card: Card, accent: str, ph: int) -> Chart:
     if temporal:
         m.tween("#vs", "transform", times[-1] - 0.1, times[-1] + 0.35, "translateX(-8px)", "translateX(0px)")
     t = times[main] + 0.35
+    m.cue(t, "tick")  # Round 35: a soft tick as the side the point lands on lights up
     m.tween(f"#c{main}", "borderColor", t, t + 0.3, "rgba(255,255,255,.10)", _rgba(accent, 0.55))
     m.tween(f"#c{main}", "backgroundColor", t, t + 0.3, "rgba(255,255,255,.025)", _rgba(accent, 0.08))
     m.tween(f"#ce{main}", "opacity", t, t + 0.3, "0", "1")
@@ -1384,6 +1555,7 @@ def _step_sequence(card: Card, accent: str, ph: int) -> Chart:
                      f'<div class="step" id="s{k}" style="top:{centers[k] - pitch / 2:.0f}px">'
                      f'<div class="lbl fit" id="l{k}">{_e(row.label)}</div>{detail}</div>')
         t = times[k]
+        m.cue(t, "tick")  # Round 35: each step box lights up with a soft tick
         m.fade_up(f"#s{k}", t, rise=14, length=0.4)
         m.tween(f"#d{k}", "borderColor", t, t + 0.25, RULE, accent)
         m.tween(f"#d{k}", "color", t, t + 0.25, SOFT, accent)
@@ -1401,7 +1573,7 @@ CHARTS = {
     "drawdown_curve": _drawdown_curve, "timeline": _timeline, "metric_bars": _metric_bars, "ranked_bars": _ranked_bars,
     "diverging_bar": _diverging_bar, "share_split": _share_split, "trend_line": _trend_line, "arr_bridge": _arr_bridge,
     "sankey_flow": _sankey_flow, "cac_payback": _cac_payback, "candlestick_ema": _candlestick_ema,
-    "comparison_card": _comparison_card, "step_sequence": _step_sequence,
+    "comparison_card": _comparison_card, "step_sequence": _step_sequence, "market_line": _market_line,
 }
 
 # The page's runtime: easing, rolling numbers, Plot helpers and the frame clock.
@@ -1451,7 +1623,8 @@ window.NAV = (() => {
           onBuild: f => builds.push(f), onFrame: f => hooks.push(f), canvas: () => { paint = true; }, needsPaint: () => paint};
 })();
 window.seekToFrame = async (frameIndex, fps) => {
-  const ms = frameIndex * 1000 / fps, t = ms / 1000;
+  const real = frameIndex / fps, [a, b, k, delta] = window.NAV_WARP || [0, 0, 1, 0];
+  const t = k === 1 || real <= a ? real : real <= b ? a + (real - a) * k : real + delta, ms = t * 1000;  // story time
   for (const a of document.getAnimations()) a.currentTime = ms;
   NAV.rolls(t);
   for (const hook of NAV.hooks) await hook(t);
@@ -1502,7 +1675,7 @@ def _split_scene(card: Card, brand: BrandKit) -> tuple[str, str, str, Motion, tu
     accent = brand.accent
     context = bool(card.context.get("value"))
     footer = context or card.template in KEYED
-    header_h = HEADER_H if card.headline or _kpi_row(card) is not None else HEADER_SLIM
+    header_h = HEADER_H if card.headline or card.entity or _kpi_row(card) is not None else HEADER_SLIM
     plot_h = CARD_H - header_h - (FOOTER_H if footer else 0)
     chart = CHARTS[card.template](card, accent, plot_h)
     m = chart.motion
@@ -1522,9 +1695,18 @@ def _split_scene(card: Card, brand: BrandKit) -> tuple[str, str, str, Motion, tu
     elif chart.note:
         right = f'<div class="note" id="note">{_e(chart.note)}</div>'
         m.tween("#note", "opacity", 0.3, 0.6, "0", "1")
-    if card.headline or right:
+    logo = ""
+    if card.entity:  # Round 35: the company's logo tile (core.entity_enricher, from the local cache only)
+        from core import entity_enricher
+
+        found = entity_enricher.cached(card.entity)
+        if found is not None and found.logo_uri:
+            logo = (f'<div class="logo{" badge" if found.logo_kind == "initials" else ""}" id="logo">'
+                    f'<img src="{found.logo_uri}" alt=""></div>')
+            m.fade_up("#logo", 0.2, rise=8, length=0.4)
+    if card.headline or right or logo:
         title = f'<div class="title fit" id="ttl">{_e(card.headline)}</div>' if card.headline else '<div class="title"></div>'
-        header.append(f'<div class="hrow">{title}{right}</div>')
+        header.append(f'<div class="hrow">{logo}{title}{right}</div>')
         if card.headline:
             m.fade_up("#ttl", 0.25, rise=10, length=0.45)
     fx, fy = chart.focal or (CARD_W / 2, plot_h / 2)
@@ -1543,7 +1725,7 @@ def _split_scene(card: Card, brand: BrandKit) -> tuple[str, str, str, Motion, tu
         m.merge(extra)
     elif footer:
         foot = chart.key
-    body = (f'<div class="card">{GRAIN}<div class="spot"></div><div class="beam" id="beam"></div><div class="hdr">{"".join(header)}</div><div class="plot"><div class="dots"></div>'
+    body = (f'<div class="card">{GRAIN}<div class="spot"></div><div class="spec-top"></div><div class="beam" id="beam"></div><div class="hdr">{"".join(header)}</div><div class="plot"><div class="dots"></div>'
             f'{glow}{chart.body}</div><div class="ftr">{foot}</div><div class="rim"></div></div>')
     return css, body, chart.js, m, chart.libs
 
@@ -1553,20 +1735,40 @@ def scene(card: Card, brand: BrandKit) -> tuple[str, Motion, int, int, int]:
     and fades out over its last 0.4 s; a split chart's card stays whole and leaves with
     the panel (core.dynamic_layout slides it down)."""
     duration = max(0.5, card.end - card.start)
+    brand = with_entity(card, brand)
+    css, body, script, motion, libs = _build(card, brand)
+    motion.warp_to(_lead(card), ENTRANCE_END)  # Round 35: in and still by 1.2 s
     if MODES[card.template] == "overlay":
-        css, body, motion = OVERLAYS[card.template](card, brand.accent)
-        script, libs = "", ()
         width, height, top = FRAME_W, FRAME_H, 0
-        gone = duration - 1 / FPS  # fully faded on the last frame, so nothing pops off
+        gone = motion.story(duration - 1 / FPS)  # fully faded on the last frame, so nothing pops off
         motion.tween(".stage", "opacity", gone - EXIT, gone, "1", "0", EASE_OUT_EXIT)
         motion.tween(".stage", "transform", gone - EXIT, gone, "translateY(0px)", "translateY(18px)", EASE_OUT_EXIT)
     else:
-        css, body, script, motion, libs = _split_scene(card, brand)
         width, height, top = FRAME_W, SPLIT_H, SPLIT_TOP
     page = (f"<!doctype html><html><head><meta charset='utf-8'><style>{_base_css(width, height)}{css}</style>"
-            f"<script>{RUNTIME}</script>{_scripts(libs)}</head><body><div class='stage'>{body}</div>"
-            f"<script>{script}</script></body></html>")
+            f"<script>{RUNTIME}window.NAV_WARP = {json.dumps(list(motion.warp))};</script>{_scripts(libs)}</head>"
+            f"<body><div class='stage'>{body}</div><script>{script}</script></body></html>")
     return page, motion, width, height, top
+
+
+def _build(card: Card, brand: BrandKit) -> tuple[str, str, str, Motion, tuple[str, ...]]:
+    """(css, body, script, motion, libraries) of a card, its way out not included."""
+    if MODES[card.template] == "overlay":
+        css, body, motion = OVERLAYS[card.template](card, brand.accent)
+        return css, body, "", motion, ()
+    return _split_scene(card, brand)
+
+
+def cues(card: Card, brand: BrandKit | None = None) -> list[tuple[float, str]]:
+    """Round 35: (real seconds from the card's start, kind) of each micro sound effect:
+    a soft whoosh as a Bento visual comes in, a tick when a step or a comparison side
+    lights up. Name cards make no sound."""
+    if card.template == "speaker_title":
+        return []
+    motion = _build(card, with_entity(card, brand or BrandKit()))[3]
+    motion.warp_to(_lead(card), ENTRANCE_END)
+    found = [(0.0, "whoosh")] + [(round(motion.real(t), 4), kind) for t, kind in motion.cues]
+    return sorted(found)
 
 
 def _lead(card: Card) -> float:
@@ -1616,15 +1818,13 @@ def settle_time(card: Card) -> float:
     """Seconds from the card's start until nothing in it moves any more (its way out not
     counted): what the hold is measured from."""
     try:
-        if MODES[card.template] == "overlay":
-            motion = OVERLAYS[card.template](card, BrandKit().accent)[2]
-        elif card.template == "candlestick_ema" and not Path(card.data_path).is_file():
-            return 2.6
-        else:
-            motion = _split_scene(card, BrandKit())[3]
-        return round(motion.last(), 3)
+        if card.template in DATA_CHARTS and not Path(card.data_path).is_file():
+            return ENTRANCE_END
+        motion = _build(card, BrandKit())[3]
+        motion.warp_to(_lead(card), ENTRANCE_END)
+        return round(motion.real(motion.last()), 3)
     except Exception:  # noqa: BLE001 - a card the builder can't draw is caught at render time
-        return _lead(card) + 1.0 + ROLL
+        return ENTRANCE_END
 
 
 def compact(card: Card) -> Card | None:

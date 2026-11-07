@@ -567,10 +567,23 @@ def compose_cards(
                 graph.append(f"[{current}][split{k}]overlay=0:0:enable='{on}'[v{n + 1}]")
             current, n = f"v{n + 1}", n + 1
     graph.append(f"[{current}]ass='{ass.name}':fontsdir='{FONTS}'[out]")
+    # Round 35: the graphics' micro sound effects (core.audio_polish), one track with every cue
+    # at its exact sample, mixed under the clip's own audio. Only the audio is re-encoded; the
+    # video's frames pass through untouched (-fps_mode passthrough), so lip-sync can't drift.
+    audio = ["-map", "0:a?", "-c:a", "copy"]
+    from core import audio_polish
+
+    if audio_polish.enabled() and _has_audio(base_clip):
+        track = audio_polish.cue_track(audio_polish.clip_cues(edit, windows), duration, work / "sfx.wav")
+        if track is not None:
+            inputs += ["-i", str(track)]
+            graph.append(f"[0:a][{next_input}:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]")
+            audio = ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
+            next_input += 1
     command = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error", *inputs,
-        "-filter_complex", ";".join(graph), "-map", "[out]", "-map", "0:a?",
-        *_video_encoder_args(ffmpeg), "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
+        "-filter_complex", ";".join(graph), "-map", "[out]", *audio,
+        *_video_encoder_args(ffmpeg), "-pix_fmt", "yuv420p", *PASSTHROUGH, "-movflags", "+faststart",
         "-t", f"{duration:.3f}", str(output),
     ]
     try:
@@ -580,6 +593,16 @@ def compose_cards(
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return output
+
+
+def _has_audio(path: Path) -> bool:
+    """The clip has a sound track."""
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                            "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+    return bool(probe.stdout.strip())
+
+
+PASSTHROUGH = ("-fps_mode", "passthrough")  # every video frame written as it comes: none dropped or doubled
 
 
 def render_with_cards(

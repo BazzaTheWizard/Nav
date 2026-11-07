@@ -25,10 +25,10 @@ from typing import Any
 
 from core.edl import MODES, Card, ClipEdit
 
-MIN_CARD_SECONDS = 5.0  # Round 33: a chart is on screen 5-6 s (shorter, it is gone before anyone reads it)
+MIN_CARD_SECONDS = 5.0  # a chart is on screen 5-6 s: in by 1.2 s, still for 3.8 s, out in 0.4 s (Round 35)
 MIN_OVERLAY_SECONDS = 4.5  # a number or boxes over the speaker: 4.5-6 s
-BUILD_SECONDS = 1.0  # every item of a graphic starts coming in within this long of the first
-READ_HOLD = 3.5  # ...then the finished graphic holds completely still at least this long
+BUILD_SECONDS = 0.5  # every item of a graphic starts coming in within this long of the first (Round 35)
+READ_HOLD = 3.8  # ...then the finished graphic (in by 1.2 s, core.cards.ENTRANCE_END) holds completely still
 BENTO_MAX_SECONDS = 6.0  # and leaves: no graphic outstays what there is to read
 EXIT_SECONDS = 0.4  # the way out (an overlay fades and slides, a chart's panel slides down)
 HOOK_SECONDS = 3.0  # the first seconds stay full-screen: the hook is the speaker
@@ -563,7 +563,7 @@ def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float
              "comparison_card": (2, 2), "step_sequence": (2, 4),
              "metric_bars": (2, 4), "ranked_bars": (2, 5), "diverging_bar": (2, 2), "share_split": (2, 5),
              "trend_line": (2, 6), "arr_bridge": (3, 7), "sankey_flow": (3, 8), "cac_payback": (2, 2),
-             "drawdown_curve": (2, 2), "candlestick_ema": (0, 0), "stat_pill": (1, 4)}[card.template]
+             "drawdown_curve": (2, 2), "candlestick_ema": (0, 0), "stat_pill": (1, 4), "market_line": (2, 3)}[card.template]
     if not count[0] <= len(rows) <= count[1]:
         errors.append(f"This graphic takes {count[0]}{'' if count[0] == count[1] else f' to {count[1]}'} items.")
         return result
@@ -586,6 +586,23 @@ def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float
         if not 2.5 <= card.end - card.start <= 4.5:
             errors.append("A name card stays on 2.5 to 4.5 s (3.3 s is best).")
         rows[0].reveal_at = card.start
+        return result
+    if card.template == "market_line":  # Round 35: real data (core.market_data), with its source
+        from core import entity_enricher
+        from core.cards import read_series
+
+        if not card.source.strip():
+            errors.append("Say where the data comes from (Source).")
+        try:
+            if len(read_series(card.data_path)) < 4:
+                errors.append("The data file needs at least 4 points (date, value).")
+        except OSError:
+            errors.append("The data file is missing (CSV: date, value).")
+        named = " ".join(str(w.text) for w in _in_window(words, card.start - LINE_LOOKBACK, card.end))
+        if card.entity and card.entity not in entity_enricher.detect(named):
+            errors.append(f"{entity_enricher.ENTITIES[card.entity].name if card.entity in entity_enricher.ENTITIES else card.entity}"
+                          " isn't named while the chart is on screen.")
+        result.warnings.append("Drawn from real market data, not from what was said: it shows its source.")
         return result
     if card.template == "candlestick_ema":
         from core.cards import read_prices  # a chart from your file: no transcript numbers to check
