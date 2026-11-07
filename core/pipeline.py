@@ -65,6 +65,29 @@ class RenderedClip:
     graphics_notes: tuple[str, ...] = ()  # what the graphics director added or left out, and why
 
 
+@dataclass(frozen=True)
+class EditProfile:
+    """Round 32: the editing choices a clip is made with, the same for 🎬 Make clips and the
+    autonomous worker: framing (layout, the explainer layout for slide videos), the title
+    card, the 59 s cap, and the graphics director (1-2 Bento visuals and every speaker's
+    name card, settings.auto_graphics). Captions, subtitle styling, speaker ID and the
+    graphics engine all run inside render_selected_clip, which both call with these."""
+
+    layout_mode: str = "auto"
+    allow_explainer: bool = True  # "auto" may pick the explainer layout for a faceless slide video
+    title_fade_in: bool = False  # False: the title card is on screen from the first frame
+    pin_title: bool = False  # True: the title card stays for the whole clip
+    max_seconds: float | None = 59.0  # YouTube blocks claimed Shorts over a minute
+
+    def render_kwargs(self) -> dict[str, Any]:
+        """The arguments render_selected_clip takes from this profile."""
+        return {"layout_mode": self.layout_mode, "pin_title": self.pin_title, "title_fade_in": self.title_fade_in,
+                "allow_explainer": self.allow_explainer and self.layout_mode == "auto"}
+
+
+STANDARD_EDIT = EditProfile()  # Make clips' defaults, and what the worker always uses
+
+
 def choose_layout(requested: str, plan: CropPlan | None) -> str:
     """Resolve "auto" to a concrete layout; explicit layouts are respected."""
     if requested != "auto":

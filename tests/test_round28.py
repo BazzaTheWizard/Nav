@@ -238,18 +238,20 @@ wrong = idea("kinetic_range", 5, 5, 9, [{"value": "$9M"}])
 direction = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=answer(change, hedged, fluff, wrong))
 kinds = [(c.template, c.rows[0].value) for c in direction.edit.cards]
 check("Director: real data moments get a graphic, each checked", ("kinetic_range", "$2M → $8M") in kinds, str(direction.notes))
-check("...the speaker's hedge is added, not dropped (\"about five trillion\" -> ~$5T)", ("kinetic_range", "~$5T") in kinds,
-      str(direction.notes))
+# Round 32: Bento visuals start 12 s apart, so the hedge is checked on its own clip.
+hedge_only = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=answer(hedged))
+check("...the speaker's hedge is added, not dropped (\"about five trillion\" -> ~$5T)",
+      ("kinetic_range", "~$5T") in [(c.template, c.rows[0].value) for c in hedge_only.edit.cards], str(hedge_only.notes))
 check("...a casual number scored low is skipped", any("not strong enough" in n for n in direction.notes))
 check("...a number that wasn't said never gets on screen", not any(c.rows[0].value == "$9M" for c in direction.edit.cards)
       and any("Dropped" in n and "$9M" in n for n in direction.notes), str(direction.notes))
 check("...and every graphic passes the renderer's own check", all(r.ok for r in K.check_edit(direction.edit, talk, 4.0)))
 short_end = talk[0].start + 25.0
 short = G.direct(talk, 100.0, short_end, info=INFO, hook_seconds=4.0, ask=answer(change, hedged))
-check("Density (Round 30): at most two graphics in a clip under 25 s, three otherwise",
-      len(short.edit.cards) <= G.max_graphics(short_end - 100.0) and G.max_graphics(24.0) == 2
-      and G.max_graphics(45.0) == 3, str(short.notes))
-check("The prompt states the limit and when the title is up", "At most 3 graphics" in G.build_prompt(
+check("Density (Round 32: 1-2 Bento visuals, one under 25 s; name cards never count)",
+      len([c for c in short.edit.cards if c.template != "speaker_title"]) <= G.max_graphics(short_end - 100.0)
+      and G.max_graphics(24.0) == 1 and G.max_graphics(45.0) == 2, str(short.notes))
+check("The prompt states the limit and when the title is up", "At most 2 graphics" in G.build_prompt(
     spans, 100.0, 45.0, 4.0, INFO) and "No graphic before 4.0 s" in G.build_prompt(spans, 100.0, 45.0, 4.0, INFO))
 named = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0,
                  ask=answer(speaker={"name": "Dana Reyes", "role": "CEO, Northwind Labs"}))
@@ -259,7 +261,8 @@ check("Name card from the video's own title and description, right after the tit
       and abs(card.start - 104.2) < 1e-6 and abs(card.end - card.start - 3.3) < 1e-6, str(named.notes))
 G._GUESTS.clear()  # Round 29: a video's guest is remembered for its other clips; start fresh here
 made_up = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=answer(speaker={"name": "Sam Altman", "role": "CEO"}))
-check("...never a name that isn't in the title or description", not made_up.edit.cards)
+check("...never a name that isn't in the title or description",
+      not any(c.template == "speaker_title" and "Altman" in c.rows[0].label for c in made_up.edit.cards), str(made_up.notes))
 check("...never the channel's own host", G.grounded_name({"name": "Founders Podcast", "role": ""}, INFO) is None)
 check("...a role it can't find there is left off", G.grounded_name({"name": "Dana Reyes", "role": "Nobel laureate"}, INFO)
       == ("Dana Reyes", ""))
@@ -268,9 +271,12 @@ both = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0,
 check("The name card makes room for the data graphic (no overlap, 1.5 s apart)",
       len(both.edit.cards) == 2 and all(r.ok for r in K.check_edit(both.edit, talk, 4.0)), str(both.notes))
 none = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=lambda p, s: None)
-check("No AI key: no graphics, and it says why", not none.edit.cards and "no AI key" in none.notes[0])
+bento = lambda d: [c for c in d.edit.cards if c.template != "speaker_title"]  # noqa: E731
+check("No AI key: it says why, and the clip still gets a visual from the transcript (Round 32: never zero)",
+      "no AI key" in none.notes[0] and len(bento(none)) == 1, str(none.notes))
 junk = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=lambda p, s: "not json")
-check("An unusable AI answer: no graphics, the clip still renders", not junk.edit.cards and "unusable" in junk.notes[0])
+check("An unusable AI answer: it says so, and the visual comes from the transcript",
+      "unusable" in junk.notes[0] and len(bento(junk)) == 1, str(junk.notes))
 from core.service_pause import ServicePause  # noqa: E402
 
 
@@ -279,7 +285,8 @@ def limit(prompt, system):
 
 
 paused = G.direct(talk, 100.0, clip_end, info=INFO, hook_seconds=4.0, ask=limit)
-check("A used-up AI limit doesn't stop the clip (no graphics this time)", not paused.edit.cards and "limit" in paused.notes[0])
+check("A used-up AI limit doesn't stop the clip (the visual comes from the transcript)",
+      "limit" in paused.notes[0] and len(bento(paused)) == 1, str(paused.notes))
 
 # changes and spoken numbers
 grade = words_from("I went from being a C student in math to an A student overnight, which was amazing really.", 100.0)
@@ -337,9 +344,11 @@ asked = []
 G.ask_ai = lambda prompt, system: asked.append(prompt) or json.dumps({"graphics": [change], "speaker": None})
 rendered = P.render_selected_clip(plain_source, clip, spoken_talk, settings, tmp / "out" / "auto.mp4",
                                   layout_mode="blurred_background", graphics=INFO)
-check("Make clips and the worker: the graphics are decided and rendered in automatically",
-      rendered.graphics is not None and [c.template for c in rendered.graphics.cards] == ["kinetic_range"]
-      and rendered.path.is_file() and any("Added kinetic_range" in n for n in rendered.graphics_notes), str(rendered.graphics_notes))
+check("Make clips and the worker: the graphics are decided and rendered in automatically (Round 32: with the "
+      "guest's name card, which isn't a Bento visual)",
+      rendered.graphics is not None and [c.template for c in rendered.graphics.cards if c.template != "speaker_title"]
+      == ["kinetic_range"] and rendered.path.is_file() and any("Added kinetic_range" in n for n in rendered.graphics_notes),
+      str(rendered.graphics_notes))
 check("...the director sees the clip's own sentences, with clip times", asked and "S2 [" in asked[-1] and "$2 million" in asked[-1])
 asked.clear()
 off = P.render_selected_clip(plain_source, clip, spoken_talk, dataclasses.replace(settings, auto_graphics=False),
@@ -348,7 +357,9 @@ check("AUTO_GRAPHICS=0 turns it off", off.graphics is None and not asked)
 G.ask_ai = lambda prompt, system: "not json"
 fallback = P.render_selected_clip(plain_source, clip, spoken_talk, settings, tmp / "out" / "plain.mp4",
                                   layout_mode="blurred_background", graphics=INFO)
-check("No usable graphics: the clip renders exactly as before", fallback.graphics is None and fallback.path.is_file())
+check("An unusable AI answer: the clip still renders, with a visual from its own transcript (Round 32: never zero)",
+      fallback.path.is_file() and fallback.graphics is not None
+      and any(c.template != "speaker_title" for c in fallback.graphics.cards), str(fallback.graphics_notes))
 
 # ---------- the app ----------
 from streamlit.testing.v1 import AppTest  # noqa: E402

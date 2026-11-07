@@ -63,9 +63,10 @@ from core.lead_harvester import (
     lead_profile,
 )
 from core.graphics_director import VideoInfo
-from core.hook_selector import replay_peaks
+from core.hook_selector import cap_clip_length, replay_peaks
 from core.pipeline import (
     MIN_CLIPS,
+    STANDARD_EDIT,
     WeakMoments,
     pick_clips_with_agent,
     render_selected_clip,
@@ -1606,6 +1607,20 @@ def _content_kind(report: dict[str, Any], subject: str, email: str) -> str:
     return "episode" if subject.rstrip().endswith(" episode") or " from the episode " in email else "video"
 
 
+def _cap_like_make_clips(clips: list[ClipResult], words: list[Word], report: dict[str, Any]) -> list[ClipResult]:
+    """Round 32: the worker's clips end on a finished sentence at 59 s at most, like Make
+    clips' "59 s max" (STANDARD_EDIT.max_seconds); the pitch's clip length follows."""
+    if not STANDARD_EDIT.max_seconds or not clips:
+        return clips
+    capped = cap_clip_length(clips, words, STANDARD_EDIT.max_seconds)
+    facts = report.get("pitch_facts")
+    if isinstance(facts, dict):
+        for clip in capped:
+            if abs(clip.start_time - float(facts.get("at", -1e9))) < 0.06:
+                facts["seconds"] = round(clip.end_time - clip.start_time, 1)
+    return capped
+
+
 def _render_selected_clips(
     source_path: Path,
     clips: list[ClipResult],
@@ -1627,10 +1642,10 @@ def _render_selected_clips(
             words,
             settings,
             job_dir / f"clip_{index:02d}.mp4",
-            layout_mode="auto",
             work_dir=job_dir,
-            title_fade_in=False,  # the hook is on screen from the very first frame
             graphics=graphics,
+            # Round 32: exactly Make clips' editing (layout, title card, explainer, graphics).
+            **STANDARD_EDIT.render_kwargs(),
         )
         for index, clip in enumerate(clips, start=1)
     ]
@@ -1789,6 +1804,7 @@ def _process_lead(
             )
         except WeakMoments as exc:
             raise NotAFit(f"weak moments: {exc}") from exc
+        clips = _cap_like_make_clips(clips, words, report)
         layouts: list[str] = []
         rendered_items: list[Any] = []
         rendered = _render_selected_clips(

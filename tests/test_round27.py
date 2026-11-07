@@ -66,8 +66,9 @@ check("Signed values for waterfalls (+$3.2M, −$0.4M)",
       K.signed_value("+$3.2M") == 3.2 and K.signed_value("−$0.4M") == -0.4)
 check("Sentences split on . ? !", SPANS[0][2] == "Where's all this money going to come from?" and len(SPANS) == 6,
       str(len(SPANS)))
-check("The library: 15 graphics, 4 over the speaker and 11 charts (Round 29 added the fall-and-recovery curve, "
-      "Round 30 the micro-stat)", len(TEMPLATES) == 15 and sum(MODES[t] == "overlay" for t in TEMPLATES) == 4)
+check("The library: 17 graphics, 4 over the speaker and 13 charts (Round 29 added the fall-and-recovery curve, "
+      "Round 30 the micro-stat, Round 32 the comparison card and the step sequence)",
+      len(TEMPLATES) == 17 and sum(MODES[t] == "overlay" for t in TEMPLATES) == 4)
 
 # ---------- the checks: a breakdown chart (the S&P moment) ----------
 card_start, card_end = SPANS[2][0], SPANS[4][1] + 0.15
@@ -244,8 +245,8 @@ res = K.check_card(candle, WORDS, CLIP_START, CLIP_END)
 ok["candlestick_ema"] = candle
 check("Price chart with a file and a source passes (flagged as drawn from the file)", res.ok and res.warnings, str(res.errors))
 ok["metric_bars"] = good
-check("Every graphic has a passing example (the micro-stat's is in test_round30)",
-      set(ok) == set(TEMPLATES) - {"stat_pill"}, str(set(TEMPLATES) - set(ok)))
+check("Every graphic has a passing example (the micro-stat's is in test_round30, Round 32's cards in test_round32)",
+      set(ok) == set(TEMPLATES) - {"stat_pill", "comparison_card", "step_sequence"}, str(set(TEMPLATES) - set(ok)))
 
 # ---------- restraint: clip-wide caps and gaps ----------
 results = K.check_edit(ClipEdit(CLIP_START, CLIP_END, cards=[sp_card(), sp_card(start=card_start + 1),

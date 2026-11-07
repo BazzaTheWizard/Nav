@@ -95,7 +95,7 @@ class Frames24:
         self.frames = {}
         for lo, hi in ranges:
             raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"select='between(n\\,{lo}\\,{hi})'",
-                                  "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                                  "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
                                  capture_output=True, check=True).stdout
             for k, frame in enumerate(np.frombuffer(raw, np.uint8).reshape(-1, 1920, 1080, 3)):
                 self.frames[lo + k] = frame
@@ -169,9 +169,9 @@ check("Under a chart, the small captions start once the panel is in and end befo
                     for a, b in times), f"{times[:2]} landed {landed - edit.start:.2f}")
 
 # ---------- more visuals: 2-3 per clip, the micro-stat, the context layer ----------
-check("Up to 3 graphics in a clip (2 under 25 s); 2 charts, 3 over the speaker",
-      G.max_graphics(40) == 3 and G.max_graphics(20) == 2 and K.MAX_CARDS == 2 and K.MAX_OVERLAYS == 3
-      and K.MAX_GRAPHICS == 3)
+check("Round 32: up to 2 Bento visuals in a clip (1 under 25 s); 2 charts, 3 over the speaker",
+      G.max_graphics(40) == 2 and G.max_graphics(20) == 1 and K.MAX_CARDS == 2 and K.MAX_OVERLAYS == 3
+      and K.MAX_GRAPHICS == 2)
 check("The micro-stat is in the library, over the speaker", "stat_pill" in TEMPLATES and MODES["stat_pill"] == "overlay")
 money = words("and the big thing is we are at 40 million in ARR now after only 18 months of selling it to banks",
               start=100.0)

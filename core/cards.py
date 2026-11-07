@@ -24,6 +24,10 @@ footer (14%: the "In context" strip, or the chart's key). With nothing for the f
 the chart takes its room, so the card never shows an empty band. The empty card rides
 in with the panel, its contents draw once the panel lands, and it leaves with the panel.
 
+Round 32: two qualitative Bento cards for talk with no chartable numbers, drawn in plain
+HTML in the same card: the comparison (two sides of the speaker's contrast) and the step
+sequence (2-4 steps of their framework, a rail drawing down as each is said).
+
 Name cards, micro-stats and the over-the-speaker graphics stay on the video as glass
 pills. The blur behind them is FFmpeg's (core.dynamic_layout), measured from the page:
 a transparent PNG can't blur the video under it.
@@ -106,6 +110,7 @@ EYEBROWS = {
     "timeline": "Timeline", "metric_bars": "Breakdown", "ranked_bars": "Ranking", "diverging_bar": "Head to head",
     "share_split": "Share of the total", "trend_line": "Trend", "arr_bridge": "ARR bridge", "sankey_flow": "Cash flow",
     "cac_payback": "CAC payback", "drawdown_curve": "Drawdown", "candlestick_ema": "Price action",
+    "comparison_card": "The contrast", "step_sequence": "Step by step",
 }
 KEYED = {"candlestick_ema"}  # charts whose footer always holds their key (a source, a legend)
 
@@ -1242,6 +1247,99 @@ def _candlestick_ema(card: Card, accent: str, ph: int) -> Chart:
     return Chart(css, '<div id="lw"></div>', m, js, ("lightweight",), (CARD_W * 0.7, ph * 0.4), key=key)
 
 
+def _comparison_card(card: Card, accent: str, ph: int) -> Chart:
+    """Round 32: the speaker's contrast as two sides of one card ("We didn't market" vs
+    "Then we did, and it worked"). Each side lands on its words; the side the point is
+    about (highlight, else the second) takes the accent and the other steps back."""
+    main = next((k for k, row in enumerate(card.rows) if row.highlight), len(card.rows) - 1)
+    gap, top = 64, 30
+    side_w, side_h = (IW - gap) / 2, ph - 2 * top
+    css = f"""
+.cmp {{ position: absolute; top: {top}px; width: {side_w:.0f}px; height: {side_h:.0f}px; border-radius: 16px;
+  border: 1px solid rgba(255,255,255,.10); background: rgba(255,255,255,.025); padding: 40px 34px 34px; }}
+.cmp .tag {{ display: inline-block; max-width: 100%; height: 46px; line-height: 44px; padding: 0 18px; border-radius: 23px;
+  border: 1px solid rgba(255,255,255,.18); font-size: 24px; font-weight: 650; color: {SOFT}; white-space: nowrap;
+  overflow: hidden; margin-bottom: 26px; }}
+.cmp .head {{ font-family: "Instrument Serif", Georgia, serif; font-size: 58px; line-height: 1.04; letter-spacing: -.01em;
+  max-height: 126px; overflow: hidden; }}
+.cmp .line {{ margin-top: 22px; font-size: 31px; font-weight: 500; line-height: 1.28; color: {SOFT}; max-height: 160px;
+  overflow: hidden; }}
+.cmp .edge {{ position: absolute; left: 0; top: 22px; bottom: 22px; width: 4px; border-radius: 2px; background: {accent};
+  opacity: 0; }}
+.vs {{ position: absolute; left: {PAD + side_w + gap / 2 - 30:.0f}px; top: {ph / 2 - 30:.0f}px; width: 60px; height: 60px;
+  border-radius: 30px; background: {CARD_BG}; border: 1px solid {RULE}; color: {SOFT}; font-size: 20px; font-weight: 700;
+  letter-spacing: .08em; display: flex; align-items: center; justify-content: center; }}
+"""
+    m = Motion()
+    parts = []
+    times = [_at(card, row.reveal_at, 0.5 + 0.9 * k) for k, row in enumerate(card.rows)]
+    for k, row in enumerate(card.rows):
+        left = PAD + k * (side_w + gap)
+        tag = f'<div class="tag num fit" id="ct{k}">{_e(row.value)}</div>' if row.value.strip() else ""
+        line = f'<div class="line fitv">{_e(row.detail)}</div>' if row.detail.strip() else ""
+        parts.append(f'<div class="cmp" id="c{k}" style="left:{left:.0f}px"><div class="edge" id="ce{k}"></div>{tag}'
+                     f'<div class="head fitv" id="ch{k}">{_e(row.label)}</div>{line}</div>')
+        m.fade_up(f"#c{k}", times[k], rise=18, length=0.45)
+    parts.append('<div class="vs" id="vs">VS</div>')
+    m.tween("#vs", "opacity", times[0] + 0.2, times[0] + 0.5, "0", "1")
+    t = times[main] + 0.35
+    m.tween(f"#c{main}", "borderColor", t, t + 0.3, "rgba(255,255,255,.10)", _rgba(accent, 0.55))
+    m.tween(f"#c{main}", "backgroundColor", t, t + 0.3, "rgba(255,255,255,.025)", _rgba(accent, 0.08))
+    m.tween(f"#ce{main}", "opacity", t, t + 0.3, "0", "1")
+    m.tween(f"#ch{main}", "color", t, t + 0.3, INK, accent)
+    if row_other := [k for k in range(len(card.rows)) if k != main]:
+        m.tween(f"#c{row_other[0]}", "opacity", max(t, times[row_other[0]] + 0.5), max(t, times[row_other[0]] + 0.5) + 0.35,
+                "1", ".55")
+    focal = (PAD + main * (side_w + gap) + side_w / 2, ph / 2)
+    return Chart(css, "".join(parts), m, "", (), focal)
+
+
+def _step_sequence(card: Card, accent: str, ph: int) -> Chart:
+    """Round 32: the speaker's framework as 2-4 steps in the order said. A rail draws down
+    from step to step as each one is said; the newest step is the active one."""
+    n = len(card.rows)
+    pitch = min(176.0, (ph - 60) / n)
+    top = (ph - pitch * n) / 2
+    dot_x = PAD + 34
+    text_x = PAD + 100
+    css = f"""
+.step {{ position: absolute; left: {text_x}px; right: {PAD}px; height: {pitch:.0f}px; display: flex; flex-direction: column;
+  justify-content: center; }}
+.step .lbl {{ font-size: 48px; font-weight: 650; letter-spacing: -.015em; line-height: 1.08; white-space: nowrap; overflow: hidden; }}
+.step .dtl {{ margin-top: 8px; font-size: 30px; font-weight: 500; color: {SOFT}; white-space: nowrap; overflow: hidden; }}
+.dot {{ position: absolute; left: {dot_x - 30}px; width: 60px; height: 60px; border-radius: 30px; border: {STROKE}px solid {RULE};
+  background: {CARD_BG}; color: {SOFT}; font-size: 24px; font-weight: 700; display: flex; align-items: center;
+  justify-content: center; }}
+.rail {{ position: absolute; left: {dot_x - STROKE / 2:.0f}px; width: {STROKE}px; background: {RULE}; }}
+.rail.on {{ background: {accent}; transform-origin: 50% 0%; }}
+"""
+    m = Motion()
+    parts = []
+    centers = [top + pitch * (k + 0.5) for k in range(n)]
+    parts.append(f'<div class="rail" style="top:{centers[0]:.0f}px;height:{centers[-1] - centers[0]:.0f}px"></div>')
+    times = [_at(card, row.reveal_at, 0.5 + 0.8 * k) for k, row in enumerate(card.rows)]
+    for k in range(1, n):
+        parts.append(f'<div class="rail on" id="rl{k}" style="top:{centers[k - 1]:.0f}px;'
+                     f'height:{centers[k] - centers[k - 1]:.0f}px"></div>')
+        m.tween(f"#rl{k}", "transform", max(times[k - 1] + 0.1, times[k] - 0.45), times[k], "scaleY(0)", "scaleY(1)")
+    for k, row in enumerate(card.rows):
+        detail = f'<div class="dtl fit">{_e(row.detail)}</div>' if row.detail.strip() else ""
+        parts.append(f'<div class="dot num" id="d{k}" style="top:{centers[k] - 30:.0f}px">{k + 1:02d}</div>'
+                     f'<div class="step" id="s{k}" style="top:{centers[k] - pitch / 2:.0f}px">'
+                     f'<div class="lbl fit" id="l{k}">{_e(row.label)}</div>{detail}</div>')
+        t = times[k]
+        m.fade_up(f"#s{k}", t, rise=14, length=0.4)
+        m.tween(f"#d{k}", "borderColor", t, t + 0.25, RULE, accent)
+        m.tween(f"#d{k}", "color", t, t + 0.25, SOFT, accent)
+        m.tween(f"#l{k}", "color", t, t + 0.25, INK, accent)
+        if k + 1 < n:  # the newest step is the active one
+            nxt = times[k + 1]
+            m.tween(f"#l{k}", "color", nxt, nxt + 0.25, accent, INK)
+            m.tween(f"#d{k}", "color", nxt, nxt + 0.25, accent, INK)
+    focal = (text_x + 200, centers[-1])
+    return Chart(css, "".join(parts), m, "", (), focal)
+
+
 def _nice_step(raw: float) -> float:
     exponent = 10 ** math.floor(math.log10(raw)) if raw > 0 else 1.0
     return next(s * exponent for s in (1, 2, 2.5, 5, 10) if s * exponent >= raw)
@@ -1256,6 +1354,7 @@ CHARTS = {
     "drawdown_curve": _drawdown_curve, "timeline": _timeline, "metric_bars": _metric_bars, "ranked_bars": _ranked_bars,
     "diverging_bar": _diverging_bar, "share_split": _share_split, "trend_line": _trend_line, "arr_bridge": _arr_bridge,
     "sankey_flow": _sankey_flow, "cac_payback": _cac_payback, "candlestick_ema": _candlestick_ema,
+    "comparison_card": _comparison_card, "step_sequence": _step_sequence,
 }
 BUILDERS = {**OVERLAYS, **CHARTS}
 

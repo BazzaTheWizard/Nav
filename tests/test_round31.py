@@ -80,6 +80,12 @@ CARDS = {
     "stat_pill": Card("stat_pill", S, S + 3, rows=[row("ARR", "40M", at=0.4)]),
     "kinetic_range": Card("kinetic_range", S, S + 3, rows=[row("a year in fees", "$850–$1,700", True, 0.5)]),
     "buckets": Card("buckets", S, S + 3, rows=[row("Expected", at=0.4, dashed=True), row("Actual", at=1.2)]),
+    # Round 32: the qualitative Bento cards (their checks are in test_round32)
+    "comparison_card": Card("comparison_card", S, S + 4, headline="Marketing in growth", rows=[
+        row("Venture firms", "Before", at=0.8, detail="didn't market themselves"),
+        row("Then we did", "Now", True, 2.0, detail="and it worked")]),
+    "step_sequence": Card("step_sequence", S, S + 4, rows=[row("Find the market", at=0.6), row("Hire the team", at=1.4),
+                                                          row("Scale the brand", "", True, 2.2, detail="go tell your story")]),
 }
 check("A sample for every graphic", set(CARDS) == set(TEMPLATES), str(set(TEMPLATES) ^ set(CARDS)))
 
@@ -149,7 +155,7 @@ for template, card in CARDS.items():
     except Exception as exc:  # noqa: BLE001
         drawn[template] = exc
 broken = {t: str(f)[:200] for t, f in drawn.items() if isinstance(f, Exception)}
-check("All 15 graphics draw on the new engine", not broken, str(broken))
+check("All 17 graphics draw on the new engine", not broken, str(broken))
 good = {t: f for t, f in drawn.items() if not isinstance(f, Exception)}
 
 

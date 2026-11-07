@@ -37,6 +37,8 @@ from autonomous_worker import (
     get_cached_leads,
     get_recently_passed,
     get_worker_status,
+    load_cached_transcript,
+    save_cached_transcript,
     mark_follow_up,
     prioritize_queued_lead,
     record_clip_trim,
@@ -103,11 +105,14 @@ from core.outreach import (
 from core.hook_selector import ClipResult, cap_clip_length, select_clips
 from core.pipeline import (
     MIN_CLIPS,
+    STANDARD_EDIT,
+    EditProfile,
     pick_clips_with_agent,
     render_selected_clip,
     video_info_and_peaks,
 )
 from core import clip_pages
+from core import made_clips
 from core.pitch_files import (
     accept_trim,
     cut_report,
@@ -599,8 +604,11 @@ def _discard_generated_clips() -> None:
             )
     if source_path is not None:
         source_path.unlink(missing_ok=True)
+    if st.session_state.get("made_batch_id"):  # Round 32: discarded clips leave the batch list too
+        made_clips.remove_batch(str(st.session_state["made_batch_id"]))
 
     for key in (
+        "made_batch_id",
         "generated_clips",
         "published_page",
         "card_drafts",
@@ -660,6 +668,8 @@ def _generate_clips(
     False puts the title card fully on screen from the first frame. Layout "auto" may
     choose the explainer layout for a faceless slide video."""
     settings = load_settings()
+    profile = EditProfile(layout_mode=layout_mode, allow_explainer=STANDARD_EDIT.allow_explainer,
+                          title_fade_in=title_fade_in, pin_title=pin_title, max_seconds=max_seconds)
     output_dir = render_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
     prune_output_folder(output_dir=output_dir)
@@ -694,7 +704,13 @@ def _generate_clips(
 
     try:
         st.write("**Step 1 of 4: Preparing audio**")
-        if is_url:
+        # Round 32: a YouTube video's transcript is saved by its id, as the worker saves it, so
+        # the same video is never transcribed twice and its clips can be checked again later.
+        video_id = youtube_video_id(source_value) if is_url else None
+        cached_words = load_cached_transcript(video_id) if video_id else None
+        if is_url and cached_words is not None:
+            duration = max((float(word.end) for word in cached_words), default=0.0)  # until the video is here
+        elif is_url:
             download_audio_only(
                 source_value,
                 audio_path,
@@ -706,13 +722,14 @@ def _generate_clips(
                 raise ValueError(f"Input video is not a file: {input_path}")
             duration = _video_duration(source_video)
         fingerprint = None if is_url or source_video is None else long_video.file_fingerprint(source_video)
-        words = long_video.load_file_transcript(fingerprint) if fingerprint else None
+        words = cached_words if cached_words is not None else (
+            long_video.load_file_transcript(fingerprint) if fingerprint else None)
         if words is None and source_video is not None and not is_url:
             extract_audio_only(source_video, audio_path)
         update_progress(0.20, "")
 
         if words is not None:
-            st.write("**Step 2 of 4: Reusing this file's saved transcript (no Groq call)**")
+            st.write("**Step 2 of 4: Reusing the saved transcript (no Groq call)**")
         else:
             st.write("**Step 2 of 4: Transcribing speech with Groq**")
             words = transcribe_audio(
@@ -722,6 +739,8 @@ def _generate_clips(
             )
             if fingerprint:
                 long_video.save_file_transcript(fingerprint, words)
+            if video_id:
+                save_cached_transcript(video_id, words)
         update_progress(0.45, "")
 
         st.write("**Step 3 of 4: AI picking the best moments**")
@@ -804,6 +823,8 @@ def _generate_clips(
                     on_progress=stage_progress(0.45, 0.60),
                 )
             )
+            if cached_words is not None:
+                duration = _video_duration(source_video) or duration
         else:
             if source_video is None:
                 raise RuntimeError("No source video is available for rendering.")
@@ -833,13 +854,11 @@ def _generate_clips(
                     words,
                     settings,
                     output_path,
-                    layout_mode=layout_mode,
-                    pin_title=pin_title,
                     webinar_corner=webcam_corner,
                     webinar_options=webinar_options,
-                    title_fade_in=title_fade_in,
-                    allow_explainer=layout_mode == "auto",
                     graphics=video_info,
+                    # Round 32: one editing profile for Make clips and the worker (same defaults).
+                    **profile.render_kwargs(),
                 )
             except Exception:
                 output_path.unlink(missing_ok=True)
@@ -1520,7 +1539,7 @@ PATH_HELP = (
     "key and choose “Copy … as Pathname”, then paste it here."
 )
 HIGHLIGHT_COUNTS = (3, 4, 5, 6, 7)  # 5-7 for your own long videos (one Short per section)
-CAP_SECONDS = 59.0  # YouTube blocks claimed Shorts over 1 minute (a podcast quote can be claimed)
+CAP_SECONDS = STANDARD_EDIT.max_seconds or 59.0  # YouTube blocks claimed Shorts over 1 minute (a podcast quote can be claimed)
 CAP_LABEL = "⏱ 59 s max"
 CAP_HELP = (
     "Keeps every clip at 59 seconds or less, ending on a finished sentence. A Short over one "
@@ -1545,10 +1564,13 @@ def _render_clip_generator() -> None:
     )
     if CLIP_MODES[mode] == "series":
         _render_series_maker()
+        _render_made_batches()
         return
     st.session_state.setdefault("clip_count", HIGHLIGHT_COUNTS[0])
-    st.session_state.setdefault("cap_59", True)
-    st.session_state.setdefault("instant_title", True)
+    # Round 32: the same defaults the worker always uses (core.pipeline.STANDARD_EDIT).
+    st.session_state.setdefault("cap_59", STANDARD_EDIT.max_seconds is not None)
+    st.session_state.setdefault("instant_title", not STANDARD_EDIT.title_fade_in)
+    st.session_state.setdefault("pin_title", STANDARD_EDIT.pin_title)
     count_column, cap_column = st.columns([3, 2], vertical_alignment="bottom")
     clip_count = int(count_column.select_slider(
         "How many clips", options=list(HIGHLIGHT_COUNTS), key="clip_count",
@@ -1595,6 +1617,7 @@ def _render_clip_generator() -> None:
             local_path=local_path,
         )
     _render_generated_clips()
+    _render_made_batches()
 
 
 def _webinar_controls(prefix: str = "") -> tuple[str, dict[str, str]]:
@@ -1670,6 +1693,7 @@ def _make_clips(
         "ai_outreach_subject",
         "agent_video_title",
         "agent_channel_name",
+        "made_batch_id",
     ):
         st.session_state.pop(key, None)
     if sum((bool(video_url.strip()), uploaded_video is not None, bool(local_path.strip()))) != 1:
@@ -1711,6 +1735,7 @@ def _make_clips(
         st.session_state["clip_paths"] = [str(item[0].expanduser().resolve()) for item in generated]
         if generated:
             st.session_state["outreach_input_path"] = str(input_path)
+            _record_made_batch(generated, input_path)
         if len(generated) == clip_count:
             st.success(f"All clips ready. Saved to {render_output_dir()}", icon="✅")
         elif generated:
@@ -1724,6 +1749,24 @@ def _make_clips(
     finally:
         if uploaded_input is not None:
             uploaded_input.unlink(missing_ok=True)
+
+
+def _record_made_batch(generated: list[tuple[Path, ClipResult]], input_path: str | Path) -> None:
+    """Round 32: keep this batch (it survives a restart) so it can be marked as sent."""
+    source = str(input_path) if str(input_path).startswith(("http://", "https://")) else Path(input_path).name
+    try:
+        batch = made_clips.record_batch(
+            str(st.session_state.get("agent_video_title") or st.session_state.get("outreach_title_override") or ""),
+            str(st.session_state.get("agent_channel_name") or st.session_state.get("outreach_channel_override") or ""),
+            source,
+            [{"path": str(path), "title": clip.viral_title, "start": clip.start_time, "end": clip.end_time}
+             for path, clip in generated],
+            batch_id=str(st.session_state.get("active_clip_run_id") or ""),
+        )
+    except OSError:
+        logging.warning("Could not save this batch for the Sent list", exc_info=True)
+        return
+    st.session_state["made_batch_id"] = batch["batch_id"]
 
 
 def _local_video(text: str) -> Path:
@@ -1925,6 +1968,12 @@ def _make_series_batch(
                      made=sorted(set(int(n) for n in state.get("made") or []) | {item["number"] for item in items}))
         series.save_series(key, state)
         st.session_state["series_results"] = {"title": title, "folder": str(folder), "items": items, "total": len(parts)}
+        try:  # Round 32: a Series batch can be marked sent too
+            made_clips.record_batch(title, "", str(folder), [
+                {"path": item["path"], "title": f"Part {item['number']}", "start": item["start"], "end": item["end"]}
+                for item in items], kind="series")
+        except OSError:
+            logging.warning("Could not save the Series batch for the Sent list", exc_info=True)
         st.session_state["series_batch_pending"] = min(batch + 1, series.batch_count(parts))
         st.session_state["series_title_pending"] = title
         progress.progress(1.0, text="Done")
@@ -2007,6 +2056,7 @@ def _render_generated_clips() -> None:
 
     _render_data_cards(generated_clips)
     _render_publish_page(generated_clips)
+    _render_current_batch_sent()
 
     if st.session_state.get("drive_folder_link"):
         st.info("These clips are in Google Drive. Discarding only removes the copies on this Mac.")
@@ -2083,11 +2133,113 @@ CARD_GUIDE: dict[str, tuple[str, dict[str, str]]] = {
                        {"label": "Label (speaker's words)", "value": "Number as said"}),
     "candlestick_ema": ("Drawn from a price file you upload (CSV: date, open, high, low, close, volume), not from "
                         "speech. The chart shows its source.", {}),
+    "comparison_card": ("Two sides of the speaker's contrast (then vs now, them vs us), each a heading and a line in "
+                        "their words, with an optional short tag. Tick 'Focus' on the side the point lands on.",
+                        {"label": "Heading (speaker's words)", "detail": "Line (speaker's words)", "value": "Tag (optional)",
+                         "highlight": "Focus"}),
+    "step_sequence": ("2–4 steps of the speaker's framework, in the order they say them. Each comes in on its words.",
+                      {"label": "Step (speaker's words)", "detail": "Detail (optional)"}),
 }
 CARD_ROWS = {"kinetic_range": 1, "buckets": 3, "stat_pill": 1, "timeline": 3, "metric_bars": 3, "ranked_bars": 3,
              "diverging_bar": 2, "share_split": 3, "trend_line": 4, "arr_bridge": 4, "sankey_flow": 4,
-             "cac_payback": 2, "drawdown_curve": 2}
+             "cac_payback": 2, "drawdown_curve": 2, "comparison_card": 2, "step_sequence": 3}
 NAME_CARD_SECONDS = 3.3
+
+
+# --- 📨 Sent, for Make clips (Round 32): like the Outbox, batches are marked as sent -------
+MADE_VIEWS = {"to send": "📦 To send", "sent": "📨 Sent", "all": "All"}
+
+
+def _sent_date(stamp: Any) -> str:
+    try:
+        return datetime.fromisoformat(str(stamp)).astimezone().strftime("%b %d, %Y")
+    except ValueError:
+        return str(stamp or "")[:10]
+
+
+def _render_current_batch_sent() -> None:
+    """Under the clips just made: mark them as sent once they've gone to the client."""
+    batch_id = st.session_state.get("made_batch_id")
+    batch = made_clips.get(str(batch_id)) if batch_id else None
+    if batch is None:
+        return
+    if made_clips.status(batch) == made_clips.SENT:
+        to = f" to {batch['sent_to']}" if batch.get("sent_to") else ""
+        st.success(f"📨 Sent{to} on {_sent_date(batch.get('sent_at'))}. It's under 📨 Sent below.", icon="✅")
+        if st.button("↩ Move back to To send", key=f"made_unsend_{batch_id}"):
+            made_clips.mark_unsent(str(batch_id))
+            st.rerun()
+        return
+    to_column, button_column = st.columns([3, 2], vertical_alignment="bottom")
+    sent_to = to_column.text_input("Sent to (optional)", key=f"made_sent_to_{batch_id}",
+                                   placeholder="e.g. the client's name or email")
+    if button_column.button("✅ Mark these clips as Sent", type="primary", key=f"made_send_{batch_id}",
+                            use_container_width=True,
+                            help="Click after you've sent them (the page link, the Drive folder or the files). "
+                                 "They move to 📨 Sent below, and stay there after the app restarts."):
+        made_clips.mark_sent(str(batch_id), sent_to=sent_to)
+        st.rerun()
+
+
+def _render_made_batches() -> None:
+    """Every batch made here, to send or sent (kept across restarts), like the Outbox and
+    the 📨 Sent tab are for the worker's pitches."""
+    counts = made_clips.counts()
+    if not counts[made_clips.TO_SEND] and not counts[made_clips.SENT]:
+        return
+    st.subheader("📦 Your batches")
+    labels = {"to send": f"📦 To send ({counts[made_clips.TO_SEND]})", "sent": f"📨 Sent ({counts[made_clips.SENT]})",
+              "all": "All"}
+    if st.session_state.get("made_view") not in labels:
+        st.session_state["made_view"] = "to send"
+    view = st.segmented_control("Show", list(labels), format_func=labels.get, key="made_view",
+                                label_visibility="collapsed") or "to send"
+    shown = made_clips.batches(view)
+    if not shown:
+        st.caption("Nothing here yet." if view != "sent" else
+                   "Batches you mark as sent show up here, with when and who they went to.")
+        return
+    for batch in shown[:30]:
+        _render_made_batch(batch)
+
+
+def _render_made_batch(batch: dict[str, Any]) -> None:
+    batch_id = str(batch["batch_id"])
+    state = made_clips.status(batch)
+    clips = batch.get("clips") or []
+    badge = {"sent": "📨 Sent", "partly sent": "🟡 Partly sent", "to send": "📦 To send"}[state]
+    title = batch.get("video_title") or batch.get("source") or "Clips"
+    who = f" · {batch['channel_title']}" if batch.get("channel_title") else ""
+    with st.container(border=True, key=f"made_batch_{batch_id}"):
+        st.markdown(f"**{title}**{who} · {len(clips)} clip{'s' if len(clips) != 1 else ''} · made "
+                    f"{_sent_date(batch.get('created_at'))} · {badge}")
+        if state == "sent":
+            to = f" to {batch['sent_to']}" if batch.get("sent_to") else ""
+            st.caption(f"Sent{to} on {_sent_date(batch.get('sent_at'))}.")
+        if batch.get("page_url"):
+            st.caption(f"Preview page: {batch['page_url']}")
+        for k, clip in enumerate(clips):
+            here = Path(str(clip.get("path"))).is_file()
+            label = (f"{clip.get('title') or f'Clip {k + 1}'} · {_clock(float(clip.get('start') or 0))}"
+                     f"{'' if here else ' (file no longer on this Mac)'}")
+            key = f"made_clip_{batch_id}_{k}"
+            st.session_state[key] = bool(clip.get("sent_at"))
+            st.checkbox(label, key=key, on_change=_toggle_made_clip, args=(batch_id, str(clip.get("path")), key),
+                        help="Ticked: this clip was sent.")
+        if state == "sent":
+            if st.button("↩ Move back to To send", key=f"made_back_{batch_id}"):
+                made_clips.mark_unsent(batch_id)
+                st.rerun()
+        elif st.button("✅ Mark batch as Sent", key=f"made_all_{batch_id}", type="primary"):
+            made_clips.mark_sent(batch_id)
+            st.rerun()
+
+
+def _toggle_made_clip(batch_id: str, path: str, key: str) -> None:
+    if st.session_state.get(key):
+        made_clips.mark_sent(batch_id, [path])
+    else:
+        made_clips.mark_unsent(batch_id, [path])
 
 
 def _render_brand_kit() -> None:
@@ -2158,14 +2310,16 @@ def _new_card(template: str, key: str, clip: Any, spans: list[tuple[float, float
         config = {
             field: (st.column_config.CheckboxColumn(header, width="small") if field in {"highlight", "dashed"}
                     else st.column_config.TextColumn(header, max_chars={
-                        "value": CARD_LIMITS["value"], "detail": CARD_LIMITS["detail"], "parent": CARD_LIMITS["label"],
-                        "label": CARD_LIMITS["box" if template == "buckets" else
-                                             "context" if template == "kinetic_range" else "label"],
+                        "value": CARD_LIMITS["value"], "parent": CARD_LIMITS["label"],
+                        "detail": CARD_LIMITS["context" if template == "comparison_card" else "detail"],
+                        "label": 24 if template in {"comparison_card", "step_sequence"} else
+                        CARD_LIMITS["box" if template == "buckets" else "context" if template == "kinetic_range" else "label"],
                     }[field]))
             for field, header in fields.items()
         }
         edited = st.data_editor([dict(blank) for _ in range(CARD_ROWS[template])], column_config=config,
-                                num_rows="fixed" if template in {"kinetic_range", "diverging_bar", "cac_payback", "drawdown_curve"}
+                                num_rows="fixed" if template in {"kinetic_range", "diverging_bar", "cac_payback", "drawdown_curve",
+                                                                 "comparison_card"}
                                 else "dynamic", hide_index=True, use_container_width=True,
                                 key=f"card_rows_{key}_{template}")
         for item in edited:
@@ -2242,6 +2396,9 @@ def _swap_clip(index: int, old_path: Path, new_path: Path, new_clip: Any, contex
         drafts[_clip_key(new_path)] = drafts.pop(_clip_key(old_path))
     st.session_state.get("cards_changed", set()).discard(_clip_key(old_path))
     st.session_state.pop("published_page", None)  # a page should show the new version
+    if st.session_state.get("made_batch_id"):
+        made_clips.replace_clip(str(st.session_state["made_batch_id"]), old_path, new_path,
+                                new_clip.start_time, new_clip.end_time)
     if Path(old_path).resolve() != Path(new_path).resolve():
         Path(old_path).unlink(missing_ok=True)
 
@@ -2399,6 +2556,8 @@ def _remove_generated_clip(index: int) -> str:
     if not path.is_symlink() and resolved.parent == output_dir and resolved.suffix.lower() == ".mp4":
         resolved.unlink(missing_ok=True)
     removed = generated.pop(index)
+    if st.session_state.get("made_batch_id"):
+        made_clips.remove_clip(str(st.session_state["made_batch_id"]), path)
     st.session_state["generated_clips"] = generated
     st.session_state["clip_paths"] = [p for p in st.session_state.get("clip_paths", []) if _clip_key(p) != key]
     st.session_state.get("clip_render_contexts", {}).pop(key, None)
@@ -2480,6 +2639,8 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
             return
     # The page's clips in order, so 🗑 Remove clip can take one off it later.
     st.session_state["published_page"] = {**entry, "paths": [_clip_key(clip["path"]) for clip in clips]}
+    if st.session_state.get("made_batch_id"):
+        made_clips.set_page(str(st.session_state["made_batch_id"]), name, url)
     st.rerun()
 
 

@@ -1,76 +1,102 @@
 """🎬 Graphics director (Round 28): decides each clip's graphics on its own.
 
-The AI reads the clip's sentences and proposes at most a couple of graphics (the right
-template, the exact numbers as said, the sentences they cover) plus the guest's name
-card. Nothing it proposes is trusted: every graphic goes through core.card_checks
-(numbers said, same scale, hedges kept, sums add up, hook and payoff clear, restraint
-caps) and is dropped if it fails. Clip picking never sees any of this, so whether a
-graphic fits never changes which clips are made.
+The AI reads the clip's sentences and proposes its visuals (the right template, the exact
+numbers as said, the sentences they cover) and names the people who speak. Nothing it
+proposes is trusted: every graphic goes through core.card_checks (numbers said, same
+scale, hedges kept, sums add up, hook and payoff clear, restraint caps) and is dropped if
+it fails. Clip picking never sees any of this, so whether a graphic fits never changes
+which clips are made.
 
-Density with taste (Round 30; was the Round 28 restraint doctrine): every clean visual
-the talk supports, up to 3 per clip (2 under 25 s): a chart for a real data moment, a
-micro-stat in a corner for a number that backs the point, boxes for 2-3 named ideas. Never
-a visual for a number that's an aside or a joke, never two on top of each other, and none
-is still the right answer when nothing is said that a viewer would want to see. A chart
-can carry a second "in context" layer: what its numbers mean, worked out from what was
-said (one item as a multiple of another, a part of a whole) or a number the speaker
-said elsewhere in the same video. Never a figure from outside the video.
+Round 32: every clip gets 1-2 Bento visuals, at least BENTO_SPACING apart.
+- Tier 1 (quantitative) first: a chart or a number whenever a real metric is said (a
+  multiple, a share, a market size, a split), with the checks' semantic number sense
+  ("14 times safer than a human driver" is Human driver 1x vs 14x).
+- Tier 2 (qualitative) when the talk has no chartable metric: the speaker's contrast or
+  framework as a comparison card, 2-3 boxes, a step sequence or a timeline. The AI always
+  names one in "fallback".
+- Never a chart on a number said in passing (core.card_checks.incidental_card).
+- A visual that fails a check is repaired before it's given up on (the hedge shown, the
+  card moved onto the sentences where its words are said, moved clear of the title, the
+  ending or a name card). If nothing survives: a second, qualitative-only AI request, and
+  then a visual built from the transcript itself, so no clip ships without one.
+Name cards are planned first and separately (core.name_cards.plan_name_cards): one per
+identified speaker, guest and host, never counted as a Bento visual.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from core.card_checks import HOOK_SECONDS, MIN_GAP, PAYOFF_SECONDS, check_edit
+from core.card_checks import (HOOK_SECONDS, MAX_GRAPHICS, MIN_CARD_SECONDS, MIN_GAP, MIN_OVERLAY_SECONDS,
+                              PAYOFF_SECONDS, chartable_numbers, check_edit, incidental_card, parse_value,
+                              same_amount, spoken_numbers)
 from core.edl import MODES, TEMPLATES, BrandKit, Card, ClipEdit, CardRow, sentences
 
 logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-MIN_STRENGTH = 6  # the AI's own 1-10 score; below this the moment isn't worth a graphic
+MIN_STRENGTH = 6  # the AI's own 1-10 score; below this a Tier 1 moment isn't worth a graphic
+FALLBACK_STRENGTH = 3  # a qualitative card (Tier 2) is the fallback: it needs less
 NAME_CARD_SECONDS = 3.3
-_GUESTS: dict[tuple[str, str], tuple[str, str]] = {}  # (title, channel) -> the guest's (name, role)
-SHORT_CLIP_SECONDS = 25  # under this, two graphics at most (three otherwise)
+MIN_BENTO = 1  # Round 32: never a clip without a Bento visual
+BENTO_SPACING = 12.0  # seconds from one Bento visual's start to the next one's (Round 32)
+_GUESTS: dict[tuple[str, str], list["Speaker"]] = {}  # (title, channel) -> the video's identified speakers
+_GUESTS_LOCK = threading.Lock()  # Make clips renders two clips at once
+SHORT_CLIP_SECONDS = 25  # under this, one Bento visual (two otherwise)
 EARLIER_FACTS = 12  # numbers said elsewhere in the video, offered for a chart's context layer
 DIRECTED = tuple(t for t in TEMPLATES if t not in {"speaker_title", "candlestick_ema"})
+QUALITATIVE = ("comparison_card", "buckets", "step_sequence", "timeline")  # Tier 2
 _STOP = {"of", "the", "and", "at", "for", "in", "on", "a", "an", "to", "&"}
 
 SYSTEM_PROMPT = """You are the motion-graphics editor for vertical (9:16) clips cut from
 business podcasts and interviews (B2B, SaaS, venture, consulting, finance), working to
-the standard of The New York Times and Bloomberg. For ONE clip you decide which moments
-get a visual and you write its exact text. Visuals are what make these clips stand out:
-viewers remember a number or a trend they SEE. Find every moment a clean, simple visual
-would make the point land, and add it. Never decorate: no visual is better than filler.
+the standard of The New York Times and Bloomberg. For ONE clip you decide its visuals and
+write their exact text, and you name the people who speak. Visuals are what make these
+clips stand out: viewers remember a number or an idea they SEE.
 
 RULES
-1. Visual moments: a figure that carries the point (money, a percentage, growth, a
-   multiple, a count of customers, months, people), a comparison, a trend, a timeline of
-   2-4 dated points, a financial walk (start, gains, losses, end), parts of a whole, or a
-   named framework of 2-3 kinds or steps. A supporting number (said in passing but real,
-   like "we're at 40 million ARR" or "18 months") is a micro-stat in a corner.
-   Never: casual or rhetorical numbers ("a million times", "two sizes too small",
-   "six times seven"), numbers in a joke or an aside, an age or a year said in passing,
-   a hypothetical unless the hypothetical is the point.
-2. Aim for 2-3 visual moments per clip when the talk has them, at most MAX_GRAPHICS, at
-   most 2 of them charts. Spread them out (a chart, then a micro-stat later, say). An
-   empty list is still right when nothing qualifies.
-3. Exact words. Write every number as it was said, same number and scale
+1. Every clip gets 1 to MAX_GRAPHICS visuals, at least 12 s apart (start to start). Never zero.
+2. Tier 1 first (quantitative): whenever a real metric is said, chart it: a multiple
+   ("14 times safer"), a share ("20% of the S&P 500"), a market size ("$5 trillion"), a
+   split ("half ... and half", "70/30"), growth ("doubled"), money, a count that carries
+   the point. Write the same amount the way the chart needs it:
+   - "14 times safer than a human driver" -> metric_bars [{"label": "Human driver", "value": "1x"},
+     {"label": "Autonomous", "value": "14x", "highlight": true}] (the baseline nobody says, 1x,
+     labelled with what the speaker compares against, in their words);
+   - "20% of the S&P 500" -> share_split [{"label": "...", "value": "20%"}, {"label": "Rest of the S&P 500",
+     "value": "80%"}] (the rest of a whole may be the computed remainder);
+   - "half between Seed and B, half from C+" -> diverging_bar 50% / 50%; "a third" -> 33%;
+     "a quarter" -> 25%; "70-30" -> 70% and 30%; "doubled" -> "2x"; "tripled" -> "3x";
+     "tenfold" -> "10x"; "50 basis points" -> "50 bps"; "$5 trillion" -> "$5T";
+   - "between 10 and 14 times" -> value "10–14x", or "14x" (or the middle, "12x") with the
+     exact range in its label ("Waymo · 10–14x").
+   Stages and relative times are fine time labels: "Seed–Series B", "Series C+", "Today", "+5 yrs".
+3. Never chart a number said in passing: a year ("in 2018"), a time ago ("3 or 4 months
+   ago"), an everyday count ("I had 2 questions"), a joke, an aside, a rhetorical number
+   ("a million times"), a hypothetical unless the hypothetical is the point.
+4. Tier 2 (qualitative) when the clip has no chartable metric: show the speaker's core
+   framework or contrast: comparison_card (two sides: then vs now, them vs us, the myth vs
+   what happened), buckets (2-3 named ideas), step_sequence (2-4 steps in order) or
+   timeline (2-4 moments). ALWAYS also give your best Tier 2 idea in "fallback", even when
+   there are Tier 1 visuals: it's used only if they fail the checks.
+5. Exact words. Write every number as it was said, same number and scale
    ("17 trillion dollars" -> "$17T"; "about 11 or 12 trillion" -> "~$11–12T"). If the
    speaker hedges (about, around, roughly, or, between), keep it with "~" or a range.
    Labels, lines and descriptions are the speaker's own words, as short as possible.
    A change from one thing to another can be "C → A" or "$2M → $8M" (both ends said).
-4. Timing: a graphic covers the sentences where its numbers or words are said.
+6. Timing: a graphic covers the sentences where its numbers or words are said.
    It cannot start before HOOK_END s (the title is on screen) or run into the last
-   2 seconds. Leave at least 2 s between two graphics. One exception: when the clip's
-   hook itself is the data moment (a kinetic_range number or change said in the first
-   HOOK_END s), give that sentence and the next; it comes in right after the title as a
-   recap. A number or box graphic stays up only a few seconds, so never stretch one
-   over sentences that don't need it.
-5. Show, don't tell. When the speaker describes a relationship, show its shape instead of
+   2 seconds. One exception: when the clip's hook itself is the data moment (a
+   kinetic_range number or change said in the first HOOK_END s), give that sentence and
+   the next; it comes in right after the title as a recap. A number or box graphic stays
+   up only a few seconds, so never stretch one over sentences that don't need it.
+7. Show, don't tell. When the speaker describes a relationship, show its shape instead of
    printing a number they just said: a fall and a recovery (a crash, a dip, a drawdown,
    "and then it came back") -> drawdown_curve; a comparison -> bars; dated points ->
    timeline; growth over time -> trend_line; a whole and its parts -> share_split or
@@ -87,11 +113,11 @@ TEMPLATES (items: label, value, detail, parent, dashed, highlight)
 - buckets: over the speaker. 2-3 items: label = a box (≤20 chars, said in this order);
   dashed = true for an expectation or projection next to what actually happened.
 - timeline: chart. 2-4 items in the order said: value = when as said ("2008",
-  "20 yrs ago"), detail = what happened (≤30 chars, speaker's words).
+  "20 yrs ago", "Seed–Series B", "Today"), detail = what happened (≤30 chars, speaker's words).
 - metric_bars: chart. 2-4 numbers in one unit: label, value.
 - ranked_bars: chart. 2-5 numbers in one unit, largest first: label, value.
 - diverging_bar: chart. Exactly 2 numbers that pull against each other: label, value.
-- share_split: chart. 3-5 shares of one whole that add to about 100%: label, value.
+- share_split: chart. 2-5 shares of one whole that add to about 100%: label, value.
 - trend_line: chart. 2-6 values over time, oldest first: label = the time, value.
 - arr_bridge: chart. First item the start, last the end, + or − steps between
   ("+$3.2M", "−$0.4M"); it must add up.
@@ -102,6 +128,12 @@ TEMPLATES (items: label, value, detail, parent, dashed, highlight)
   negative percentage ("−20%"), label = "" or the speaker's few words for it. Item 2:
   label = the recovery in the speaker's words ("they go back up", ≤26 chars), value = a
   number only if one was said ("4 yrs"), else "".
+- comparison_card: chart (Tier 2). Exactly 2 items in the order said: label = the side's
+  heading in the speaker's words (≤24 chars, e.g. "Venture firms, before"), detail = their
+  line for it (≤44 chars), value = an optional short tag (≤14 chars: "Before", "Now", or a
+  number as said); highlight = the side the point lands on.
+- step_sequence: chart (Tier 2). 2-4 items in the order said: label = the step in the
+  speaker's words (≤24 chars), detail = optional (≤30 chars).
 Set highlight = true on the one item the point is about. Chart headline: 2-4 words, or "".
 
 IN CONTEXT (charts only, optional): a second, smaller layer under a number chart that
@@ -116,27 +148,45 @@ and adds something; never a figure from outside the video. Three kinds:
 The text (≤44 chars) names what is compared and has NO number or number word in it (the
 figure is shown next to it). Write the text in plain words a viewer gets at a glance.
 
-THE GUEST: if the video has a guest whose full name is in the video title or description,
-always give {"name": ..., "role": ...}, with the role taken from the title or description
-(≤42 chars, e.g. "Professor of Finance, MIT Sloan"). Every clip carries the guest's name
-card (it's placed on the guest's own face), even when the host talks most in this clip.
-Never the channel's own host. If the video has no named guest, null.
+THE SPEAKERS: name every person who speaks in this video whose full name is in the video
+title, the description or the channel name: the guest(s) AND the host. Each gets a name
+card: {"name": ..., "role": ..., "kind": "guest" or "host"}, the role taken from the title
+or description (≤42 chars, e.g. "Professor of Finance, MIT Sloan"; for the host "Host" or
+"Host, <show>"). Never a company or a show as a name, never a name that isn't there.
 
 Return JSON only:
 {"graphics": [{"template": "...", "first_sentence": 3, "last_sentence": 4, "strength": 1-10,
   "headline": "", "items": [{"label": "", "value": "", "detail": "", "parent": "",
   "dashed": false, "highlight": false}], "context": null or {...},
   "reason": "why this moment earns a visual"}],
- "speaker": {"name": "", "role": ""} or null}"""
+ "fallback": {one Tier 2 visual in the same shape} or null,
+ "speakers": [{"name": "", "role": "", "kind": "guest"}]}"""
+
+RETRY_PROMPT = """
+
+SECOND LOOK: none of the visuals proposed for this clip passed the checks ({why}). Propose
+ONE qualitative visual (comparison_card, buckets, step_sequence or timeline) of the
+speaker's main contrast or framework, in their exact words, timed to the sentences where
+those words are said. Return {"graphics": [that one visual]}."""
 
 
 @dataclass(frozen=True)
 class VideoInfo:
-    """What the director knows about the whole video (for the name card)."""
+    """What the director knows about the whole video (for the name cards)."""
 
     title: str = ""
     channel: str = ""
     description: str = ""
+
+
+@dataclass(frozen=True)
+class Speaker:
+    """A person who speaks in the video, named in its title, description or channel."""
+
+    name: str
+    role: str = ""
+    kind: str = "guest"  # "guest" or "host"
+    from_ai: bool = False  # named by the AI (grounded); else read from the title or description
 
 
 @dataclass
@@ -148,7 +198,13 @@ class Direction:
 
 
 def max_graphics(duration: float) -> int:
-    return 2 if duration < SHORT_CLIP_SECONDS else 3
+    """Bento visuals in a clip (Round 32: 1-2; name cards never count)."""
+    return 1 if duration < SHORT_CLIP_SECONDS else MAX_GRAPHICS
+
+
+def tier(card: Card) -> int:
+    """1: a quantitative visual (a chart or a number); 2: a qualitative one."""
+    return 2 if card.template in QUALITATIVE else 1
 
 
 def ask_ai(prompt: str, system_prompt: str) -> str | None:
@@ -171,14 +227,23 @@ def _clock(seconds: float) -> str:
 
 
 def build_prompt(spans: list[tuple[float, float, str]], clip_start: float, duration: float, hook: float,
-                 info: VideoInfo, earlier: list[tuple[float, str]] | None = None) -> str:
+                 info: VideoInfo, earlier: list[tuple[float, str]] | None = None,
+                 clip_words: list[Any] | None = None) -> str:
     lines = [f"S{k} [{s - clip_start:.1f}-{e - clip_start:.1f}] {text}" for k, (s, e, text) in enumerate(spans, 1)]
     facts = [f"E{k} [{_clock(at)} in the video] {text}" for k, (at, text) in enumerate(earlier or [], 1)]
+    metrics = []
+    for number in chartable_numbers(clip_words or []):  # Round 32: a hint, so a real metric gets its chart
+        where = next((k for k, (s, e, _t) in enumerate(spans, 1) if s - 0.05 <= number.start <= e + 0.05), None)
+        if where:
+            metrics.append(f"S{where}: {' '.join(str(w.text) for w in clip_words[number.index:number.end + 3])}")
+    hint = ("Chartable metrics said in this clip (Tier 1): " + "; ".join(metrics[:8]) if metrics else
+            "No chartable metric is said in this clip: give a Tier 2 (qualitative) visual.")
     return (
         f"Video title: {info.title}\nChannel: {info.channel}\n"
         f"Video description (first part): {info.description[:1200]}\n\n"
         f"Clip length: {duration:.1f} s. No graphic before {hook:.1f} s or after {duration - PAYOFF_SECONDS:.1f} s. "
-        f"At most {max_graphics(duration)} graphics.\n\nSentences (seconds from the clip's start):\n" + "\n".join(lines)
+        f"At most {max_graphics(duration)} graphics, at least 1, starting at least {BENTO_SPACING:g} s apart.\n"
+        f"{hint}\n\nSentences (seconds from the clip's start):\n" + "\n".join(lines)
         + ("\n\nNumbers said elsewhere in this video (for a chart's \"earlier\" context only):\n" + "\n".join(facts)
            if facts else "")
     )
@@ -275,27 +340,124 @@ def _words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
+# Words that make a "name" a company, a show or a channel, never a person.
+_ORG_WORDS = {"podcast", "podcasts", "show", "channel", "media", "studio", "studios", "tv", "news", "radio", "network",
+              "group", "capital", "ventures", "partners", "labs", "inc", "llc", "official", "daily", "weekly", "club",
+              "school", "academy", "university", "institute", "fund", "funds", "company", "co", "team", "live",
+              "breakfast", "uncapped", "decile", "founders", "tips", "marketing", "after", "dark"}
+_TITLE_WORDS = {"why", "how", "what", "when", "where", "who", "the", "this", "that", "your", "you", "watch", "before",
+                "growth", "investing", "power", "law", "episode", "ep", "part", "full", "interview", "ai", "inside",
+                "brutal", "advice", "lessons", "story", "my", "our", "is", "are", "on", "with", "and", "of", "a", "an"}
+_HOST_ROLE_WORDS = {"host", "hosts", "cohost", "co", "hosted"}
+_NAME = r"[A-Z][a-z]+(?:[-'’][A-Z]?[a-z]+)?(?:\s+[A-Z]\.)?\s+(?:[A-Z][a-z]+|[A-Z][a-z]*[A-Z][a-z]+)(?:[-'’][A-Z]?[a-z]+)?"
+
+
+def _person_like(name: str) -> bool:
+    words = _words(name)
+    return 2 <= len(words) <= 4 and not set(words) & (_ORG_WORDS | _TITLE_WORDS)
+
+
 def grounded_name(speaker: Any, info: VideoInfo) -> tuple[str, str] | None:
-    """The name card's (name, role) if both come from the video's own title or
-    description (never invented, never the channel itself); None otherwise."""
+    """A name card's (name, role) if both come from the video's own title, description or
+    channel name (never invented, never a company or a show); None otherwise. Round 32: the
+    host too (a channel named after its host is that person: "Lex Fridman")."""
     if not isinstance(speaker, dict):
         return None
     name, role = str(speaker.get("name") or "").strip(), str(speaker.get("role") or "").strip()
-    source = f"{info.title}\n{info.description}".lower()
+    source = f"{info.title}\n{info.description}\n{info.channel}".lower()
     name_words = _words(name)
     if len(name_words) < 2 or not all(re.search(rf"\b{re.escape(w)}\b", source) for w in name_words):
         return None
-    if " ".join(name_words) == " ".join(_words(info.channel)):
-        return None
-    role_words = [w for w in _words(role) if w not in _STOP]
+    if not _person_like(name):
+        return None  # "Founders Podcast", "Decile Group": the show or the company, not a person
+    host = str(speaker.get("kind") or "").lower() == "host"
+    role_words = [w for w in _words(role) if w not in _STOP and not (host and w in _HOST_ROLE_WORDS)]
     if role_words and sum(w in source or w.rstrip("s") in source for w in role_words) / len(role_words) < 0.75:
         role = ""  # a role we can't find in the title or description isn't shown
+    if len(role) > 42:  # the card's limit: the part before a comma ("General Partner"), else none
+        role = role.split(",")[0].strip() if len(role.split(",")[0].strip()) <= 42 else ""
     return name, role
+
+
+def _clean_role(text: str) -> str:
+    role = re.split(r"[|(\[,;]| - | – | — |\.\s|\.$| to | who | and ", text, maxsplit=1)[0].strip(" ,.:;–—-")
+    return role[:1].upper() + role[1:] if len(role) <= 42 else ""
+
+
+def names_from_text(info: VideoInfo) -> list[Speaker]:
+    """The people the video's own title and description name as its speakers (Round 32),
+    for when the AI names nobody: "David George on Growth Investing", "... | Brian Folmer,
+    FirstLook VC", "– Neil Patel & Eric Siu", "Goldman Sachs Chairman and CEO David
+    Solomon on AI"; "Connor Sattely talks with Jonathan Bragdon, founder of Capacity
+    Capital" (a host and a guest)."""
+    found: list[Speaker] = []
+
+    def add(name: str, role: str = "", kind: str = "guest") -> None:
+        name = re.sub(r"\s+", " ", name).strip()
+        if _person_like(name) and not any(set(_words(name)) & set(_words(s.name)) == set(_words(name)) for s in found):
+            found.append(Speaker(name, _clean_role(role), kind))
+
+    title, description = info.title or "", info.description or ""
+    for match in re.finditer(rf"({_NAME})\s+(?:sits down with|talks (?:to|with)|speaks with|chats with|interviews|"
+                             rf"is joined by|welcomes|hosts)\s+({_NAME})(?:,\s*([^.\n]{{3,60}}))?", description):
+        add(match.group(1), "", "host")
+        add(match.group(2), match.group(3) or "")
+    for match in re.finditer(rf"(?:[Hh]osted by|[Hh]ost)\s+({_NAME})", description):
+        add(match.group(1), "", "host")
+    for match in re.finditer(rf"[Oo]ur guest(?: today)?(?: is)?\s+({_NAME})(?:,?\s+(?:is\s+)?(?:the\s+)?([^.\n]{{3,60}}))?",
+                             description):
+        add(match.group(1), match.group(2) or "")
+    lead = re.match(rf"^({_NAME})(?:'s)?\s*(?:on|:|-|–|—|\||says|explains|talks|reveals|shares|breaks down)\s", title)
+    if lead and not re.match(rf"^{_NAME}'s", title):
+        add(lead.group(1))
+    for match in re.finditer(rf"(?:CEO|Founder|Co-founder|Chairman|President|Partner|Professor|Dr\.?|GP)\s+"
+                             rf"({_NAME})(?=\s+(?:on|says|explains|talks)\b|\s*[:|,–—-]|\s*$)", title):
+        before = title[:match.start(1)].strip()
+        add(match.group(1), before if 3 <= len(before) <= 42 else "")
+    for match in re.finditer(rf"(?:\bwith|\bft\.?|\bfeat\.?|\bfeaturing|[|:–—])\s+({_NAME})(?:\s*(?:&|and)\s+({_NAME}))?"
+                             rf"(?:,\s*([^|()\[\]]{{3,42}}))?", title):
+        add(match.group(1), match.group(3) or "" if not match.group(2) else "")
+        if match.group(2):
+            add(match.group(2))
+    return found
+
+
+def video_speakers(answer: dict[str, Any] | None, info: VideoInfo) -> list[Speaker]:
+    """Every identified speaker of the video: the ones the AI names (only if grounded in the
+    title, description or channel), else the ones the title and description name
+    themselves; remembered for the video's other clips (the AI may leave one out)."""
+    raw = []
+    if isinstance(answer, dict):
+        listed = answer.get("speakers")
+        raw = [s for s in listed if isinstance(s, dict)] if isinstance(listed, list) else []
+        if isinstance(answer.get("speaker"), dict):  # the Round 28 shape: the guest only
+            raw.append({**answer["speaker"], "kind": answer["speaker"].get("kind") or "guest"})
+    named: list[Speaker] = []
+    for entry in raw:
+        grounded = grounded_name(entry, info)
+        if grounded and not any(_words(grounded[0]) == _words(s.name) for s in named):
+            kind = "host" if str(entry.get("kind") or "").lower() == "host" else "guest"
+            named.append(Speaker(grounded[0], grounded[1], kind, from_ai=True))
+    if not named:
+        named = names_from_text(info)
+    key = (info.title, info.channel)
+    with _GUESTS_LOCK:
+        known = list(_GUESTS.get(key, []))
+        for speaker in named:
+            same = next((k for k, s in enumerate(known) if _words(s.name) == _words(speaker.name)), None)
+            if same is None:
+                known.append(speaker)
+            elif speaker.role and (not known[same].role or (speaker.from_ai and not known[same].from_ai)):
+                known[same] = speaker  # the AI's grounded role wins over one read from the description
+        if known:
+            _GUESTS[key] = known
+    return known
 
 
 def _add_name_card(direction: Direction, named: tuple[str, str], clip_words: list[Any], clip_start: float,
                    clip_end: float, hook: float, plan: Any, source: Any, strengths: dict[int, int]) -> None:
-    """The guest's name card: in every clip, on the guest's own face (core.name_cards),
+    """Round 29's single-guest name card (kept for its checks; since Round 32 the director
+    plans every speaker's card with _plan_names). The guest's name card: in every clip, on the guest's own face (core.name_cards),
     never counted toward the graphics limit. If the data graphics leave no free moment
     while the guest is on screen, the weakest one makes room."""
     from core import name_cards
@@ -346,6 +508,242 @@ def _stat_spot(source: Any, plan: Any, clip_start: float, clip_end: float, card:
     return name_cards.stat_place(source, plan, clip_start, clip_end, card.start, card.end)
 
 
+def _what(card: Card) -> str:
+    return f"{card.template} ({', '.join(r.value or r.label for r in card.rows)[:40]})"
+
+
+_SALIENT_STOP = {
+    "about", "above", "actually", "after", "again", "against", "always", "among", "another", "anything", "around",
+    "because", "before", "being", "below", "between", "better", "bunch", "called", "certain", "could", "doing", "during",
+    "either", "enough", "especially", "every", "everybody", "everyone", "everything", "exactly", "first", "going",
+    "gonna", "great", "having", "honestly", "however", "itself", "kinda", "know", "later", "least", "little", "maybe",
+    "might", "money", "never", "often", "other", "others", "people", "point", "pretty", "probably", "quite", "rather",
+    "really", "right", "second", "should", "since", "something", "sometimes", "sort", "still", "stuff", "super", "sure",
+    "their", "there", "these", "thing", "things", "think", "those", "though", "three", "today", "together", "totally",
+    "trying", "under", "until", "users", "using", "very", "wanna", "where", "whether", "which", "while", "whole", "would",
+    "years", "yeah", "basically", "literally", "definitely", "obviously", "already", "almost", "anyway", "ourselves",
+    "talking", "saying", "thought", "looked", "looking", "getting", "makes", "making", "means", "meant", "wanted",
+}
+
+
+def transcript_fallback(clip_words: list[Any], spans: list[tuple[float, float, str]], clip_start: float,
+                        clip_end: float, hook: float) -> list[tuple[int, Card, str]]:
+    """Round 32's last resort, built from the transcript alone (no AI): the clip's main
+    metric as said (Tier 1, a number over the speaker), else its key ideas as 2-3 boxes in
+    the order said (Tier 2). Both still go through every check."""
+    from core.card_checks import _clean, _hedge_near, _normalize_tokens
+
+    ideas: list[tuple[int, Card, str]] = []
+    first, last = clip_start + hook + 0.3, clip_end - PAYOFF_SECONDS - MIN_OVERLAY_SECONDS
+    tokens = _normalize_tokens([_clean(w.text) for w in clip_words])
+    rank = {"x": 0, "T": 1, "B": 1, "M": 2, "%": 3, "bps": 4, "K": 5}
+    metrics = sorted((n for n in chartable_numbers(clip_words) if first <= n.start <= last and n.kind != "split"),
+                     key=lambda n: (rank.get(n.scale or "", 6), n.start))
+    for number in metrics[:1]:
+        money = str(clip_words[number.index].text).lstrip("\"'(").startswith("$") \
+            or "dollars" in tokens[number.end + 1:number.end + 3]
+        amount = f"{number.value:g}"
+        text = (f"{amount}x" if number.scale == "x" else f"{amount} bps" if number.scale == "bps"
+                else f"{amount}%" if number.scale == "%" else f"{'$' if money else ''}{amount}{number.scale or ''}")
+        if _hedge_near(tokens, number.index):
+            text = "~" + text
+        span = next((s for s in spans if s[0] - 0.05 <= number.start <= s[1] + 0.05), None)
+        if span:
+            ideas.append((5, Card("kinetic_range", start=max(span[0], first - 0.3), end=span[1] + 0.15,
+                                  rows=[CardRow("", text, highlight=True)]), "the clip's main number, as said"))
+    counts: dict[str, int] = {}
+    for token in tokens:
+        if len(token) >= 5 and token.isalpha() and token not in _SALIENT_STOP:
+            counts[token] = counts.get(token, 0) + 1
+    best: tuple[float, float, float, list[str]] | None = None
+    for k in range(len(spans)):
+        for j in range(k, min(k + 2, len(spans))):
+            a, b = spans[k][0], spans[j][1]
+            if a < first - 0.3 or b > clip_end - PAYOFF_SECONDS or b - a > 9.0:
+                continue
+            seen: list[str] = []
+            for word in clip_words:
+                token = _clean(word.text)
+                if a - 0.05 <= float(word.start) <= b and token in counts and token not in seen:
+                    seen.append(token)
+            top = sorted(seen, key=lambda t: (-counts[t], seen.index(t)))[:3]
+            boxes = [t for t in seen if t in top]
+            if len(boxes) >= 2:
+                score = sum(counts[t] for t in boxes) + 0.5 * len(boxes)
+                if best is None or score > best[0]:
+                    best = (score, a, b, boxes)
+    if best:
+        _score, a, b, boxes = best
+        ideas.append((4, Card("buckets", start=a, end=b + 0.15, rows=[CardRow(t.capitalize()[:20]) for t in boxes]),
+                      "the clip's key ideas, in the order said"))
+    return ideas
+
+
+class _Picker:
+    """Chooses the clip's Bento visuals around its name cards: each offered visual is
+    checked with everything already chosen, repaired when a fix is safe, and kept only
+    when every graphic in the clip still passes."""
+
+    def __init__(self, direction: Direction, words: list[Any], spans: list[tuple[float, float, str]],
+                 clip_start: float, clip_end: float, hook: float, limit: int, names: list[Card],
+                 replan: Callable[[list[Card]], list[Card]], plan: Any, source: Any) -> None:
+        self.direction, self.words, self.spans = direction, words, spans
+        self.clip_start, self.clip_end, self.hook, self.limit = clip_start, clip_end, hook, limit
+        self.names, self.replan, self.plan, self.source = names, replan, plan, source
+        self.chosen: list[Card] = []
+        self.errors: list[str] = []
+
+    def note(self, text: str) -> None:
+        self.direction.notes.append(text)
+
+    def _check(self, card: Card, names: list[Card] | None = None) -> tuple[bool, list[str], bool]:
+        names = self.names if names is None else names
+        cards = sorted(self.chosen + names + [card], key=lambda c: c.start)
+        results = check_edit(ClipEdit(self.clip_start, self.clip_end, cards=cards), self.words, self.hook)
+        mine = next(r for c, r in zip(cards, results) if c is card)
+        clash = any(card.start < n.end + MIN_GAP and n.start < card.end + MIN_GAP for n in names)
+        others = [e for c, r in zip(cards, results) if c is not card for e in r.errors]
+        return all(r.ok for r in results), mine.errors + others, clash
+
+    def _anchor(self, card: Card) -> tuple[float, float] | None:
+        """The sentences where the card's numbers or words are said: the card's new times."""
+        numbers = [(n, parse_value(part).scale) for row in card.rows for part in re.split(r"\s*(?:→|->)\s*", row.value)
+                   for n in parse_value(part).numbers]
+        keys = {w for row in card.rows for w in _words(f"{row.label} {row.detail}") if len(w) >= 5}
+        hit = []
+        for start, end, text in self.spans:
+            inside = [w for w in self.words if start - 0.05 <= float(w.start) <= end + 0.05]
+            said = spoken_numbers(inside)
+            has_number = any(any(same_amount(n, scale, s) for s in said) for n, scale in numbers)
+            if has_number or (not numbers and keys & set(_words(text))):
+                hit.append((start, end))
+        if not hit:
+            return None
+        start = max(hit[0][0], self.clip_start + self.hook + 0.2) if card.template != "kinetic_range" else hit[0][0]
+        shortest = MIN_OVERLAY_SECONDS if MODES[card.template] == "overlay" else MIN_CARD_SECONDS
+        end = min(max(hit[-1][1] + 0.15, start + shortest + 0.5), self.clip_end - PAYOFF_SECONDS - 0.05)
+        return start, end
+
+    def _repair(self, card: Card, errors: list[str]) -> Card | None:
+        """One safe fix for the first problem it can fix, or None."""
+        fixed = copy.deepcopy(card)
+        text = " ".join(errors)
+        if "hedged" in text and any(r.value and not r.value.startswith("~") for r in fixed.rows):
+            for row in fixed.rows:  # show the hedge the speaker used
+                if row.value and not row.value.startswith("~") and not re.search(r"→|->", row.value):
+                    row.value = "~" + row.value
+            return fixed
+        if "isn't said" in text or "none of its words are said" in text or "aren't said" in text:
+            anchored = self._anchor(card)
+            if anchored and (abs(anchored[0] - card.start) > 0.05 or abs(anchored[1] - card.end) > 0.05):
+                fixed.start, fixed.end = anchored
+                return fixed
+        if "Starts in the first" in text:
+            fixed.start = self.clip_start + self.hook + 0.2
+            return fixed if fixed.end - fixed.start >= MIN_OVERLAY_SECONDS else None
+        if "Runs into the last" in text:
+            fixed.end = self.clip_end - PAYOFF_SECONDS - 0.05
+            return fixed if fixed.end - fixed.start >= MIN_OVERLAY_SECONDS else None
+        if "after the graphic before it" in text:  # move clear of the graphic in its way
+            others = self.chosen + self.names
+            before = [c for c in others if c.start <= card.start and c.end + MIN_GAP > card.start]
+            after = [c for c in others if c.start > card.start and c.start < card.end + MIN_GAP]
+            if before:
+                fixed.start = max(c.end for c in before) + MIN_GAP + 0.01
+            elif after:
+                fixed.end = min(c.start for c in after) - MIN_GAP - 0.01
+            shortest = MIN_OVERLAY_SECONDS if MODES[card.template] == "overlay" else MIN_CARD_SECONDS
+            return fixed if fixed.end - fixed.start >= shortest else None
+        if "On screen" in text and "needs at least" in text:
+            following = [e for s, e, _t in self.spans if e > card.end + 0.2]
+            if following:
+                fixed.end = min(following[0] + 0.15, self.clip_end - PAYOFF_SECONDS - 0.05)
+                return fixed
+        return None
+
+    def offer(self, card: Card, strength: int, reason: str) -> bool:
+        card = copy.deepcopy(card)
+        what = _what(card)
+        if len(self.chosen) >= self.limit:
+            self.note(f"Skipped {what}: {self.limit} Bento visual{'s' if self.limit > 1 else ''} is the most for this clip.")
+            return False
+        if incidental_card(card, self.words):
+            self.note(f"Skipped {what}: its numbers are said in passing, not a metric.")
+            return False
+        if card.context:  # time to read the layer under the chart (the checks drop it if there isn't)
+            card.end = max(card.end, min(card.end + 2.0, self.clip_end - PAYOFF_SECONDS - 0.05))
+        errors: list[str] = []
+        clash = False
+        for _attempt in range(5):
+            ok, errors, clash = self._check(card)
+            if ok:
+                return self._keep(card, strength, reason, what)
+            fixed = self._repair(card, errors)
+            if fixed is None:
+                break
+            card = fixed
+        if clash:  # a name card is in the way: move the name cards around this visual instead
+            names = self.replan(self.chosen + [card])
+            if len(names) >= len(self.names):
+                ok, errors, _clash = self._check(card, names)
+                if ok and self._keep(card, strength, reason, what):
+                    self.names[:] = names
+                    self.note("Moved the name cards to make room: " + ", ".join(
+                        f"{n.rows[0].label} at {n.start - self.clip_start:.1f} s" for n in names) + ".")
+                    return True
+        self.errors.append(errors[0] if errors else "it didn't pass the checks")
+        self.note(f"Dropped {what}: {errors[0] if errors else 'it did not pass the checks'}")
+        return False
+
+    def _keep(self, card: Card, strength: int, reason: str, what: str) -> bool:
+        near = [c for c in self.chosen if abs(c.start - card.start) < BENTO_SPACING]
+        if near:
+            self.note(f"Skipped {what}: less than {BENTO_SPACING:g} s from the {near[0].template} (one idea at a time).")
+            return False
+        if card.template == "stat_pill":
+            card.place = _stat_spot(self.source, self.plan, self.clip_start, self.clip_end, card)
+        self.chosen.append(card)
+        self.chosen.sort(key=lambda c: c.start)
+        self.note(f"Added {what} at {_clock(card.start - self.clip_start)}: {reason}")
+        if card.context:
+            self.note(f"...with an 'in context' layer: {card.context.get('value')} {card.context.get('text')}")
+        return True
+
+
+def _plan_names(speakers: list[Speaker], clip_words: list[Any], clip_start: float, clip_end: float, hook: float,
+                plan: Any, source: Any, taken: list[Card], notes: list[str] | None = None) -> list[Card]:
+    """Every identified speaker's name card (core.name_cards), clear of ``taken``; each
+    one checked like any graphic."""
+    from core import name_cards
+
+    if not speakers:
+        return []
+    speakers = [s for s in speakers if s.kind != "host"] + [s for s in speakers if s.kind == "host"]  # the guest first
+    cards: list[Card] | None = None
+    said: list[str] = []
+    if plan is not None and source is not None:
+        try:
+            cards, said = name_cards.plan_name_cards(source, plan, clip_start, clip_end, hook, taken, speakers)
+        except Exception as exc:  # noqa: BLE001 - the clip still gets its name cards, in the standard spot
+            logger.warning("Name card placement failed: %s", exc)
+            said = [f"Placing the name cards on faces failed ({exc}); they go in the standard spot."]
+    if cards is None:
+        cards, more = name_cards.sequential_cards(speakers, clip_start, clip_end, hook, taken)
+        said += more
+    kept: list[Card] = []
+    for card in cards:
+        result = check_edit(ClipEdit(clip_start, clip_end, cards=sorted(taken + kept + [card], key=lambda c: c.start)),
+                            clip_words, hook)
+        if all(r.ok for r in result):
+            kept.append(card)
+        else:
+            errors = [e for r in result for e in r.errors]
+            said.append(f"No name card for {card.rows[0].label}: {errors[0]}")
+    if notes is not None:
+        notes.extend(said)
+    return kept
+
+
 def direct(
     words: list[Any],
     clip_start: float,
@@ -359,11 +757,12 @@ def direct(
     source: str | Path | None = None,
     video_words: list[Any] | None = None,
 ) -> Direction:
-    """The clip's graphics, every one checked. ``words``: the clip's words (source
-    times). ``plan`` and ``source``: the crop plan and the video, to find the guest's own
-    face for the name card (and a clear corner for a micro-stat). ``video_words``: the
-    whole video's words, for a chart's context layer (numbers said elsewhere in it).
-    Never raises: anything that goes wrong means no graphics, with a note."""
+    """The clip's graphics, every one checked: 1-2 Bento visuals (Round 32) and a name card
+    for each identified speaker. ``words``: the clip's words (source times). ``plan`` and
+    ``source``: the crop plan and the video, to put each name card on its speaker's own
+    shot (and a micro-stat in a clear corner). ``video_words``: the whole video's words,
+    for a chart's context layer (numbers said elsewhere in it). Never raises: anything that
+    goes wrong means fewer graphics, with a note."""
     from core.agent_brain import _parse_json_response
     from core.service_pause import ServicePause
 
@@ -376,68 +775,80 @@ def direct(
     if duration < hook + PAYOFF_SECONDS + 3 or not spans:
         direction.notes.append("No graphics: the clip is too short.")
         return direction
+    asker = ask or ask_ai
+    answer: dict[str, Any] | None = None
+    earlier: list[tuple[float, str]] = []
+    prompt, system = "", _system_prompt(duration, hook)
     try:
         earlier = earlier_facts(video_words, clip_start, clip_end, clip_words)
-        raw = (ask or ask_ai)(build_prompt(spans, clip_start, duration, hook, info, earlier), _system_prompt(duration, hook))
+        prompt = build_prompt(spans, clip_start, duration, hook, info, earlier, clip_words)
+        raw = asker(prompt, system)
         if raw is None:
-            direction.notes.append("No graphics: no AI key (GEMINI_API_KEY or OPENAI_API_KEY).")
-            return direction
-        answer = _parse_json_response(raw)
-    except ServicePause as exc:
-        direction.notes.append(f"No graphics: the AI limit is used up for now ({exc}).")
-        return direction
-    except Exception as exc:  # noqa: BLE001 - graphics are optional; the clip still renders
-        logger.warning("Graphics director failed: %s", exc)
-        direction.notes.append(f"No graphics: the AI answer was unusable ({exc}).")
-        return direction
-
-    limit = max_graphics(duration)
-    strengths: dict[int, int] = {}
-    for strength, card, reason in proposals(answer, spans, earlier):
-        what = f"{card.template} ({', '.join(r.value or r.label for r in card.rows)[:40]})"
-        if strength < MIN_STRENGTH:
-            direction.notes.append(f"Skipped {what}: not strong enough ({strength}/10).")
-            continue
-        if len(edit.cards) >= limit:
-            direction.notes.append(f"Skipped {what}: {limit} graphic{'s' if limit > 1 else ''} is the most for this clip.")
-            continue
-        if card.context:  # time to read the layer under the chart (the checks drop it if there isn't)
-            card.end = max(card.end, min(card.end + 2.0, clip_end - PAYOFF_SECONDS - 0.05))
-        result = check_edit(ClipEdit(clip_start, clip_end, cards=edit.cards + [card]), clip_words, hook)[-1]
-        if not result.ok and any("hedged" in e for e in result.errors):
-            for row in card.rows:  # the one safe repair: show the hedge the speaker used
-                if row.value and not row.value.startswith("~"):
-                    row.value = "~" + row.value
-            result = check_edit(ClipEdit(clip_start, clip_end, cards=edit.cards + [card]), clip_words, hook)[-1]
-        if result.ok:
-            if card.template == "stat_pill":
-                card.place = _stat_spot(source, plan, clip_start, clip_end, card)
-            edit.cards.append(card)
-            edit.cards.sort(key=lambda c: c.start)
-            strengths[id(card)] = strength
-            direction.notes.append(f"Added {what} at {_clock(card.start - clip_start)}: {reason}")
-            if card.context:
-                direction.notes.append(f"...with an 'in context' layer: {card.context.get('value')} "
-                                       f"{card.context.get('text')}")
-            for warning in result.warnings:
-                if warning.startswith("Context layer left out"):
-                    direction.notes.append(f"...{warning}")
+            direction.notes.append("AI graphics unavailable: no AI key (GEMINI_API_KEY or OPENAI_API_KEY); "
+                                   "the visuals come from the transcript.")
         else:
-            direction.notes.append(f"Dropped {what}: {result.errors[0]}")
+            answer = _parse_json_response(raw)
+    except ServicePause as exc:
+        direction.notes.append(f"AI graphics unavailable: the AI limit is used up for now ({exc}); "
+                               "the visuals come from the transcript.")
+    except Exception as exc:  # noqa: BLE001 - the AI is optional; the clip still gets its visuals
+        logger.warning("Graphics director failed: %s", exc)
+        direction.notes.append(f"AI graphics unavailable: the AI answer was unusable ({exc}); "
+                               "the visuals come from the transcript.")
 
-    named = grounded_name(answer.get("speaker"), info)
-    if named:
-        _GUESTS[(info.title, info.channel)] = named
-    else:  # the same guest as the video's other clips
-        named = _GUESTS.get((info.title, info.channel))
-    if named:
-        _add_name_card(direction, named, clip_words, clip_start, clip_end, hook, plan, source, strengths)
-    # The renderer checks again; anything that wouldn't pass the second time is left out now.
+    # 1. Name cards first: one per identified speaker, never counted as a Bento visual.
+    speakers = video_speakers(answer, info)
+    names = _plan_names(speakers, clip_words, clip_start, clip_end, hook, plan, source, [], direction.notes)
+
+    def replan(taken: list[Card]) -> list[Card]:
+        return _plan_names(speakers, clip_words, clip_start, clip_end, hook, plan, source, taken)
+
+    # 2. Bento visuals: Tier 1 (quantitative) first, Tier 2 (qualitative) as the fallback.
+    limit = max_graphics(duration)
+    picker = _Picker(direction, clip_words, spans, clip_start, clip_end, hook, limit, names, replan, plan, source)
+    ideas = proposals(answer, spans, earlier) if answer else []
+    spare = answer.get("fallback") if answer else None
+    backup = [(s, c, f"fallback: {r}") for s, c, r in proposals({"graphics": [spare]}, spans, earlier)] \
+        if isinstance(spare, dict) else []
+    # Tier 1 first, and within it a chart (a Bento card: Plot, ECharts, Lightweight Charts) before a number
+    # over the speaker; then the strongest.
+    ranked = sorted(ideas, key=lambda idea: (tier(idea[1]), MODES[idea[1].template] != "split", -idea[0])) + backup
+    weak: list[tuple[int, Card, str]] = []
+    for strength, card, reason in ranked:
+        floor = MIN_STRENGTH if tier(card) == 1 and not reason.startswith("fallback") else FALLBACK_STRENGTH
+        if strength < floor:
+            direction.notes.append(f"Skipped {_what(card)}: not strong enough ({strength}/10).")
+            weak.append((strength, card, reason))
+            continue
+        picker.offer(card, strength, reason)
+    if not picker.chosen:  # never zero: a second look at what was scored low
+        for strength, card, reason in weak:
+            if picker.offer(card, strength, f"{reason} (taken on a second look: the clip needs one visual)"):
+                break
+    if not picker.chosen and answer is not None:  # a second AI request, qualitative only
+        why = "; ".join(picker.errors[:3]) or "there were none"
+        try:
+            raw = asker(prompt + RETRY_PROMPT.replace("{why}", why), system)
+            second = _parse_json_response(raw) if raw else {}
+            for strength, card, reason in sorted(proposals(second, spans, earlier), key=lambda i: -i[0]):
+                if picker.offer(card, strength, f"second look: {reason}"):
+                    break
+        except Exception as exc:  # noqa: BLE001 - the transcript fallback is next
+            logger.warning("Graphics director's second look failed: %s", exc)
+    if not picker.chosen:  # last resort: built from the transcript itself
+        for strength, card, reason in transcript_fallback(clip_words, spans, clip_start, clip_end, hook):
+            if picker.offer(card, strength, f"from the transcript: {reason}"):
+                break
+
+    # 3. The renderer checks again; anything that wouldn't pass the second time is left out now.
+    edit.cards = sorted(picker.chosen + picker.names, key=lambda c: c.start)
     final = check_edit(edit, clip_words, hook)
     for card, result in list(zip(edit.cards, final)):
         if not result.ok:
             edit.cards.remove(card)
             direction.notes.append(f"Dropped {card.template}: {result.errors[0]}")
-    if not edit.cards:
-        direction.notes.append("No graphics: nothing in this clip needs one.")
+    bento = [c for c in edit.cards if c.template != "speaker_title"]
+    if len(bento) < MIN_BENTO:
+        direction.notes.append("No Bento visual: nothing in this clip passed the checks"
+                               + (f" ({picker.errors[0]})" if picker.errors else "") + ".")
     return direction

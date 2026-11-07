@@ -263,6 +263,10 @@ def _frame_rate(path: Path) -> Fraction:
         return Fraction(30)
 
 
+TO_RGB = "scale=in_color_matrix=bt709"  # a clip's frame, as its Rec. 709 tag says
+FROM_RGB = "scale=out_color_matrix=bt709,format=yuv420p"  # a move frame, back into the clip
+
+
 def _decode(path: Path, start: float, count: int, rate: Fraction | None = None, chain: str = "",
             size: tuple[int, int] | None = None) -> list[np.ndarray]:
     """``count`` frames (RGB) from ``start`` seconds. ``rate``: sample the picture at the
@@ -275,7 +279,10 @@ def _decode(path: Path, start: float, count: int, rate: Fraction | None = None, 
                                capture_output=True, text=True).stdout.strip().split(",")
         size = (int(probe[0]), int(probe[1]))
     width, height = size
-    filters = ",".join(part for part in ((f"fps={rate}" if rate else ""), chain) if part)
+    # Round 32: read the picture as Rec. 709, as every clip is tagged (core.video_renderer),
+    # and write the move frames back the same way (compose_cards). Newer FFmpeg builds no
+    # longer pick the same matrix both ways on their own, and the move flashed a shade off.
+    filters = ",".join(part for part in ((f"fps={rate}" if rate else ""), chain, TO_RGB) if part)
     raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, start):.4f}", "-i", str(path),
                           *(["-vf", filters] if filters else []), "-frames:v", str(count),
                           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
@@ -542,7 +549,7 @@ def compose_cards(
                 parts = []
                 for label, pattern in (("pi", in_pattern), ("po", out_pattern)):
                     inputs += ["-framerate", str(rate), "-i", pattern]
-                    graph.append(f"[{next_input}:v]format=yuv420p,setsar=1,settb={tick},setpts=N[{label}{k}]")
+                    graph.append(f"[{next_input}:v]{FROM_RGB},setsar=1,settb={tick},setpts=N[{label}{k}]")
                     parts.append(f"[{label}{k}]")
                     next_input += 1
                 steady_from, steady_to = first_in + count_in, first_out

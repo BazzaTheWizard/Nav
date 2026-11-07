@@ -17,10 +17,13 @@ from typing import Any
 # Graphics library (round 27). Three tiers, NYT short-form standard:
 #   overlay: the speaker stays full-screen; type, wireframe boxes or a name card over the frame.
 #   split:   real multi-point data only; speaker on top, an animated chart below.
+# Round 32: two qualitative Bento cards (split) for clips with no chartable numbers: the
+# speaker's contrast (comparison_card) or framework in order (step_sequence).
 TEMPLATES = (
     "kinetic_range", "buckets", "stat_pill", "speaker_title",
     "timeline", "metric_bars", "ranked_bars", "diverging_bar", "share_split", "trend_line",
     "arr_bridge", "sankey_flow", "cac_payback", "drawdown_curve", "candlestick_ema",
+    "comparison_card", "step_sequence",
 )
 TEMPLATE_LABELS = {
     "kinetic_range": "A · Number or range over the speaker",
@@ -38,6 +41,8 @@ TEMPLATE_LABELS = {
     "cac_payback": "C · CAC payback (cost to win a customer, months to earn it back)",
     "drawdown_curve": "C · Fall and recovery (a crash, a dip and the rebound)",
     "candlestick_ema": "C · Price chart (from a price file you upload, with its source)",
+    "comparison_card": "C · Comparison card (two sides of the speaker's contrast, in their words)",
+    "step_sequence": "C · Step sequence (2–4 steps of the speaker's framework, in order)",
 }
 MODES = {name: ("overlay" if name in {"kinetic_range", "buckets", "stat_pill", "speaker_title"} else "split")
          for name in TEMPLATES}

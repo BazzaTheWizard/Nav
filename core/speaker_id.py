@@ -37,6 +37,7 @@ VIDEO_SAMPLES = 36  # frames sampled across the whole video to find the guest
 MOUTH_FPS = 12.5
 
 _cache: dict[tuple[str, int, int], tuple[float, ...] | None] = {}
+_groups_cache: dict[tuple[str, int, int], tuple[list[list["SeenFace"]], int]] = {}
 
 
 @dataclass(frozen=True)
@@ -146,30 +147,47 @@ def video_duration(source: str | Path) -> float:
         return 0.0
 
 
-def guest_face(source: str | Path, duration: float, frame_width: int) -> tuple[float, ...] | None:
-    """The guest's face feature: whoever is alone on screen most often across the video
-    (at least 4 of the sampled solo frames, and 35% of them). None if that's unclear."""
+def _solo_groups(source: str | Path, duration: float, frame_width: int) -> tuple[list[list[SeenFace]], int]:
+    """The faces seen alone on screen across the video, grouped by person (most seen
+    first), and how many solo frames there were. Read once per video."""
     path = Path(source)
     try:
         key = (str(path.resolve()), path.stat().st_size, int(path.stat().st_mtime))
     except OSError:
-        return None
-    if key in _cache:
-        return _cache[key]
-    times = [duration * (0.04 + 0.92 * k / (VIDEO_SAMPLES - 1)) for k in range(VIDEO_SAMPLES)]
-    solos = [faces[0] for faces in faces_at(source, times, frame_width) if len(faces) == 1]
-    groups: list[list[SeenFace]] = []
-    for face in solos:
-        for group in groups:
-            if similarity(_mean(group), face.feature) >= SAME_PERSON:
-                group.append(face)
-                break
-        else:
-            groups.append([face])
-    best = max(groups, key=len, default=[])
-    result = _mean(best) if len(best) >= 4 and len(best) >= 0.35 * len(solos) else None
-    _cache[key] = result
-    return result
+        return [], 0
+    if key not in _groups_cache:
+        times = [duration * (0.04 + 0.92 * k / (VIDEO_SAMPLES - 1)) for k in range(VIDEO_SAMPLES)]
+        solos = [faces[0] for faces in faces_at(source, times, frame_width) if len(faces) == 1]
+        groups: list[list[SeenFace]] = []
+        for face in solos:
+            for group in groups:
+                if similarity(_mean(group), face.feature) >= SAME_PERSON:
+                    group.append(face)
+                    break
+            else:
+                groups.append([face])
+        _groups_cache[key] = (sorted(groups, key=len, reverse=True), len(solos))
+    return _groups_cache[key]
+
+
+def guest_face(source: str | Path, duration: float, frame_width: int) -> tuple[float, ...] | None:
+    """The guest's face feature: whoever is alone on screen most often across the video
+    (at least 4 of the sampled solo frames, and 35% of them). None if that's unclear."""
+    groups, solos = _solo_groups(source, duration, frame_width)
+    best = groups[0] if groups else []
+    return _mean(best) if len(best) >= 4 and len(best) >= 0.35 * solos else None
+
+
+def people_faces(source: str | Path, duration: float, frame_width: int, most: int = 2) -> list[tuple[float, ...]]:
+    """Round 32: the face of each person alone on screen across the video, most seen first:
+    the guest (as guest_face) and then the next person, usually the host (at least 3 of
+    the sampled solo frames and 15% of them). Empty when even the guest is unclear."""
+    groups, solos = _solo_groups(source, duration, frame_width)
+    if guest_face(source, duration, frame_width) is None:
+        return []
+    found = [_mean(groups[0])]
+    found += [_mean(group) for group in groups[1:] if len(group) >= 3 and len(group) >= 0.15 * solos]
+    return found[:max(1, most)]
 
 
 def _mean(faces: list[SeenFace]) -> tuple[float, ...]:
