@@ -8,6 +8,7 @@ ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(ROOT))
 for name in ("CAPTION_STYLE", "EMPHASIS_INTENSITY"):
     os.environ.pop(name, None)
+os.environ["CAPTION_STYLE"] = "bold"  # Round 48: the default when this suite was written (Round 45 made it linkedin_executive)
 
 fails = 0
 def check(name, cond, detail=""):

@@ -90,14 +90,26 @@ CARDS = {
         row("Then we did", "Now", True, 2.0, detail="and it worked")]),
     "step_sequence": Card("step_sequence", S, S + 4, rows=[row("Find the market", at=0.6), row("Hire the team", at=1.4),
                                                           row("Scale the brand", "", True, 2.2, detail="go tell your story")]),
+    # Round 36: the multi-niche cards (their checks are in test_round36)
+    "geo_map_card": Card("geo_map_card", S, S + 5, headline="Chips leave China",
+                         rows=[row("China", at=0.5), row("United States", hl=True, at=0.8)]),
+    "prediction_gauge_card": Card("prediction_gauge_card", S, S + 5, headline="A December cut?",
+                                  rows=[row("Cut", "70%", True, 0.6)]),
+    "flow_sankey_card": Card("flow_sankey_card", S, S + 5, headline="Who builds the chips",
+                             rows=[row("ASML", at=0.5), row("TSMC", at=0.8), row("NVIDIA", hl=True, at=1.0)]),
+    "framework_matrix_card": Card("framework_matrix_card", S, S + 5, headline="The flywheel", context={"layout": "flywheel"},
+                                  rows=[row("Lower prices", at=0.4), row("More customers", at=0.6), row("More sellers", at=0.8)]),
+    "headline_card": Card("headline_card", S, S + 5, eyebrow="The rule",
+                          rows=[row("Never fight the Fed.", "fight the Fed", True, 0.5, detail="Marty Zweig")]),
 }
 check("A sample for every graphic", set(CARDS) == set(TEMPLATES), str(set(TEMPLATES) ^ set(CARDS)))
 
 # ---------- offline: every library and font is in the project ----------
 vendor = {name: (ROOT / "assets" / "vendor" / name) for lib in C.LIBRARIES.values() for name in lib}
-check("Vendored: d3, Observable Plot, ECharts, Lightweight Charts (no CDN)",
-      all(p.is_file() and p.stat().st_size > 100_000 for p in vendor.values())
-      and set(vendor) == {"d3.min.js", "plot.min.js", "echarts.min.js", "lightweight-charts.standalone.production.js"}, str(vendor))
+check("Vendored: d3, Observable Plot, ECharts, Lightweight Charts, and (Round 36) TopoJSON with the world map (no CDN)",
+      all(p.is_file() and p.stat().st_size > (5_000 if n == "topojson-client.min.js" else 100_000) for n, p in vendor.items())
+      and set(vendor) == {"d3.min.js", "plot.min.js", "echarts.min.js", "lightweight-charts.standalone.production.js",
+                          "topojson-client.min.js", "world-50m.js"}, str(vendor))
 check("Their licenses travel with them", all((ROOT / "assets" / "vendor" / f).is_file() for f in
                                              ("LICENSE-d3.txt", "LICENSE-plot.txt", "LICENSE-echarts.txt", "LICENSE-lightweight-charts.txt")))
 fonts = ["InstrumentSerif-Regular.woff2", "Geist-Variable.woff2", "JetBrainsMono-Variable.woff2"]
@@ -112,7 +124,7 @@ check("No page loads anything from the internet (scripts, fonts, styles)", not a
 local = {t: re.findall(r'<script src="(file://[^"]+)"', p) for t, p in pages.items()}
 check("Every script a page loads is a local file that exists",
       all(Path(re.sub("^file://", "", u).replace("%20", " ")).is_file() for urls in local.values() for u in urls))
-uses = {t: {lib for lib, files in C.LIBRARIES.items() if any(f in p for f in files)} for t, p in pages.items()}
+uses = {t: {lib for lib, files in C.LIBRARIES.items() if all(f in p for f in files)} for t, p in pages.items()}  # a library is used when all its files load
 check("Plot + D3 draw the bars, splits, shares, trends, timelines and the payback and drawdown curves",
       all(uses[t] == {"plot"} for t in ("metric_bars", "ranked_bars", "diverging_bar", "share_split", "trend_line", "timeline",
                                         "cac_payback", "drawdown_curve")), str(uses))
@@ -120,19 +132,20 @@ check("ECharts (SVG renderer) draws the ARR bridge and the Sankey",
       uses["arr_bridge"] == uses["sankey_flow"] == {"echarts"} and all("renderer: 'svg'" in pages[t] for t in ("arr_bridge", "sankey_flow")))
 check("Lightweight Charts draws the price chart, with TradingView's logo off in the video",
       uses["candlestick_ema"] == {"lightweight"} and "attributionLogo: false" in pages["candlestick_ema"])
-check("Over-the-speaker graphics load no chart library", all(not uses[t] for t in TEMPLATES if MODES[t] == "overlay"))
+check("Over-the-speaker graphics load no chart library", all(not uses[t] and "d3.min.js" not in pages[t] for t in TEMPLATES if MODES[t] == "overlay"))
+check("The map (Round 36) loads D3 with TopoJSON and the bundled world map", uses["geo_map_card"] == {"geo"})
 check("No chart animates on its own clock (library animation off; one frame clock)",
       all("animation: false" in pages[t] for t in ("arr_bridge", "sankey_flow")) and "window.seekToFrame" in pages["metric_bars"]
       and "cubic-bezier(0.16, 1, 0.3, 1)" in C.EASE and "bezier(0.16, 1, 0.3, 1)" in C.RUNTIME)
 
 # ---------- the Bento card ----------
-check("The card: output y 492-1340, x 28-1052 (24/76 split kept: the speaker band is 460 tall)",
-      (C.CARD_TOP, C.CARD_BOTTOM, C.CARD_X, C.CARD_X + C.CARD_W, C.SPLIT_TOP) == (492, 1340, 28, 1052, 460))
-check("...it ends above the small captions (y 1370) and the apps' bottom bars",
-      C.CARD_BOTTOM < D.CALM_CAPTIONS[0] and C.CARD_BOTTOM < 1540, f"{C.CARD_BOTTOM} vs {D.CALM_CAPTIONS}")
-check("Three zones: header 18%, chart 68%, footer 14%",
-      abs(C.HEADER_H / C.CARD_H - 0.18) < 0.005 and abs(C.FOOTER_H / C.CARD_H - 0.14) < 0.005
-      and abs((C.CARD_H - C.HEADER_H - C.FOOTER_H) / C.CARD_H - 0.68) < 0.005)
+check("The card (Round 39): output y 1056-1768, x 28-1052, right under the speaker's 1040 px viewport",
+      (C.CARD_TOP, C.CARD_BOTTOM, C.CARD_X, C.CARD_X + C.CARD_W, C.SPLIT_TOP) == (1056, 1768, 28, 1052, 1040))
+check("...it ends 152 px above the frame's bottom (the apps' bars); its captions sit on the seam above it",
+      1920 - C.CARD_BOTTOM == 152 and D.SPLIT_CAPTIONS[1] < C.CARD_TOP, f"{C.CARD_BOTTOM} vs {D.SPLIT_CAPTIONS}")
+check("Three zones: header 16%, chart 72%, footer 12% (Round 39: compact)",
+      abs(C.HEADER_H / C.CARD_H - 0.16) < 0.005 and abs(C.FOOTER_H / C.CARD_H - 0.12) < 0.005
+      and abs((C.CARD_H - C.HEADER_H - C.FOOTER_H) / C.CARD_H - 0.72) < 0.005)
 check("Canvas #040507 around a #090C12 card with a 20 px radius and a top-lit 1 px rim",
       C.CANVAS == "#040507" and C.CARD_BG == "#090C12" and C.RADIUS == 20
       and "rgba(255,255,255,.12) 26%, rgba(255,255,255,.035) 100%" in pages["metric_bars"]  # Round 35: accent-lit corner
@@ -185,7 +198,7 @@ for t in ("metric_bars", "arr_bridge", "sankey_flow", "candlestick_ema", "drawdo
     if t in good:
         f = good[t]
         early, late = lit(rgba(f, 2)), lit(rgba(f, f.count - 2))
-        check(f"{t}: drawn as it's said (nothing on frame 2 but the card; the data by the end)", early < 60 and late > 1500,
+        check(f"{t}: drawn as it's said (nothing on frame 2 but the card; the data by the end)", early < 60 and late > 1000,  # Round 39: the compact card has fewer lit pixels
               f"{early} -> {late}")
 if "arr_bridge" in good:
     f = good["arr_bridge"]
@@ -239,7 +252,7 @@ def same_frame(a, b):
     return int((diff > 0).sum()) <= 120 and int(diff.max()) <= 48, f"{int((diff > 0).sum())} px, max {int(diff.max())}"
 
 
-for template in ("arr_bridge", "sankey_flow", "candlestick_ema", "trend_line", "buckets"):
+for template in ("arr_bridge", "sankey_flow", "candlestick_ema", "trend_line", "buckets", "geo_map_card"):
     forward, requests, _ = frame_hashes(template, [10, 30, 50, 70])
     backward, _, _ = frame_hashes(template, [70, 50, 30, 10, 50])
     results = [same_frame(forward[k], backward[k]) for k in forward]

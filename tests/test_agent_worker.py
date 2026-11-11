@@ -22,9 +22,13 @@ good = [{"start_time": 100, "end_time": 140, "hook_title": "a", "reason": "r"},
 A._request_openai = fake(good)
 r = A.select_clips_and_draft_pitch(segs, "Coach Sam", "Squat Tips")
 check("Valid response works without the model writing the email", len(r["clips"]) == 3 and "breaking down the squat" in r["outreach_email"])
-check("Email still filled from the template (round 25: ask first, no link)",
-      r["outreach_email"].startswith("Hi there,\n\nI watched your recent video on breaking down the squat and cut 3 vertical clips")
-      and "Want me to send them over?" in r["outreach_email"] and "://" not in r["outreach_email"])
+# Round 44 onward the first email shows the clips (the clip page link, filled in once the page is
+# published) instead of asking first; the model still never writes the email.
+check("Email still filled from the template (round 44: the clip page link in the first email)",
+      r["outreach_email"].startswith("Hi there,\n\nI cut 3 vertical clips from your recent video on breaking down the squat:")
+      and "[Your clip page link goes here once the page is published]" in r["outreach_email"]
+      and "Want me to do the same for your next video?" in r["outreach_email"]
+      and "Free, and yours to keep either way." in r["outreach_email"], r["outreach_email"][:200])
 bad_one = good + [{"start_time": "oops", "end_time": 5, "hook_title": "x", "reason": "r"}]
 A._request_openai = fake(bad_one)
 r = A.select_clips_and_draft_pitch(segs, "Coach Sam", "Squat Tips")

@@ -211,8 +211,8 @@ with sync_playwright() as pw:
     brand_var = view.evaluate("() => getComputedStyle(document.documentElement).getPropertyValue('--brand-accent').trim()")
     background = view.evaluate("() => getComputedStyle(document.querySelector('.card')).backgroundImage")
     browser.close()
-inside = all(492 <= top + a and top + b <= 1340 for _s, a, b in boxes)
-check("The market chart stays inside the card's band, y 492-1340 of the frame (every part of it)",
+inside = all(C.CARD_TOP <= top + a and top + b <= C.CARD_BOTTOM for _s, a, b in boxes)
+check("The market chart stays inside the card's band, y 1056-1768 of the frame (every part of it)",
       not over and inside, str([(s, round(top + a), round(top + b)) for s, a, b in boxes]))
 check("...with its source and period in the footer", "Source: Yahoo Finance" in footer and "monthly" in footer, footer)
 check("...and NVIDIA's colour as the card's accent (--brand-accent), from its cached logo",
@@ -290,13 +290,13 @@ check("In a clip: cues sit at the graphic's on-screen start, and ticks are never
 from core.dynamic_layout import render_with_cards  # noqa: E402
 
 source, base = tmp / "source.mp4", tmp / "base.mp4"
-for path, size in ((source, "1920x1080"), (base, "1080x1920")):
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc2=s={size}:r=30:d=12", "-f", "lavfi",
-                    "-i", "anullsrc=r=48000:cl=mono", "-t", "12", "-c:v", "libx264", "-preset", "ultrafast",
+for path, size in ((source, "1920x1080"), (base, "1080x1920")):  # Round 39: 15 s, room to read the steps said over 3.6 s
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc2=s={size}:r=30:d=15", "-f", "lavfi",
+                    "-i", "anullsrc=r=48000:cl=mono", "-t", "15", "-c:v", "libx264", "-preset", "ultrafast",
                     "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)], check=True)
 said = words_from("Okay so here is the plan for all of you today. First we find the market and then we hire the team "
                   "and then we scale the brand together and that is how it works every single time for us here", 100.0, 0.3)
-steps_edit = ClipEdit(100.0, 112.0, cards=[Card("step_sequence", 104.5, 109.9, rows=[
+steps_edit = ClipEdit(100.0, 115.0, cards=[Card("step_sequence", 104.5, 109.9, rows=[
     CardRow("Find the market"), CardRow("Hire the team"), CardRow("Scale the brand", highlight=True)])])
 made, results = render_with_cards(source, steps_edit, said, tmp / "with_sfx.mp4", tmp / "work", lambda kept: base,
                                   hook_seconds=3.0)

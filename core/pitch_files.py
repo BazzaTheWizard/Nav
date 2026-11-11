@@ -370,9 +370,44 @@ def trim_limits(item: dict[str, Any]) -> tuple[float, float]:
     return float(item["slice_start"]), max(float(item["slice_end"]) - 0.05, float(item["end"]))
 
 
-def rerender_trim(record_id: str, index: int, new_start: float, new_end: float, settings: Any) -> Path:
+def video_info_for(record: dict[str, Any] | None) -> Any:
+    """Round 52: what the worker's render knew about the video (title, show, this month's theme),
+    so a trim writes the clip's LinkedIn post and Shorts & Reels caption again for the new cut."""
+    if not isinstance(record, dict):
+        return None
+    from core.graphics_director import VideoInfo
+
+    facts = record.get("pitch") if isinstance(record.get("pitch"), dict) else {}
+    return VideoInfo(title=str(record.get("video_title") or ""), channel=str(record.get("channel_title") or ""),
+                     theme=str(facts.get("theme") or ""))
+
+
+def _outbox_record(record_id: str) -> dict[str, Any] | None:
+    """The pitch's record in the Outbox (storage/pending_outreach.json), or None."""
+    try:
+        import autonomous_worker as W
+
+        return next((r for r in W._pending_records() if r.get("record_id") == record_id), None)
+    except Exception:  # noqa: BLE001 - the trim still renders, just without new posts
+        return None
+
+
+def _side_files(clip: Path) -> list[Path]:
+    """A rendered clip's companions: captions (.srt), LinkedIn post, Shorts & Reels caption."""
+    from core.linkedin_post import post_path
+    from core.social_post import post_path as social_path
+
+    return [Path(clip).with_suffix(".srt"), post_path(Path(clip)), social_path(Path(clip))]
+
+
+def rerender_trim(record_id: str, index: int, new_start: float, new_end: float, settings: Any,
+                  info: Any = None) -> Path:
     """Render the clip again with new start/end times (seconds in the source video),
-    exactly like the worker does. Waits as clip_NN.trim.mp4 until accept_trim()."""
+    exactly like the worker does. Waits as clip_NN.trim.mp4 until accept_trim().
+    ``info`` (video_info_for(record)): the clip's posts are written again for the new cut; by
+    default it's read from the pitch's Outbox record."""
+    if info is None:
+        info = video_info_for(_outbox_record(record_id))
     from core.hook_selector import ClipResult
     from core.pipeline import render_selected_clip
 
@@ -408,10 +443,18 @@ def rerender_trim(record_id: str, index: int, new_start: float, new_end: float, 
             kept["webinar_layout"] = layout_from_dict(item["webinar"])
         rendered = render_selected_clip(
             directory / item["source"], clip, words, settings, work_dir / item["file"],
-            layout_mode=str(item["layout"]), work_dir=work_dir, **kept,
+            layout_mode=str(item["layout"]), work_dir=work_dir, graphics=info, **kept,
         )
         trimmed = directory / _trim_name(item["file"])
         shutil.move(str(rendered.path), trimmed)
+        # Round 52: the captions file and the posts go with the trimmed clip. They used to stay in
+        # the work folder and be deleted with it, so "Use this cut" put the clip on their page
+        # without its captions file (and with the old cut's posts).
+        for made, kept_as in zip(_side_files(rendered.path), _side_files(trimmed)):
+            if made.is_file():
+                shutil.move(str(made), kept_as)
+            else:
+                kept_as.unlink(missing_ok=True)
         make_preview(trimmed, directory / _trim_name(item["preview"]))
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -527,3 +570,76 @@ __all__ = [
     "PITCHES_DIR", "TRIM_MARGIN_SEC", "accept_trim", "discard_trim", "load_pitch", "pitch_dir",
     "pitch_files_bytes", "prune_pitch_files", "remove_pitch_files", "rerender_trim", "save_pitch_files", "trim_limits",
 ]
+
+
+# ------------------------------------------------------------------ Round 48: re-render a pitch
+def rerender_pitch(record_id: str, settings: Any, record: dict[str, Any] | None = None,
+                   replace_remote: Callable[[dict[str, Any], dict[str, Any]], Callable[[Path, str], None] | None] | None = None,
+                   ) -> list[int]:
+    """Render every clip of a pitch again, at the same times, with the current editing (a fix
+    shipped after the pitch was made: Round 48's grey screens), and swap each one where the
+    prospect sees it (their clip page, the Drive folder) exactly like the Outbox's Trim does.
+    Returns the clip numbers replaced."""
+    manifest = load_pitch(record_id)
+    if manifest is None:
+        raise RuntimeError("This pitch's files aren't on this Mac any more.")
+    done: list[int] = []
+    for item in manifest["clips"]:
+        start, end = float(item["start"]), float(item["end"])
+        rerender_trim(record_id, int(item["index"]), start, end, settings)
+        replacer = replace_remote(record or {}, {"start": start, "end": end, "file": item["file"]}) if replace_remote else None
+        accept_trim(record_id, int(item["index"]), replacer)
+        logger.info("Re-rendered clip %d of pitch %s.", item["index"], record_id)
+        done.append(int(item["index"]))
+    return done
+
+
+def _publish_replacer(record: dict[str, Any], clip: dict[str, Any]) -> Callable[[Path, str], None] | None:
+    """The app's _clip_replacer: the clip page (and the Drive folder) get the new file."""
+    page_name = str(record.get("page_name") or "")
+    drive_link = str(record.get("drive_link") or "")
+    if not page_name and not drive_link:
+        return None
+
+    def replace(path: Path, file_name: str) -> None:
+        if page_name:
+            from core import clip_pages
+
+            clip_pages.replace_clip(page_name, file_name, path, clip["start"], clip["end"])
+        if drive_link:
+            from core.drive_uploader import replace_clip_in_drive
+
+            replace_clip_in_drive(drive_link, file_name, path)
+
+    return replace
+
+
+def main(argv: list[str] | None = None) -> int:
+    """python -m core.pitch_files rerender <channel name or record id> [--local]"""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m core.pitch_files")
+    sub = parser.add_subparsers(dest="command", required=True)
+    again = sub.add_parser("rerender", help="render a pending pitch's clips again and update its clip page")
+    again.add_argument("pitch", help="the channel name (or the record id) in the Outbox")
+    again.add_argument("--local", action="store_true", help="only the files on this Mac, not the clip page")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    from autonomous_worker import get_pending_outreach
+    from config import load_settings
+
+    wanted = args.pitch.strip().lower()
+    records = [r for r in get_pending_outreach()
+               if wanted in {str(r.get("record_id", "")).lower(), str(r.get("channel_title", "")).strip().lower()}]
+    if not records:
+        parser.error(f"No pending pitch named {args.pitch!r} in the Outbox.")
+    record = records[0]
+    done = rerender_pitch(str(record["record_id"]), load_settings(), record,
+                          None if args.local else _publish_replacer)
+    where = "on this Mac" if args.local else (f"and on {record.get('page_url') or 'its clip page'}")
+    print(f"Re-rendered clip(s) {', '.join(map(str, done))} of {record.get('channel_title')} {where}.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -28,8 +28,10 @@ def _ass_time(seconds: float) -> str:
 
 
 def _safe_ass_text(text: str) -> str:
+    from core.plain_text import strip_controls  # Round 56: no NUL / escape codes / direction overrides
+
     return (
-        text.replace("\\", "/")
+        strip_controls(text).replace("\\", "/")
         .replace("{", "（")
         .replace("}", "）")
         .replace("\n", " ")
@@ -190,8 +192,18 @@ PULSE_SHARE = 0.4
 MIN_PULSE_WORD_MS = 120
 
 
+# Round 45: the default look is "linkedin_executive" (core.executive): Inter Display SemiBold
+# in sentence case, two calm lines over a soft scrim, silver -> white as it's spoken. The
+# creator looks stay: CAPTION_STYLE=bold (or classic) in .env.
+DEFAULT_CAPTION_STYLE = "linkedin_executive"
+
+
+def caption_style_name(name: str | None = None) -> str:
+    return (name or os.getenv("CAPTION_STYLE") or DEFAULT_CAPTION_STYLE).strip().lower()
+
+
 def caption_style(name: str | None = None) -> dict[str, float | str]:
-    chosen = (name or os.getenv("CAPTION_STYLE") or "bold").strip().lower()
+    chosen = caption_style_name(name)
     return CAPTION_STYLES.get(chosen, CAPTION_STYLES["bold"])
 
 
@@ -236,6 +248,8 @@ def create_ass_subtitles(
     style: str | None = None,
     emphasis: str | None = None,
     caption_top: int | None = None,
+    accent: str | None = None,
+    lower_third: object = None,
 ) -> Path:
     """Write short, clip-relative ASS subtitle cards with non-overlapping timing.
 
@@ -251,6 +265,10 @@ def create_ass_subtitles(
     style: "bold" or "classic" (default: CAPTION_STYLE in .env, else "bold").
     emphasis: "off", "subtle", "balanced" or "punchy" (default: EMPHASIS_INTENSITY
     in .env, else the style's own default).
+    accent: the brand colour for named companies and countries (Round 36, core.captions:
+    figures emerald, tickers and power words gold; default: the brand kit's accent).
+    style "linkedin_executive" (Round 45, the default): core.executive.write_ass, with
+    ``lower_third`` (a core.executive.LowerThird) drawn from 1.0 to 4.5 s.
     """
     if not words:
         raise ValueError("Cannot create subtitles without word timestamps.")
@@ -260,6 +278,14 @@ def create_ass_subtitles(
     if any(word.end <= word.start for word in ordered):
         raise ValueError("Every subtitle word must have an end time after its start time.")
 
+    if caption_style_name(style) == "linkedin_executive":
+        from core import executive
+
+        return executive.write_ass(
+            ordered, Path(output_path), clip_duration, highlight_active_word=highlight_active_word,
+            hook_title=hook_title, hook_seconds=hook_seconds, seam_spans=seam_spans, seam_title=seam_title,
+            caption_top=caption_top, accent_colour=accent, lower_third=lower_third,
+        )
     look = caption_style(style)
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -291,6 +317,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     soften = f"{{{blur}}}" if blur else ""
     preset = emphasis_preset(emphasis, look)
     numbers = number_emphasis()
+    # Round 36: semantic keywords (core.captions) keep their colour for the whole line and pop when spoken.
+    from core import captions as semantic
+
+    keywords = semantic.enabled()
+    kind_of = dict(zip(map(id, ordered), semantic.keyword_kinds(w.text for w in ordered))) if keywords else {}
+    if not numbers:
+        kind_of = {k: v for k, v in kind_of.items() if v != semantic.FIGURE}
+    palette = semantic.colours(accent)
     # After the spoken word: back to the plain style (keeping the soft edge).
     restore = f"{{\\r{blur}}}"
 
@@ -333,14 +367,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             continue
 
         tokens = [_safe_ass_text(word.text.upper()) for word in group]
-        shown = [f"{{\\c{NUMBER_COLOUR}}}{token}{restore}" if numbers and is_figure(token) else token
-                 for token in tokens]  # how each word looks while it isn't the spoken one
+        kinds = [kind_of.get(id(word)) if keywords else (semantic.FIGURE if numbers and is_figure(token) else None)
+                 for word, token in zip(group, tokens)]
+        shown = [f"{{\\c{palette[kind]}}}{token}{restore}" if kind else token
+                 for token, kind in zip(tokens, kinds)]  # how each word looks while it isn't the spoken one
         if not highlight_active_word:
             add_event(event_start_cs, event_end_cs, " ".join(shown))
         elif len(group) == 1:
             # A one-word card: the word itself is the spoken word.
-            pulse = _pulse(preset, look["outline"], (event_end_cs - event_start_cs) * 10)
-            add_event(event_start_cs, event_end_cs, f"{{{pulse}}}{tokens[0]}" if pulse else tokens[0])
+            word_ms = (event_end_cs - event_start_cs) * 10
+            if kinds[0]:  # a keyword keeps its colour and pops 1.08x
+                pop = semantic.keyword_pop(look["outline"], word_ms) if preset is not None else ""
+                add_event(event_start_cs, event_end_cs, f"{{\\c{palette[kinds[0]]}{pop}}}{tokens[0]}")
+            else:
+                pulse = _pulse(preset, look["outline"], word_ms)
+                add_event(event_start_cs, event_end_cs, f"{{{pulse}}}{tokens[0]}" if pulse else tokens[0])
         else:
             # One event per word: same card text, the spoken word in yellow.
             boundaries = [event_start_cs]
@@ -350,11 +391,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 )
             boundaries.append(event_end_cs)
             for word_index in range(len(group)):
-                pulse = _pulse(
-                    preset, look["outline"], (boundaries[word_index + 1] - boundaries[word_index]) * 10
-                )
+                word_ms = (boundaries[word_index + 1] - boundaries[word_index]) * 10
+                kind = kinds[word_index]
+                if kind:  # a keyword keeps its colour and pops 1.08x as it's said
+                    spoken = (f"{{\\c{palette[kind]}"
+                              f"{semantic.keyword_pop(look['outline'], word_ms) if preset is not None else ''}}}")
+                else:
+                    spoken = f"{{\\c{HIGHLIGHT_COLOUR}{_pulse(preset, look['outline'], word_ms)}}}"
                 text = " ".join(
-                    f"{{\\c{HIGHLIGHT_COLOUR}{pulse}}}{token}{restore}" if i == word_index else shown[i]
+                    f"{spoken}{token}{restore}" if i == word_index else shown[i]
                     for i, token in enumerate(tokens)
                 )
                 add_event(boundaries[word_index], boundaries[word_index + 1], text, line_start_cs=event_start_cs)

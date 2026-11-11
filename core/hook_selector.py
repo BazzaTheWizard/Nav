@@ -4,17 +4,20 @@ import logging
 import math
 import re
 
+from pydantic.json_schema import SkipJsonSchema
 from pydantic import BaseModel, Field, model_validator
 from openai import OpenAI
 
 from config import Settings
+from core import clip_length as L
 from core.transcriber import Word, format_timeline
 
 logger = logging.getLogger(__name__)
 
 
-MIN_CLIP_DURATION = 30.0
-MAX_CLIP_DURATION = 60.0
+# Round 55 (core.clip_length): 35-180 s, idea-complete (CLIP_LENGTH=legacy: 30-60 s).
+MIN_CLIP_DURATION = L.MIN_SECONDS
+MAX_CLIP_DURATION = L.MAX_SECONDS
 PRE_ROLL_SECONDS = 0.15
 POST_ROLL_SECONDS = 0.4
 MIN_SILENCE_SECONDS = 0.35
@@ -23,8 +26,8 @@ MIN_CLIP_GAP_SECONDS = 15.0
 # LLM proposals outside this range are discarded. Anything inside it is snapped to
 # sentence boundaries and forced into MIN/MAX_CLIP_DURATION by _clip_bounds, so the
 # model being a few seconds off no longer throws a good moment away.
-MIN_PROPOSED_DURATION = 10.0
-MAX_PROPOSED_DURATION = 120.0
+MIN_PROPOSED_DURATION = L.MIN_PROPOSED_SECONDS
+MAX_PROPOSED_DURATION = L.MAX_PROPOSED_SECONDS
 # Average sentence longer than this means the transcript has (almost) no
 # punctuation, e.g. auto-generated YouTube captions.
 MAX_AVERAGE_SENTENCE_SECONDS = 20.0
@@ -35,19 +38,27 @@ class ClipResult(BaseModel):
     start_time: float = Field(
         description=(
             "Clip start time in seconds from the source video's beginning. "
-            "Choose a duration of 30-60 seconds."
+            + ("Choose a duration of 30-60 seconds." if L.LEGACY else
+               "Start where the idea starts: the question, claim or story setup.")
         )
     )
     end_time: float = Field(
         description=(
             "Proposed clip end time in seconds from the source video's beginning. "
-            "Aim for a 30-60 second duration ending on a finished sentence."
+            + ("Aim for a 30-60 second duration ending on a finished sentence." if L.LEGACY else
+               "End on the sentence where the speaker lands the point (35-180 s in all), "
+               "never mid-thought.")
         )
     )
     viral_title: str = Field(description="Compelling short-form title for this clip.")
     caption: str = Field(description="Ready-to-post social caption that encourages engagement.")
     hashtags: list[str] = Field(description="A concise list of relevant social media hashtags.")
     virality_score: int = Field(ge=0, le=100, description="Estimated short-form shareability from 0 to 100.")
+    # Round 36 (core.heatmap_scorer): 0-1, how strongly the clip's hook sits on a YouTube replay
+    # spike. Set by the code, never asked of the model (left out of the response schema).
+    peak_retention_score: SkipJsonSchema[float] = 0.0
+    # Round 36 (core.audio_polish.flag_dead_air): pauses over 0.65 s, (from, to) clip seconds.
+    dead_air: SkipJsonSchema[list[list[float]]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_duration(self) -> "ClipResult":
@@ -155,14 +166,14 @@ def _clip_bounds(
     return clip_start, clip_end
 
 
-def _bounds_from_start(
+def _bound_options(
     sentences: list[tuple[float, float, int]],
     start_index: int,
     ordered_words: list[Word],
     total_video_duration: float,
-) -> list[tuple[float, float]]:
-    """All valid clip bounds that begin at sentences[start_index]."""
-    options: list[tuple[float, float]] = []
+) -> list[tuple[float, float, int]]:
+    """All valid (start, end, end sentence index) bounds that begin at sentences[start_index]."""
+    options: list[tuple[float, float, int]] = []
     start_time = sentences[start_index][0]
     for end_index in range(start_index, len(sentences)):
         if sentences[end_index][1] - start_time > _MAX_SPAN_SECONDS:
@@ -175,8 +186,180 @@ def _bounds_from_start(
             total_video_duration,
         )
         if bounds is not None:
-            options.append(bounds)
+            options.append((bounds[0], bounds[1], end_index))
     return options
+
+
+def _bounds_from_start(
+    sentences: list[tuple[float, float, int]],
+    start_index: int,
+    ordered_words: list[Word],
+    total_video_duration: float,
+) -> list[tuple[float, float]]:
+    """All valid clip bounds that begin at sentences[start_index]."""
+    return [(start, end) for start, end, _index in
+            _bound_options(sentences, start_index, ordered_words, total_video_duration)]
+
+
+# --- Round 55: idea-complete endings -------------------------------------------------
+# With room for 35-180 s, where a clip ends is decided by the thought, not the clock. Each
+# possible ending (a finished sentence) is scored; the cheapest wins. Hard problems mean the
+# speaker hasn't landed the point yet; soft ones mean the cut is likely to feel abrupt.
+HARD = 6.0
+SOFT = 1.5
+# The final "sentence" is the other person's acknowledgement, not the speaker's conclusion.
+_BACKCHANNEL = re.compile(
+    r"^(?:(?:yes|yeah|yep|yup|right|exactly|totally|absolutely|sure|correct|true|wow|interesting|"
+    r"okay|ok|mm+-?hmm+|uh-huh|got it|i see|for sure|that's right|that's true|so true|amazing|"
+    r"love that|fair|fair enough|nice|great|cool|definitely|indeed|100|100 percent|of course)[\s,.!?]*)+$",
+    re.IGNORECASE,
+)
+# The next sentence delivers the payoff of this one: stopping here cuts off the conclusion.
+_PAYOFF_NEXT = re.compile(
+    r"^(?:so that's|so the|so what|so if|so you|which means|that means|this means|what that means|"
+    r"that's why|that is why|this is why|and that's|and that is|and the reason|the reason|because|'cause|"
+    r"the point is|the lesson|the key|the takeaway|the bottom line|bottom line|in other words|"
+    r"here's the thing|here's why|but|however|except|and then|and so|then|until|otherwise)\b",
+    re.IGNORECASE,
+)
+# The other person takes the floor ("Yeah, I think...", "Right. So..."): a turn change.
+_TURN_OPENER = re.compile(
+    r"^(?:yeah|yes|yep|right|exactly|totally|absolutely|sure|wow|interesting|okay|ok|mm+-?hmm+|uh-huh|"
+    r"no|true|fair|that's (?:so )?(?:true|right|interesting|fascinating|amazing|great|incredible))\b",
+    re.IGNORECASE,
+)
+# The last sentence says it is the conclusion.
+_CONCLUDES = re.compile(
+    r"\b(?:that's why|which means|that means|the lesson|the point is|bottom line|at the end of the day|"
+    r"the key is|so that's|in the end|ultimately|that's the (?:secret|key|lesson|difference|point)|"
+    r"that's how|and that's it|that's a sign)\b",
+    re.IGNORECASE,
+)
+# Weaker continuations: the speaker is probably still going.
+_CONTINUES_NEXT = re.compile(r"^(?:so|and|also|plus|or|now|like)\b", re.IGNORECASE)
+# A sentence can't end on these (unpunctuated transcripts split at pauses).
+_DANGLING_LAST_WORD = {
+    "and", "but", "so", "or", "because", "the", "a", "an", "of", "to", "with", "that", "which", "is", "are",
+    "was", "were", "if", "like", "for", "in", "on", "at", "my", "our", "your", "their", "his", "her", "its",
+    "we", "i", "you", "they", "it's", "about", "from", "than", "then", "um", "uh",
+}
+# "Mr." / "Dr." end a transcript "sentence" but not a thought.
+_ABBREVIATIONS = {"mr", "mrs", "ms", "dr", "st", "vs", "jr", "sr", "prof", "inc", "co", "etc", "e.g", "i.e", "u.s"}
+_COUNTED_LIST = re.compile(
+    r"\b(two|three|four|five|2|3|4|5)\s+(?:\w+\s+)?(?:things|reasons|ways|mistakes|lessons|rules|steps|questions|"
+    r"pillars|principles|levers|parts|types|kinds|buckets|points|factors|pieces|stages|phases|options|ideas|"
+    r"problems|signs|habits|secrets|traits|keys|truths)\b",
+    re.IGNORECASE,
+)
+_ORDINALS = {"two": ("second", "2nd", "number two"), "three": ("third", "3rd", "number three"),
+             "four": ("fourth", "4th", "number four"), "five": ("fifth", "5th", "number five")}
+_DIGITS = {"2": "two", "3": "three", "4": "four", "5": "five"}
+
+
+def _sentence_text(ordered_words: list[Word], sentences: list[tuple[float, float, int]], index: int) -> str:
+    first = sentences[index - 1][2] + 1 if index > 0 else 0
+    return " ".join(word.text.strip() for word in ordered_words[first:sentences[index][2] + 1]).strip()
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"[\"“”‘’()\[\]]", "", text).strip().lower()
+
+
+def unfinished_list(text: str) -> bool:
+    """The clip announces "three reasons..." but never gets to the third (or the last)."""
+    lowered = _plain(text)
+    for match in _COUNTED_LIST.finditer(lowered):
+        count = _DIGITS.get(match.group(1), match.group(1))
+        rest = lowered[match.end():]
+        markers = _ORDINALS.get(count, ()) + ("last", "lastly", "finally", "final one", "and finally")
+        if not any(re.search(rf"\b{re.escape(marker)}\b", rest) for marker in markers):
+            return True
+    return False
+
+
+def ending_problems(
+    ordered_words: list[Word],
+    sentences: list[tuple[float, float, int]],
+    start_index: int,
+    end_index: int,
+) -> list[tuple[float, str]]:
+    """Why ending a clip after sentences[end_index] would cut the speaker off (cost, reason).
+    Empty: the clip ends where the thought ends."""
+    problems: list[tuple[float, str]] = []
+    last = _sentence_text(ordered_words, sentences, end_index)
+    last_plain = _plain(last)
+    if end_index > start_index and _BACKCHANNEL.match(last_plain):
+        problems.append((HARD, "ends on the other person's acknowledgement"))
+    if last.rstrip("\"')]}”’ ").endswith("?"):
+        problems.append((HARD, "ends on a question (the answer is cut off)"))
+    words = last_plain.rstrip(".!?,;: ").split()
+    if not _ends_sentence(last) and words and words[-1] in _DANGLING_LAST_WORD:
+        problems.append((HARD + 2, "ends mid-phrase"))  # a pause-split span ("...and the")
+    if last.rstrip().endswith((":", ",", ";")) or (words and words[-1].rstrip(".") in _ABBREVIATIONS):
+        problems.append((HARD, "ends mid-sentence"))
+    if last.rstrip("\"')]}”’ ").endswith(("...", "…")):
+        problems.append((HARD, "trails off"))
+    if end_index > start_index and _TURN_OPENER.match(last_plain) and not _BACKCHANNEL.match(last_plain):
+        problems.append((2 * SOFT, "ends on the other person's reply"))
+    if _CONCLUDES.search(last_plain):
+        problems.append((-1.0, "a concluding sentence"))
+    first_word = sentences[start_index - 1][2] + 1 if start_index > 0 else 0
+    clip_words = " ".join(w.text for w in ordered_words[first_word:sentences[end_index][2] + 1])
+    if unfinished_list(clip_words):
+        problems.append((HARD, "announces a list it doesn't finish"))
+    if end_index + 1 < len(sentences):
+        upcoming = _plain(_sentence_text(ordered_words, sentences, end_index + 1))
+        upcoming_raw = _sentence_text(ordered_words, sentences, end_index + 1)
+        gap = sentences[end_index + 1][0] - sentences[end_index][1]
+        next_is_question = upcoming_raw.rstrip("\"')]}”’ ").endswith("?") and len(upcoming.split()) <= 30
+        turn_change = bool(_TURN_OPENER.match(upcoming)) or next_is_question
+        if gap >= 0.9:
+            problems.append((-SOFT, "natural transition (a clear pause)"))
+        elif turn_change:
+            problems.append((-1.0, "natural transition (the other person comes in)"))
+        elif _PAYOFF_NEXT.match(upcoming):
+            problems.append((HARD, "the next sentence lands the point"))
+        elif _CONTINUES_NEXT.match(upcoming):
+            problems.append((SOFT, "the speaker carries straight on"))
+        if gap < 0.15 and not turn_change:
+            problems.append((SOFT, "no breath before the next sentence"))
+    return problems
+
+
+def _ending_cost(
+    option: tuple[float, float, int],
+    proposed_end: float,
+    ordered_words: list[Word],
+    sentences: list[tuple[float, float, int]],
+    start_index: int,
+) -> float:
+    start, end, end_index = option
+    cost = sum(points for points, _reason in ending_problems(ordered_words, sentences, start_index, end_index))
+    # Ending before the AI's proposed end risks cutting the idea it saw; ending later costs
+    # less (the snap is finishing the thought). 1 point per 3 s early, per 12 s late.
+    cost += (proposed_end - end) / 3.0 if end < proposed_end else (end - proposed_end) / 12.0
+    if end - start < L.COMFORT_SECONDS:
+        cost += (L.COMFORT_SECONDS - (end - start)) / 5.0
+    return cost
+
+
+def best_bounds(
+    options: list[tuple[float, float, int]],
+    proposed_end: float,
+    ordered_words: list[Word],
+    sentences: list[tuple[float, float, int]],
+    start_index: int,
+) -> tuple[float, float]:
+    """The idea-complete ending among ``options``; Round 54's nearest-end rule under
+    CLIP_LENGTH=legacy."""
+    if L.LEGACY:
+        start, end, _index = min(options, key=lambda bounds: (bounds[1] < proposed_end, abs(bounds[1] - proposed_end)))
+        return start, end
+    start, end, _index = min(
+        options,
+        key=lambda bounds: (_ending_cost(bounds, proposed_end, ordered_words, sentences, start_index), bounds[1]),
+    )
+    return start, end
 
 
 def _normalize_clip(
@@ -206,7 +389,7 @@ def _normalize_clip(
         range(len(sentences)),
         key=lambda index: abs(sentences[index][0] - clip.start_time),
     )
-    bounds_options = _bounds_from_start(
+    bounds_options = _bound_options(
         sentences,
         sentence_index,
         ordered_words,
@@ -214,13 +397,7 @@ def _normalize_clip(
     )
     if not bounds_options:
         return None
-    start_time, end_time = min(
-        bounds_options,
-        key=lambda bounds: (
-            bounds[1] < clip.end_time,
-            abs(bounds[1] - clip.end_time),
-        ),
-    )
+    start_time, end_time = best_bounds(bounds_options, clip.end_time, ordered_words, sentences, sentence_index)
     return clip.model_copy(
         update={"start_time": start_time, "end_time": end_time}
     )
@@ -246,6 +423,12 @@ _FILLER = re.compile(
     r"thanks? (?:you )?(?:so much )?for (?:watching|listening)|see you (?:next time|in the next)",
     re.IGNORECASE,
 )
+# Round 55: more housekeeping a longer clip can run into (idea-complete mode only).
+_FILLER_IDEA = re.compile(
+    r"thanks? (?:you )?(?:so much )?for (?:having me|joining (?:us|me)|coming on|being (?:here|on))|"
+    r"that's all (?:from|for) (?:the|this|today)|until next time|see you next week",
+    re.IGNORECASE,
+)
 # How many sentences a dangling start may be moved forward before the clip is dropped.
 MAX_START_SHIFT_SENTENCES = 2
 
@@ -261,7 +444,7 @@ def clip_text(words: list[Word], start: float, end: float) -> str:
 
 def moment_problem(text: str) -> str | None:
     """Why a clip with this text makes a weak Short, or None if it looks fine."""
-    if _FILLER.search(text):
+    if _FILLER.search(text) or (not L.LEGACY and _FILLER_IDEA.search(text)):
         return "sponsor read, intro or outro"
     opening = text.lstrip(" \"'“”‘’-–—.,…")
     if _DANGLING_OPENING.match(opening):
@@ -276,7 +459,8 @@ def _fix_or_drop(
     sentences: list[tuple[float, float, int]],
     video_duration: float,
 ) -> ClipResult | None:
-    """Keep a clean clip; move a mid-thought start forward a sentence or two; else drop."""
+    """Keep a clean clip; move a mid-thought start back to its setup (Round 55) or forward a
+    sentence or two; else drop."""
     problem = moment_problem(clip_text(words, clip.start_time, clip.end_time))
     if problem is None:
         return clip
@@ -285,11 +469,19 @@ def _fix_or_drop(
     if not sentences:
         return None
     first = min(range(len(sentences)), key=lambda index: abs(sentences[index][0] - (clip.start_time + PRE_ROLL_SECONDS)))
-    for index in range(first + 1, min(first + 1 + MAX_START_SHIFT_SENTENCES, len(sentences))):
-        options = _bounds_from_start(sentences, index, ordered_words, video_duration)
-        if not options:
+    forward = list(range(first + 1, min(first + 1 + MAX_START_SHIFT_SENTENCES, len(sentences))))
+    # Round 55: with room to spare, first try opening a sentence or two earlier, on the setup
+    # the dangling line depends on ("...and that's why" needs the claim before it).
+    backward = [] if L.LEGACY else [index for index in (first - 1, first - 2) if index >= 0]
+    for index in backward + forward:
+        triples = _bound_options(sentences, index, ordered_words, video_duration)
+        if not triples:
             continue
-        start, end = min(options, key=lambda bounds: abs(bounds[1] - clip.end_time))
+        if L.LEGACY:
+            start, end = min(((a, b) for a, b, _i in triples), key=lambda bounds: abs(bounds[1] - clip.end_time))
+        else:
+            # Opening earlier must not shorten the ending the AI chose.
+            start, end = best_bounds(triples, clip.end_time, ordered_words, sentences, index)
         if moment_problem(clip_text(words, start, end)) is None:
             return clip.model_copy(update={"start_time": start, "end_time": end})
     return None
@@ -309,8 +501,20 @@ def _fallback_clips(
     ordered_words = sorted(words, key=lambda word: (word.start, word.end))
     sentences = _sentence_spans(ordered_words)
     candidates: list[ClipResult] = []
+    shortest: list[ClipResult] = []  # Round 55: the backup when complete thoughts don't all fit
+
+    def as_clip(start_time: float, end_time: float) -> ClipResult:
+        return ClipResult(
+            start_time=start_time,
+            end_time=end_time,
+            viral_title="Key Highlight",
+            caption="Check out this moment!",
+            hashtags=["viral", "shorts", "podcast"],
+            virality_score=0,
+        )
+
     for start_index in range(len(sentences)):
-        options = _bounds_from_start(
+        options = _bound_options(
             sentences,
             start_index,
             ordered_words,
@@ -318,21 +522,26 @@ def _fallback_clips(
         )
         if not options:
             continue
-        start_time, end_time = options[0]
+        if L.LEGACY:
+            start_time, end_time = options[0][:2]
+        else:
+            # Round 55: the first complete thought from here, not just the shortest legal span.
+            start_time, end_time = best_bounds(options, sentences[start_index][0] + L.COMFORT_SECONDS,
+                                               ordered_words, sentences, start_index)
+            short_start, short_end = options[0][:2]
+            if (short_start, short_end) != (start_time, end_time) and moment_problem(
+                    clip_text(ordered_words, short_start, short_end)) is None:
+                shortest.append(as_clip(short_start, short_end))
         if moment_problem(clip_text(ordered_words, start_time, end_time)) is not None:
             continue
-        candidates.append(
-            ClipResult(
-                start_time=start_time,
-                end_time=end_time,
-                viral_title="Key Highlight",
-                caption="Check out this moment!",
-                hashtags=["viral", "shorts", "podcast"],
-                virality_score=0,
-            )
-        )
+        candidates.append(as_clip(start_time, end_time))
 
-    return _select_spaced_candidates(candidates, list(already or []), requested_count, total_video_duration)
+    selected = _select_spaced_candidates(candidates, list(already or []), requested_count, total_video_duration)
+    if len(selected) < requested_count and shortest:
+        # A short video where the complete thoughts don't all fit: fill with the shortest
+        # clean spans (still 35 s+, sentence-aligned) rather than send fewer clips.
+        selected = _select_spaced_candidates(candidates + shortest, selected, requested_count, total_video_duration)
+    return selected
 
 
 def _has_minimum_gap(candidate: ClipResult, chosen: list[ClipResult]) -> bool:
@@ -511,7 +720,8 @@ def cap_clip_length(clips: list[ClipResult], words: list[Word], max_seconds: flo
     """Clips longer than ``max_seconds`` end earlier: on the last finished sentence that
     fits (when that still leaves MIN_CLIP_DURATION), else after the last whole word that
     fits. Shorter clips are unchanged. (YouTube blocks Shorts over one minute that carry
-    a copyright claim, so Make clips' "59 s max" uses 59.)"""
+    a copyright claim, so Make clips' "59 s max" uses 59.) Round 55: only that opt-in box
+    (and CLIP_LENGTH=legacy) still caps; by default a clip runs until the idea ends."""
     capped: list[ClipResult] = []
     for clip in clips:
         if clip.end_time - clip.start_time <= max_seconds:
@@ -540,10 +750,33 @@ def finalize_candidates(
     """Snap proposals to sentence boundaries and pick the best non-overlapping set.
 
     Used for both the OpenAI picker and the Gemini picker so every clip follows
-    the same 30-60 s, sentence-aligned, well-spaced rules. Proposals are ranked
+    the same length (core.clip_length: 35-180 s, idea-complete), sentence-aligned,
+    well-spaced rules. Proposals are ranked
     by virality_score; any shortfall is filled with spaced heuristic clips.
     """
     return choose_clips(prepare_candidates(proposals, words, video_duration), words, video_duration, requested_count)
+
+
+LEGACY_LENGTH_RULES = (
+    "Target 30-60 seconds per candidate, "
+    "stay within the source duration, and prefer complete sentences "
+    "and natural thought boundaries. Final clips start with a "
+    "0.15-second pre-roll and end at a finished thought with up to "
+    "0.4 seconds of post-roll, while staying within 30-60 seconds. "
+    "Snap endings to natural silence of at least 0.35 seconds where "
+    "available. "
+)
+# Round 55: the length follows the idea (core.clip_length).
+IDEA_LENGTH_RULES = (
+    "Each candidate is one complete idea: 35 to 180 seconds, as long as the speaker needs "
+    "to land it, never trimmed to hit a time. Start on the sentence that opens the idea "
+    "(the question, the claim, the story's setup). Stay with the speaker until they finish "
+    "their thesis, argument or story resolution, and end on that concluding sentence or at "
+    "a natural topic change (a pause, the other person's next question). Never end on a "
+    "question that is answered next, halfway through a list they announced, on a 'but' or "
+    "'so that's why' still to come, or on the other person's 'yeah'. Stay within the source "
+    "duration. Final clips get a 0.15-second pre-roll and up to 0.4 seconds of post-roll. "
+)
 
 
 def select_clips(
@@ -552,7 +785,11 @@ def select_clips(
     requested_count: int,
     settings: Settings,
     replay_peaks_hint: list[tuple[float, float, float]] | None = None,
+    heatmap: list[dict] | None = None,
 ) -> list[ClipResult]:
+    """The fallback selector (OpenAI). Round 36: clips whose hook lands on a replay spike
+    (``heatmap``, else the hot ``replay_peaks_hint``) rank higher and carry their
+    peak_retention_score, as in core.pipeline.pick_clips_with_agent."""
     if not settings.openai_api_key:
         raise RuntimeError(
             "OPENAI_API_KEY is required for hook selection. Copy .env.example to .env "
@@ -573,13 +810,9 @@ def select_clips(
                 "content": (
                     "Find strong self-contained short-form moments in the timestamped "
                     "transcript. Return the requested number of candidates, ordered by "
-                    "virality_score descending. Target 30-60 seconds per candidate, "
-                    "stay within the source duration, and prefer complete sentences "
-                    "and natural thought boundaries. Final clips start with a "
-                    "0.15-second pre-roll and end at a finished thought with up to "
-                    "0.4 seconds of post-roll, while staying within 30-60 seconds. "
-                    "Snap endings to natural silence of at least 0.35 seconds where "
-                    "available. Every candidate must be a completely distinct "
+                    "virality_score descending. "
+                    + (LEGACY_LENGTH_RULES if L.LEGACY else IDEA_LENGTH_RULES)
+                    + "Every candidate must be a completely distinct "
                     "moment covering a different topic or idea from a different "
                     "part of the video. "
                     "Do NOT select overlapping timestamps or the same scene with "
@@ -617,9 +850,11 @@ def select_clips(
     if message.parsed is None:
         return _fallback_clips(requested_count, video_duration, words)
 
-    return finalize_candidates(
-        list(message.parsed.clips),
-        words,
-        video_duration,
-        requested_count,
-    )
+    from core import audio_polish, heatmap_scorer
+
+    spikes = heatmap_scorer.spikes(heatmap) if heatmap else list(replay_peaks_hint or [])
+    clips = heatmap_scorer.score_clips(
+        finalize_candidates(heatmap_scorer.score_clips(list(message.parsed.clips), spikes), words, video_duration,
+                            requested_count),
+        spikes, rank=False, raise_scores=False)
+    return audio_polish.flag_dead_air(clips, words)

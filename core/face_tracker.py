@@ -20,6 +20,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from core import camera_crop
+
 
 logger = logging.getLogger(__name__)
 __all__ = [
@@ -420,10 +422,11 @@ MIN_SHOT_SECONDS = 0.6  # shorter: an edge sliver (held over) or a quick shot (f
 FLASH_SECONDS = 0.2  # cuts closer together than this are a flash, not a shot
 SAMPLE_MARGIN = 0.12  # face samples this close to a cut may show the neighbouring shot
 # Inside a shot the crop is locked (no jitter, no chasing head movements). It re-frames
-# only when the face sits outside the dead zone for REFRAME_HOLD seconds, with an eased pan.
-DEAD_ZONE = 0.28  # share of the crop width the face may sit off-centre
-REFRAME_HOLD = 2.0
-REFRAME_SECONDS = 0.8
+# only when the face sits outside the dead band for REFRAME_HOLD seconds, with a critically
+# damped spring pan (Round 36: core.camera_crop, an 8%-of-frame dead band with hysteresis).
+DEAD_ZONE = camera_crop.DEAD_BAND  # share of the FRAME width the face may sit off-centre (was 0.28 of the crop)
+REFRAME_HOLD = camera_crop.HOLD_SECONDS
+REFRAME_SECONDS = camera_crop.MOVE_SECONDS
 FACE_SHOT_PRESENCE = 0.4
 GROUP_SHOT_PRESENCE = 0.6  # two people in the same frames for most of the shot
 # Embedded content (Round 30): a chart, slide, document or screen share in the recording
@@ -686,9 +689,8 @@ class CropPlan:
         for boundary, x in reversed(segments[:-1]):
             expression = f"if(lt(t,{boundary:.3f}),{x},{expression})"
         for begin, end, start_x, end_x in reversed(ramps):
-            # smoothstep ease from start_x to end_x between begin and end
-            progress = f"(t-{begin:.3f})/{end - begin:.3f}"
-            eased = f"{start_x}+({end_x - start_x})*{progress}*{progress}*(3-2*{progress})"
+            # a critically damped spring from start_x to end_x between begin and end (Round 36)
+            eased = camera_crop.eased_x_expression(begin, end, start_x, end_x)
             expression = f"if(between(t,{begin:.3f},{end:.3f}),{eased},{expression})"
         return expression
 
@@ -697,8 +699,7 @@ class CropPlan:
         segments, ramps = self._x_track(clip_start, clip_end)
         for begin, end, start_x, end_x in ramps:
             if begin <= t <= end:
-                progress = (t - begin) / (end - begin)
-                return start_x + (end_x - start_x) * progress * progress * (3 - 2 * progress)
+                return camera_crop.eased_x(t, begin, end, start_x, end_x)
         for boundary, x in segments:
             if t < boundary:
                 return float(x)
@@ -860,8 +861,10 @@ def _decode_analysis_frames(
             "rawvideo",
             str(face_file),
         ]
-        # A 60 s clip decodes in seconds; a stuck FFmpeg must not stall the worker.
-        result = subprocess.run(command, check=True, capture_output=True, timeout=300)
+        # A 60 s clip decodes in seconds; a stuck FFmpeg must not stall the worker. Round 55:
+        # the limit grows with 3-minute clips (5 min floor).
+        result = subprocess.run(command, check=True, capture_output=True,
+                                timeout=max(300.0, 3.0 * float(duration)))
         cut_frames = np.frombuffer(result.stdout, dtype=np.uint8)
         cut_frames = cut_frames[: cut_frames.size - cut_frames.size % (cut_w * cut_h)]
         cut_frames = cut_frames.reshape(-1, cut_h, cut_w)
@@ -983,7 +986,8 @@ def _cut_times(cut_frames: np.ndarray, times: list[float] | None = None) -> list
                 and difference >= CUT_MIN_DIFFERENCE / 2
             )
             if is_cut:
-                found.append((times[index - 1] + times[index]) / 2 if times else index / CUT_ANALYSIS_FPS)
+                found.append(camera_crop.cut_boundary(times[index - 1], times[index]) if times
+                             else index / CUT_ANALYSIS_FPS)
                 recent.clear()
             else:
                 recent.append(difference)
@@ -996,26 +1000,11 @@ def _cut_times(cut_frames: np.ndarray, times: list[float] | None = None) -> list
 def _reframes(
     track: list[tuple[float, float]], x: int, crop_width: int, frame_width: int, start_time: float
 ) -> tuple[tuple[float, int], ...]:
-    """Dead-zone re-framing for one shot. ``track``: (clip second, face centre x) samples.
-    The crop stays put while the face is within DEAD_ZONE of its centre; when the face
-    sits outside it for REFRAME_HOLD seconds, one eased pan re-centres it (hysteresis:
-    a quick lean or a gesture never moves the camera)."""
-    moves: list[tuple[float, int]] = []
-    center = x + crop_width / 2
-    outside: list[tuple[float, float]] = []
-    for t, face_x in track:
-        if abs(face_x - center) <= DEAD_ZONE * crop_width:
-            outside.clear()
-            continue
-        outside.append((t, face_x))
-        if outside[-1][0] - outside[0][0] >= REFRAME_HOLD:
-            target_center = statistics.median(value for _t, value in outside)
-            new_x = int(max(0, min(frame_width - crop_width, target_center - crop_width / 2))) // 2 * 2
-            if abs(new_x - (center - crop_width / 2)) > SAME_X_TOLERANCE_PX:
-                moves.append((start_time + outside[0][0], new_x))
-                center = new_x + crop_width / 2
-            outside.clear()
-    return tuple(moves)
+    """Dead-band re-framing for one shot (core.camera_crop.reframes): the crop stays put
+    while the face is within 8% of the frame width of its centre; a face out of the band
+    for REFRAME_HOLD seconds gets one spring pan (hysteresis: a quick lean or a gesture
+    never moves the camera)."""
+    return camera_crop.reframes(track, x, crop_width, frame_width, start_time)
 
 
 def _cluster(values: list[tuple[float, float]], distance: float) -> list[list[tuple[float, float]]]:
@@ -1123,6 +1112,30 @@ def _dissolve_times(
     return found
 
 
+STAGE_BODY_TEXTURE = 0.6  # Round 48: at least this share of the column under a face is not flat (a body)
+
+
+def on_stage(gray: np.ndarray, faces: list[tuple[float, float, float, float]], scale: float) -> bool:
+    """Round 48: every face has a body under it: the column from just below the chin to four
+    face widths lower (two face widths wide) is mostly textured (clothes, legs, a chair).
+    People on a stage or a set, not webcam tiles: a tile ends at the shoulders and the flat
+    page starts. A dark stage with a banner was read as a slide before (GTMnow's AGM chat:
+    0.87-0.93 textured under each face; webcam tiles over a page: 0.0)."""
+    rows, cols = gray.shape[:2]
+    values = gray.astype(np.float32)
+    mean = cv2.blur(values, (5, 5))
+    spread = np.sqrt(np.maximum(0.0, cv2.blur(values * values, (5, 5)) - mean * mean))
+    for cx, _area, cy, width in faces:
+        x, y, w = cx / scale, cy / scale, width / scale
+        top, bottom = int(y + 0.9 * w), int(y + 5.0 * w)
+        left, right = max(0, int(x - w)), min(cols, int(x + w))
+        if bottom > rows or right - left < 2 or bottom - top < 4:
+            return False
+        if float((spread[top:bottom, left:right] >= 1.5).mean()) < STAGE_BODY_TEXTURE:
+            return False
+    return True
+
+
 def _content_like(frame: np.ndarray, faces: list[tuple[float, float, float, float]], scale: float,
                   frame_width: int) -> bool:
     """The sample frame shows content of its own (a chart, slide, document or screen
@@ -1133,6 +1146,8 @@ def _content_like(frame: np.ndarray, faces: list[tuple[float, float, float, floa
     if any(face[3] > CONTENT_FACE_MAX * frame_width for face in faces):
         return False
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    if faces and on_stage(gray, faces, scale):
+        return False  # Round 48: people with bodies (a stage, a set), not webcam tiles over a page
     rows, cols = gray.shape
     keep = np.ones(gray.shape, bool)
     for cx, _area, cy, width in faces:  # the tiles' faces (and hair and shoulders) don't count

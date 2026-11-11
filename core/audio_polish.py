@@ -22,7 +22,8 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RATE = 48_000
-SOUNDS = {"whoosh": (0.180, -22.0), "tick": (0.040, -26.0)}  # kind: (seconds, peak dBFS)
+SOUNDS = {"whoosh": (0.180, -22.0), "tick": (0.040, -26.0),
+          "sub_hit": (0.180, -9.0)}  # kind: (seconds, peak dBFS); sub_hit: Round 40's teaser stitch
 MIN_TICK_GAP = 0.14  # seconds between two ticks at least
 
 
@@ -78,7 +79,31 @@ def tick() -> np.ndarray:
     return _peak(mix, dbfs)
 
 
-SYNTHS = {"whoosh": whoosh, "tick": tick}
+SUB_HIT_FROM, SUB_HIT_TO = 80.0, 45.0  # Hz: the thud's pitch drops from 80 to 45 Hz
+SUB_HIT_DECAY = 0.180  # seconds: the whole hit, gone (-40 dB) by the end of it
+SUB_HIT_ATTACK = 0.003  # a 3 ms rise: a thump, never a click
+
+
+def sub_hit() -> np.ndarray:
+    """Round 40: the sub-bass hit under the climax teaser's white flash. A pure sine whose
+    pitch drops exponentially from 80 Hz to 45 Hz, a 3 ms rise and a tight exponential
+    decay (-40 dB at 180 ms), the last 6 ms eased to exact silence. No noise, no
+    harmonics above 160 Hz: felt on headphones and phones' bass, never a click.
+    -9 dBFS; the stitch mixes it through SFX_LIMITER (1 ms attack) under the -1.5 dBTP
+    master. The mastering high-pass (80 Hz) runs before it, so it isn't cut."""
+    seconds, dbfs = SOUNDS["sub_hit"]
+    n = int(round(RATE * seconds))
+    t = np.arange(n) / RATE
+    glide = SUB_HIT_TO + (SUB_HIT_FROM - SUB_HIT_TO) * np.exp(-t / 0.045)  # 80 -> 45 Hz
+    phase = 2 * np.pi * np.cumsum(glide) / RATE
+    tau = SUB_HIT_DECAY / np.log(100.0)  # 1 % (-40 dB) of the peak at SUB_HIT_DECAY
+    envelope = (1 - np.exp(-t / SUB_HIT_ATTACK)) * np.exp(-t / tau)
+    tail = int(RATE * 0.006)
+    envelope[-tail:] *= np.cos(np.linspace(0, np.pi / 2, tail)) ** 2
+    return _peak(np.sin(phase) * envelope, dbfs)
+
+
+SYNTHS = {"whoosh": whoosh, "tick": tick, "sub_hit": sub_hit}
 
 
 def _write(path: Path, signal: np.ndarray) -> None:
@@ -149,3 +174,96 @@ def onsets(signal: np.ndarray, threshold_db: float = -40.0, gap: float = 0.03) -
         return []
     starts = [loud[0]] + [b for a, b in zip(loud[:-1], loud[1:]) if b - a > gap * RATE]
     return [round(int(k) / RATE, 4) for k in starts]
+
+
+# ---------------------------------------------------------------------------- Round 36: mastering
+# Broadcast loudness mastering, used by core.video_renderer for every clip (two-pass):
+#   highpass 80 Hz (rumble, desk bumps, mic handling) -> FFT denoise -> +2 dB presence at
+#   3 kHz (one octave wide: consonants and clarity on phone speakers) -> loudnorm to
+#   -14 LUFS integrated, -1.5 dBTP, LRA 11 (YouTube, TikTok and Spotify's reference).
+TARGET_LUFS = -14.0
+TRUE_PEAK_DB = -1.5
+LOUDNESS_RANGE = 11.0
+HIGHPASS_HZ = 80
+# After the micro-SFX are mixed in (core.dynamic_layout): a limiter with a 1 ms look-ahead
+# (an inaudible 1 ms shift, well under a frame) so a whoosh on a peak can't pass the ceiling.
+SFX_LIMITER = f"alimiter=limit={10 ** ((TRUE_PEAK_DB - 0.3) / 20):.3f}:attack=1:release=50:level=false"
+PRESENCE = "equalizer=f=3000:t=q:w=1:g=2"
+# The denoiser delays the sound by exactly 25 ms (measured at 44.1 and 48 kHz), which would
+# put captions and lips ahead of the voice: those 25 ms are trimmed off the start and padded
+# back at the end.
+DENOISE = "afftdn=nr=12:nf=-45:tn=1,atrim=start=0.025,asetpts=PTS-STARTPTS,apad=pad_dur=0.025"
+MASTERING_CHAIN = f"highpass=f={HIGHPASS_HZ}:poles=2,{DENOISE},{PRESENCE}"
+
+
+def loudnorm(target: float = TARGET_LUFS, true_peak: float = TRUE_PEAK_DB, measured: dict[str, str] | None = None) -> str:
+    """The loudnorm filter: a first (measuring) pass without ``measured``, else the second,
+    linear pass with the first pass's numbers."""
+    base = f"loudnorm=I={target:g}:TP={true_peak:g}:LRA={LOUDNESS_RANGE:g}"
+    if measured is None:
+        return base + ":print_format=json"
+    return (f"{base}:measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
+            f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
+            f":offset={measured['target_offset']}:linear=true:print_format=none")
+
+
+# ---------------------------------------------------------------------------- Round 36: dead air
+DEAD_AIR_SECONDS = 0.65  # a pause longer than this reads as dead air on a short
+TAIL_GUARD = 0.12  # never cut this close after a word ends (its tail: breath, decay, a final "s")
+LEAD_GUARD = 0.08  # ...or this close before the next word starts (its attack)
+KEEP_PAUSE = 0.30  # a trimmed pause keeps this much silence, so speech still breathes
+
+
+def dead_air(words: list[object], start: float, end: float, min_gap: float = DEAD_AIR_SECONDS) -> list[tuple[float, float]]:
+    """Pauses longer than ``min_gap`` inside a clip, as (from, to) in clip seconds, from the
+    word timings (the silero-vad pattern on transcript words: speech is where words are)."""
+    spoken = sorted((float(w.start), float(w.end)) for w in words if float(w.end) > start and float(w.start) < end)
+    gaps: list[tuple[float, float]] = []
+    for (_a, previous_end), (next_start, _b) in zip(spoken, spoken[1:]):
+        if next_start - previous_end > min_gap:
+            gaps.append((round(previous_end - start, 3), round(next_start - start, 3)))
+    return gaps
+
+
+def keep_ranges(gaps: list[tuple[float, float]], duration: float) -> list[tuple[float, float]]:
+    """Clip-second ranges to keep if the dead air were trimmed: each gap shrinks to
+    KEEP_PAUSE, cut only between TAIL_GUARD after the last word and LEAD_GUARD before the
+    next, so no word's tail or attack is clipped."""
+    keep: list[tuple[float, float]] = []
+    cursor = 0.0
+    for a, b in sorted(gaps):
+        cut_from = a + max(TAIL_GUARD, KEEP_PAUSE / 2)
+        cut_to = b - max(LEAD_GUARD, KEEP_PAUSE / 2)
+        if cut_to - cut_from < 0.05:
+            continue
+        keep.append((cursor, round(cut_from, 3)))
+        cursor = round(cut_to, 3)
+    keep.append((cursor, round(duration, 3)))
+    return [(a, b) for a, b in keep if b - a > 0]
+
+
+def silences(ffmpeg: str, source: str | Path, start: float, duration: float, noise_db: float = -35.0,
+             min_gap: float = DEAD_AIR_SECONDS) -> list[tuple[float, float]]:
+    """FFmpeg silencedetect over the clip's audio, as (from, to) clip seconds (a check on
+    dead_air() against the actual sound; [] when it can't run)."""
+    import re
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
+             "-map", "0:a:0", "-vn", "-af", f"silencedetect=noise={noise_db:g}dB:d={min_gap:g}", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=max(120.0, 1.5 * float(duration)))
+    except (OSError, subprocess.SubprocessError):
+        return []
+    starts = [float(v) for v in re.findall(r"silence_start: (-?[\d.]+)", result.stderr)]
+    ends = [float(v) for v in re.findall(r"silence_end: (-?[\d.]+)", result.stderr)]
+    return [(round(max(0.0, a), 3), round(b, 3)) for a, b in zip(starts, ends)]
+
+
+def flag_dead_air(clips: list[object], words: list[object]) -> list[object]:
+    """Each clip (core.hook_selector.ClipResult) with ``dead_air`` set: its pauses over
+    DEAD_AIR_SECONDS (clip seconds), flagged for the editor. Trimming them would need a
+    cut list through captions, graphics and the crop, so clips are never cut here."""
+    return [clip.model_copy(update={"dead_air": [list(g) for g in dead_air(words, clip.start_time, clip.end_time)]})
+            for clip in clips]

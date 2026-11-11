@@ -11,6 +11,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(root))
+import core.outreach as _outreach_r44; _outreach_r44.LINK_IN_FIRST_EMAIL = False  # tests round 25's ask-first email (round 44: tests/test_round44.py)
 import os as _os; _os.environ["NAV_NO_CLIP_PAGES"] = "1"  # never touch the real clip-page bucket
 
 import autonomous_worker as W  # noqa: E402

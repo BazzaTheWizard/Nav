@@ -190,14 +190,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--input",
-        required=True,
         help="Path to a local .mp4/.mov file or an http(s) video URL.",
+    )
+    parser.add_argument(  # Round 46
+        "--harvest-b2b",
+        type=int,
+        metavar="N",
+        help="Find up to N B2B shows with a LinkedIn Video Gap (storage/b2b_prospects.json) and exit. "
+             "More options: python -m core.linkedin_harvester --help",
     )
     parser.add_argument(
         "--clips",
         type=int,
         default=3,
-        help="Maximum number of 30-60 second clips to render (default: 3).",
+        help="Maximum number of clips to render, each 35 s to 3 min ending when the idea ends (default: 3).",
     )
     parser.add_argument(
         "--layout",
@@ -209,6 +215,12 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.harvest_b2b:
+        from core import linkedin_harvester
+
+        raise SystemExit(linkedin_harvester.main(["harvest", "--limit", str(args.harvest_b2b)]))
+    if not args.input:
+        parser.error("--input is required (or use --harvest-b2b N).")
     if args.clips < 1:
         parser.error("--clips must be at least 1.")
 

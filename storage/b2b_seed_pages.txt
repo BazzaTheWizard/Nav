@@ -1,0 +1,10 @@
+# Round 47: pages the harvester reads for shows (core.b2b_sources, source "seed_pages").
+# One URL per line. Every Apple Podcasts, RSS feed and YouTube channel link on the page is
+# picked up. Good pages: "best B2B podcasts" lists, podcast-agency client rosters, VC
+# portfolio pages, conference speaker / session pages. Each page is re-read every 30 days.
+https://www.dealfront.com/blog/best-b2b-sales-podcasts
+https://www.peaksalesrecruiting.com/blog/b2b-sales-podcasts/
+https://www.cognism.com/blog/best-sales-podcasts
+https://www.madx.digital/learn/saas-podcast
+https://contentallies.com/learn/best-b2b-marketing-podcasts
+https://www.fame.so/post/7-top-marketing-strategy-podcasts-to-fuel-your-b2b-growth-in-2026

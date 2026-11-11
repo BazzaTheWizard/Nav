@@ -406,8 +406,8 @@ check("Pull-in only on a plain shot of one person: never on a split or the whole
       split_first.pull_in_until(0, 10) == 0.0 and plain.pull_in_until(0, 10) == 6.0,
       f"{split_first.pull_in_until(0, 10)}, {plain.pull_in_until(0, 10)}")
 
-# ---------- the 24/76 move starts from exactly the picture on screen ----------
-from core.dynamic_layout import _move_frame, strip_rect  # noqa: E402
+# ---------- the move into a split view starts from exactly the picture on screen ----------
+from core.dynamic_layout import _move_frame, band_rect  # noqa: E402
 
 gradient = np.zeros((H_, W_, 3), np.uint8)
 gradient[:, :, 0] = np.linspace(0, 255, W_)[None, :]
@@ -420,10 +420,10 @@ start = _move_frame(gradient, base_frame, None, 0.0, base_rect)
 end = _move_frame(gradient, base_frame, None, 1.0, base_rect)
 check("The move's first frame is the full-screen picture itself (no jump into the move)",
       float(np.abs(start[:1800].astype(int) - base_frame[:1800].astype(int)).mean()) < 2.0)
-sx, sy, sw, sh = strip_rect(W_, H_)
-band = cv2.resize(gradient[int(sy):int(sy + sh), :], (1080, 460), interpolation=cv2.INTER_AREA)
-check("...and its last frame is the 24% band (the camera's whole width) over the panel",
-      float(np.abs(end[:450].astype(int) - band[:450].astype(int)).mean()) < 3.0
+sx, sy, sw, sh = band_rect(W_, H_, base_rect[0] + base_rect[2] / 2)  # Round 39: the face-centred 1080 x 1040 viewport
+band = cv2.resize(gradient[int(sy):int(sy + sh), int(sx):int(sx + sw)], (1080, 1040), interpolation=cv2.INTER_AREA)
+check("...and its last frame is the speaker's viewport (top 54%, around the face) over the panel",
+      float(np.abs(end[:1030].astype(int) - band[:1030].astype(int)).mean()) < 3.0
       and tuple(int(v) for v in end[1800, 540]) == tuple(int(__import__("core.cards", fromlist=["CANVAS"]).CANVAS[k:k + 2], 16) for k in (1, 3, 5)))
 
 # ---------- frame times survive a decoder message cutting into FFmpeg's log ----------

@@ -72,11 +72,11 @@ base = render_clip(source, ass, CropBox(0, 0, 608, 1080), clip_start, clip_start
                    layout_mode="blurred_background")
 chart = tmp / "chart"
 chart.mkdir()
-page = np.zeros((1460, 1080, 4), np.uint8)
+page = np.zeros((880, 1080, 4), np.uint8)  # Round 39: the panel under the 1040 px viewport
 page[200:260, 100:900] = (240, 200, 40, 255)  # a bar on the panel
 for k in range(240):
     cv2.imwrite(str(chart / f"f_{k:05d}.png"), page)
-frames = Frames(str(chart / "f_%05d.png"), 240, 1080, 1460, 460)
+frames = Frames(str(chart / "f_%05d.png"), 240, 1080, 880, 1040)
 a_clip = 8.15  # clip seconds: the move starts between frames, as in your clip 3
 card = Card("metric_bars", clip_start + a_clip, clip_start + a_clip + 7.0,
             rows=[CardRow("Nikkei 225", "−5%"), CardRow("SoftBank", "−10%")])
@@ -122,20 +122,21 @@ def stripe(frame):
 
 edges = [panel_edge(video[n]) for n in [*range(first_in, first_in + count + 40), *range(first_out, first_out + count)]]
 check("24 fps: from the first move frame on, every frame is the move or the chart (no plain frame)",
-      all(edge <= 470 for edge in edges[count:-count]) and min(edges[:count]) <= 470, str(edges[:count + 2]))
+      all(edge <= 1050 for edge in edges[count:-count]) and min(edges[:count]) <= 1050, str(edges[:count + 2]))
 check("...the panel rises steadily in and falls steadily out", edges[:count] == sorted(edges[:count], reverse=True)
       and edges[-count:] == sorted(edges[-count:]), f"{edges[:count]} / {edges[-count:]}")
 tall = 608
 expected_base = 656 + round(300 * tall / 1080)  # the stripe in the clip's own layout
-expected_band = round(300 * tall / 1080) - D.strip_crop_top(tall)  # ...and in the chart view's top band
+expected_band = D.wide_fit(1920, 1080)[1] + round(300 * tall / 1080)  # ...and in the viewport (Round 39: whole picture, centred)
 path = [stripe(video[n]) for n in range(first_in - 1, first_in + count + 2)]
-check("The picture glides from its place in the clip to the top band, a little each frame",
+check("The picture glides from its place in the clip up into the speaker's viewport, a little each frame",
       path[0] is not None and abs(path[0] - expected_base) <= 2 and all(p is not None for p in path)
       and path == sorted(path, reverse=True), f"{path} (from {expected_base} to {expected_band})")
 check("...and lands exactly on the chart view's band: the last move frame equals the steady view (no 1-2 px snap)",
       path[count] == path[count + 1] == path[count + 2] and abs(path[count] - expected_band) <= 1,
       f"{path[count:]} vs {expected_band}")
-check("The chart view's band starts at the picture's row 52, as FFmpeg crops it", D.strip_crop_top(608) == 52)
+check("The wide view: the whole 1080 x 608 picture, centred in the 1040 px viewport (row 216), as FFmpeg places it",
+      D.wide_fit(1920, 1080) == (0, 216, 1080, 608))
 plain, first_move = video[first_in - 1], video[first_in]
 backdrop_diff = float(np.abs(cv2.resize(first_move[:600], (135, 75)).astype(int)
                              - cv2.resize(plain[:600], (135, 75)).astype(int)).mean())
@@ -335,7 +336,7 @@ wrapper.write_text(textwrap.dedent(f"""
     C.configured = lambda: True
     C.page_settings = lambda: SimpleNamespace(base_url={BASE!r})
     C.MANUAL_PAGES_PATH = Path({str(store / "manual_pages.json")!r})
-    C.page_activity = lambda: {{}}
+    C.page_activity = lambda since=None: {{}}
     calls = Path({str(store / "calls.json")!r})
     def log(*entry):
         old = __import__("json").loads(calls.read_text()) if calls.exists() else []

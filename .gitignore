@@ -34,3 +34,11 @@ scratch/
 cache/
 assets/logos/
 storage/people/
+.venv/
+__pycache__/
+*.pyc
+*.mp4
+*.mov
+*.mkv
+*.wav
+clip_r*/

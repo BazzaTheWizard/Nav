@@ -33,6 +33,8 @@ from core import outreach as O  # noqa: E402
 import autonomous_worker as W  # noqa: E402
 import core.lead_harvester as H  # noqa: E402
 
+O.LINK_IN_FIRST_EMAIL = False  # this file tests round 25's ask-first email (round 44 has its own test)
+
 PAGE = "https://clips.navstudiolab.com/coach-dana-k7m2qx"
 POINT = "pricing retainers by outcome instead of hours"
 
@@ -387,7 +389,7 @@ wrapper.write_text(textwrap.dedent(f"""
     C.configured = lambda: True
     from types import SimpleNamespace
     C.page_settings = lambda: SimpleNamespace(base_url="https://clips.navstudiolab.com")
-    C.page_activity = lambda: {{"dana-s1": {{"opens": 2, "played": {{1}}, "half": set(), "finished": set(),
+    C.page_activity = lambda since=None: {{"dana-s1": {{"opens": 2, "played": {{1}}, "half": set(), "finished": set(),
                                               "downloaded": set(), "last": None}}}}
     import runpy
     runpy.run_path({str(ROOT / "app.py")!r}, run_name="__main__")

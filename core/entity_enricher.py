@@ -51,7 +51,8 @@ def _e(key, name, kind, domain="", ticker="", color="", aliases=(), fred=""):
 # Words that are also ordinary English: matched only capitalised, as a name.
 CASE_SENSITIVE = {"Apple", "Meta", "Block", "Square", "Oracle", "Visa", "Target", "Ford", "Benchmark", "Index Ventures",
                   "Accel", "Arm", "Snowflake", "Zoom", "Uber", "Ramp", "Chime", "Plaid", "Gold", "Oil", "Strategy",
-                  "Robinhood", "Coinbase", "Datadog", "Figma", "Canva", "Brex", "Revolut", "Klarna", "Stripe", "Dow"}
+                  "Robinhood", "Coinbase", "Datadog", "Figma", "Canva", "Brex", "Revolut", "Klarna", "Stripe", "Dow",
+                  "Patagonia", "Coke", "Nike", "Chipotle"}
 ENTITIES: dict[str, Entity] = {e.key: e for e in [
     # public tech and finance
     _e("apple", "Apple", "company", "apple.com", "AAPL", "#A2AAAD"),
@@ -112,6 +113,17 @@ ENTITIES: dict[str, Entity] = {e.key: e for e in [
     _e("mongodb", "MongoDB", "company", "mongodb.com", "MDB", "#00ED64"),
     # private companies
     _e("openai", "OpenAI", "private", "openai.com", color="#10A37F", aliases=("ChatGPT",)),
+    # Round 41: consumer brands (brand_proof pills)
+    _e("nike", "Nike", "company", "nike.com", "NKE", "#111111"),
+    _e("oakberry", "Oakberry", "private", "oakberry.com", color="#5B2A86", aliases=("OAKBERRY",)),
+    _e("starbucks", "Starbucks", "company", "starbucks.com", "SBUX", "#00704A"),
+    _e("cocacola", "Coca-Cola", "company", "coca-cola.com", "KO", "#F40009", ("Coke",)),
+    _e("adidas", "Adidas", "company", "adidas.com", color="#000000"),
+    _e("lululemon", "Lululemon", "company", "lululemon.com", "LULU", "#D22030"),
+    _e("chipotle", "Chipotle", "company", "chipotle.com", "CMG", "#A81612"),
+    _e("mcdonalds", "McDonald's", "company", "mcdonalds.com", "MCD", "#FFC72C", ("McDonalds",)),
+    _e("patagonia", "Patagonia", "private", "patagonia.com", color="#1E2A44"),
+    _e("redbull", "Red Bull", "private", "redbull.com", color="#DB0A40"),
     _e("anthropic", "Anthropic", "private", "anthropic.com", color="#D97757"),
     _e("stripe", "Stripe", "private", "stripe.com", color="#635BFF"),
     _e("spacex", "SpaceX", "private", "spacex.com", color="#A7B1BC"),

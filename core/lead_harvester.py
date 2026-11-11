@@ -1221,6 +1221,8 @@ def discover_channels(
                         "priority": priority,
                         "business_offer": offer,
                         "linkedin_url": linkedin_url(social_links),
+                        # Round 53: buyer fit (core.fit) reads what the channel says it does
+                        "description": channel_description[:600],
                     }
                 )
                 record(channel_id, "qualified", shorts=profile, priority=priority, has_email=bool(email))

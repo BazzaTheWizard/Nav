@@ -92,6 +92,21 @@ def _margin_ratio(frame: np.ndarray) -> tuple[float, float]:
     return (margin / inside if inside > 0 else float("inf")), float(inside)
 
 
+def _has_people(frame: np.ndarray) -> bool:
+    """A face of at least 2.5% of the frame width (a person on camera, not a logo)."""
+    try:
+        from core.face_tracker import MIN_FACE_WIDTH_RATIO, _face_detector
+
+        detector = _face_detector()
+        if not detector.available:
+            return False
+        height, width = frame.shape[:2]
+        small = cv2.resize(frame, (640, max(2, round(640 * height / width))), interpolation=cv2.INTER_AREA)
+        return any(w >= MIN_FACE_WIDTH_RATIO * 640 for _cx, _cy, w, _h, _s in detector.detect(small))
+    except Exception:  # noqa: BLE001 - no detector: the margins decide, as before
+        return False
+
+
 def explainer_fit(source: Path, start: float, end: float) -> bool:
     """Does this clip look like a designed slide video: a 16:9 frame whose left and
     right margins (outside the center 4:3 box) are nearly empty in most frames?"""
@@ -114,6 +129,13 @@ def explainer_fit(source: Path, start: float, end: float) -> bool:
     if not WIDE_ASPECT[0] <= width / max(1, height) <= WIDE_ASPECT[1]:
         return False
     scale = SAMPLE_WIDTH / width
+    # Round 48: the explainer is for slides with nobody on camera. A dark stage has quiet
+    # margins too (GTMnow's AGM fireside chat was shown as a "slide"): faces rule it out.
+    with_people = sum(1 for frame in frames if _has_people(frame))
+    if with_people >= 0.4 * len(frames):
+        logger.info("Explainer check: people on camera in %d of %d sampled frames (not a slide video)",
+                    with_people, len(frames))
+        return False
     measured = [_margin_ratio(cv2.resize(frame, (SAMPLE_WIDTH, round(height * scale)))) for frame in frames]
     quiet = sum(1 for ratio, inside in measured if inside >= MIN_CENTER_EDGES and ratio <= MAX_MARGIN_RATIO)
     fit = quiet >= len(measured) * 0.75

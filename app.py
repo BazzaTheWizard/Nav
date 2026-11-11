@@ -10,7 +10,7 @@ import re
 import shutil
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace as _dc_replace
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -31,6 +31,7 @@ from autonomous_worker import (
     clear_forceable_group,
     force_lead_to_queue,
     REPLY_OUTCOMES,
+    get_all_sent,
     get_awaiting_reply,
     get_replies,
     get_forceable_leads,
@@ -41,8 +42,10 @@ from autonomous_worker import (
     save_cached_transcript,
     mark_follow_up,
     prioritize_queued_lead,
+    set_record_fields,
     record_clip_trim,
     remove_pitch_clip,
+    OUTBOX_MIN_CLIPS,
     drive_backup_on,
     restore_forceable_group,
     restore_passed_as_sent,
@@ -94,6 +97,7 @@ from core.drive_uploader import remove_named_clip_in_drive, replace_clip_in_driv
 from core.outreach import (
     SUBJECT,
     build_linkedin_messages,
+    build_marketer_email,
     build_outreach_email,
     build_subject,
     fill_drive_link,
@@ -112,6 +116,11 @@ from core.pipeline import (
     video_info_and_peaks,
 )
 from core import clip_pages
+from core import follow_up_plan as FP
+from core import marketing_contact
+from core import reply_stats
+from core.fit import GRADES as FIT_GRADES, buyer_fit, outcomes_by_grade, priority as fit_priority, rank_key as fit_rank_key
+from core import heatmap_scorer, niche_data, niche_director
 from core import made_clips
 from core.pitch_files import (
     accept_trim,
@@ -138,9 +147,19 @@ from core.transcriber import (
     transcribe_audio,
     youtube_video_id,
 )
-from core.subtitle_engine import caption_style
+from core.subtitle_engine import caption_style, caption_style_name
 from core.video_renderer import loudness_target, pull_in_enabled
 from main import _audio_duration, _video_duration
+
+
+def _legacy_ui() -> bool:
+    """Round 47: the creator-era controls (the graphics cards and their palette / brand kit,
+    the YouTube About-page button) show only with VISUAL_OVERLAYS=full or LEGACY_UI=1 in .env.
+    By default the app is the LinkedIn B2B workflow: prospects -> sample clips and offer page
+    -> email queue (Outbox) -> sent and replies."""
+    from core import executive
+
+    return os.getenv("LEGACY_UI", "").strip() == "1" or executive.overlay_mode() == "full"
 
 
 class OutreachPitch(BaseModel):
@@ -165,7 +184,7 @@ _STATE_TEXT = {
     "starting": "starting up",
     "processing": "making clips for {detail}",
     "outbox_full": "waiting: the Outbox is full ({detail}). It makes the next pitch as soon as you send or pass one",
-    "discovering": "looking for new creators",
+    "discovering": "looking for new prospects",
     "idle": "waiting: {detail}",
     "quota_pause": "paused: {detail}",
     "drive_sign_in": "paused: {detail}",
@@ -273,7 +292,7 @@ def _render_lead_queue() -> None:
                 st.markdown(f"**{index + 1}. [{title}]({channel_url})** · {subscriber_text} · {email_text}{forced_text}")
                 st.caption(f"{shorts_text} · [{video_title}]({video_url}) ({length_text})")
             with next_col:
-                if index > 0 and st.button("Do next", key=f"do_next_{channel_id}_{index}", use_container_width=True):
+                if index > 0 and st.button("Do next", key=f"do_next_{channel_id}_{index}", width="stretch"):
                     try:
                         prioritize_queued_lead(channel_id)
                     except Exception as exc:
@@ -281,7 +300,7 @@ def _render_lead_queue() -> None:
                     else:
                         st.rerun()
             with action:
-                if st.button("Skip", key=f"skip_queued_{channel_id}_{index}", use_container_width=True):
+                if st.button("Skip", key=f"skip_queued_{channel_id}_{index}", width="stretch"):
                     try:
                         skip_queued_lead(channel_id)
                     except Exception as exc:
@@ -428,6 +447,7 @@ def _get_video_metadata(
     """Title, channel and YouTube "Most replayed" peaks (empty for local files)."""
     source_value = str(input_path)
     st.session_state["agent_video_description"] = ""
+    st.session_state["agent_heatmap"] = []  # Round 36: "Most replayed" buckets, for the replay badge
     if not source_value.startswith(("http://", "https://")):
         title = video_title_override.strip() or Path(input_path).stem
         return title, channel_name_override.strip() or "your channel", []
@@ -435,6 +455,7 @@ def _get_video_metadata(
     metadata, peaks = video_info_and_peaks(source_value)
     # Round 28: the graphics director takes the guest's name card only from the title or this.
     st.session_state["agent_video_description"] = str(metadata.get("description") or "")
+    st.session_state["agent_heatmap"] = list(metadata.get("heatmap") or [])
     title = video_title_override.strip() or metadata.get("title")
     channel = channel_name_override.strip() or metadata.get("channel")
     if not isinstance(title, str) or not title.strip():
@@ -626,6 +647,7 @@ def _discard_generated_clips() -> None:
         "clip_transcript",
         "ai_clip_selection_error",
         "ai_outreach_email",
+        "made_pitch_facts",
         "ai_outreach_subject",
         "agent_video_title",
         "agent_channel_name",
@@ -658,13 +680,15 @@ def _generate_clips(
     pin_title: bool = False,
     max_seconds: float | None = None,
     title_fade_in: bool = True,
+    climax_hook: bool | None = None,
 ) -> list[tuple[Path, ClipResult]]:
     """``max_seconds``: no clip longer than this (cut at a sentence end). ``title_fade_in``:
     False puts the title card fully on screen from the first frame. Layout "auto" may
     choose the explainer layout for a faceless slide video."""
     settings = load_settings()
     profile = EditProfile(layout_mode=layout_mode, allow_explainer=STANDARD_EDIT.allow_explainer,
-                          title_fade_in=title_fade_in, pin_title=pin_title, max_seconds=max_seconds)
+                          title_fade_in=title_fade_in, pin_title=pin_title, max_seconds=max_seconds,
+                          climax_hook=climax_hook)
     output_dir = render_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
     prune_output_folder(output_dir=output_dir)
@@ -768,6 +792,7 @@ def _generate_clips(
 
         try:
             with st.spinner("Analyzing the transcript and drafting outreach..."):
+                agent_report: dict[str, Any] = {}
                 clips, outreach_email, outreach_subject = pick_clips_with_agent(
                     words,
                     duration,
@@ -775,7 +800,12 @@ def _generate_clips(
                     resolved_channel_name,
                     video_title,
                     peaks,
+                    heatmap=st.session_state.get("agent_heatmap") or None,
+                    report=agent_report,
+                    business=not _legacy_ui(),  # Round 49: the executive (LinkedIn) email
                 )
+            # Round 49: the moment the email names, so it can be rebuilt around the page link
+            st.session_state["made_pitch_facts"] = agent_report.get("pitch_facts") or {}
             st.session_state["ai_outreach_email"] = outreach_email
             st.session_state["ai_outreach_subject"] = outreach_subject
             st.session_state.pop("ai_clip_selection_error", None)
@@ -789,7 +819,8 @@ def _generate_clips(
                 f"clip selector instead. Details: {exc}"
             )
             clips = select_clips(
-                words, duration, clip_count, settings, replay_peaks_hint=peaks
+                words, duration, clip_count, settings, replay_peaks_hint=peaks,
+                heatmap=st.session_state.get("agent_heatmap") or None,
             )[:clip_count]
         if max_seconds:
             clips = cap_clip_length(clips, words, max_seconds)
@@ -872,6 +903,8 @@ def _generate_clips(
                 "end_time": clip.end_time,
                 "source_duration": duration,
                 "graphics_notes": list(result.graphics_notes),
+                "climax_hook": profile.climax_hook,  # Round 40: a re-render opens the same way
+                "palette": result.palette,
             }
             return result.path, clip
 
@@ -917,7 +950,7 @@ def _generate_clips(
         audio_path.unlink(missing_ok=True)
 
 
-TAB_LABELS = ("📬 Outbox", "📨 Sent", "🧭 Pipeline", "🎬 Make clips", "🩺 System")
+TAB_LABELS = ("📬 Outbox", "📨 Sent", "🔎 Prospects", "🎬 Make clips", "🩺 System")
 # Page styles. Outbox players keep a 9:16 box while a new preview loads, so swapping
 # a clip after a re-render never collapses the column and moves the page. The About
 # page button is the big blue one: it's where the creator's email usually is.
@@ -951,6 +984,10 @@ def main() -> None:
             int(st.session_state.get("video_upload_epoch", 0)) + 1
         )
 
+    if not st.session_state.get("own_network_marked") and clip_pages.configured():
+        # Round 51: mark this Mac's network as yours on the clip pages, once per session, so your
+        # own looks at a prospect's page (views, plays, downloads, copies) are never counted.
+        st.session_state["own_network_marked"] = clip_pages.register_own_network() or "tried"
     try:
         pending = get_pending_outreach()
     except Exception as exc:
@@ -991,19 +1028,26 @@ def _render_header(pending: list[dict[str, Any]]) -> None:
     except Exception:
         logging.exception("Could not load the status numbers")
         waiting, queue, passed = [], [], {}
+    if any(record.get("page_name") for record in waiting):  # Round 53: the same follow-up plan as the Sent tab
+        activity = _page_activity() or {}
+        waiting = [FP.apply(record, activity.get(str(record.get("page_name") or ""))) for record in waiting]
     due = sum(1 for record in waiting if record.get("follow_up_due"))
     you_passed = sum(count for code, count in passed.items() if code in PASS_REASONS)
     outbox, sent, up_next, passes = st.columns(4)
+    direct = sum(record.get("kind") == "intro" for record in pending)
     outbox.metric(
-        "Ready to send", f"{len(pending)} / {MAX_PENDING_LEADS}", border=True,
-        help="Pitches in the Outbox. The worker stops making new ones when it's full.",
+        "Ready to send", f"{len(pending) - direct} / {MAX_PENDING_LEADS}", border=True,
+        delta=f"+ {direct} direct pitch{'es' if direct != 1 else ''}" if direct else None,
+        delta_color="off", delta_arrow="off",
+        help="Pitches in the Outbox. The worker stops making new ones when it has 5 waiting; "
+             "direct pitches (email only) don't count toward that.",
     )
     sent.metric(
         "Waiting for a reply", len(waiting), border=True,
         delta=f"{due} follow-up{'s' if due != 1 else ''} due" if due else None,
         delta_color="off", delta_arrow="off",
     )
-    up_next.metric("Up next", len(queue), border=True, help="Creators the worker will make clips for next.")
+    up_next.metric("Up next", len(queue), border=True, help="Prospects the worker will make sample clips for next.")
     passes.metric("Passed (14 days)", you_passed, border=True, help="Reasons are in the 📨 Sent tab.")
 
 
@@ -1020,7 +1064,8 @@ def _render_outbox(pending: list[dict[str, Any]]) -> None:
         "For each pitch: check the name and email → **Copy email** → send it from Gmail → "
         "**✅ Mark as Sent**. Not pitching someone? **❌ Pass** and pick why."
     )
-    for record in pending:
+    # Round 53: best buyers first (core.fit), so your sending time goes where a reply can turn into a client.
+    for record in sorted(pending, key=lambda r: fit_rank_key({**r, "fit": buyer_fit(r)})):
         _render_pitch_card(record)
 
 
@@ -1035,15 +1080,7 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
             _render_pitch_badges(record)
         with links:
             _render_contact(record)
-            drive_link = str(record.get("drive_link") or "")
-            page_url = str(record.get("page_url") or "")
-            small = []
-            if page_url:
-                small.append(("🌐 Their clip page", page_url, "What they'll see when they open the link in your email."))
-            if drive_link:
-                small.append(("📁 Drive backup" if page_url else "📁 Open the clips (Drive)", drive_link, None))
-            for column, (label, url, help_text) in zip(st.columns(len(small) or 1), small):
-                column.link_button(label, url, help=help_text, width="stretch")
+            _render_identity_links(record)
 
         _render_pitch_clips(record)
 
@@ -1076,7 +1113,8 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
             if not str(st.session_state.get(name_key) or "").strip():
                 st.caption(
                     "⚠️ No first name yet. 'Hi there' reads like a mass email: find the host's name "
-                    "on their About page, in the video, or on LinkedIn."
+                    + ("on their About page, in the video, or on LinkedIn." if _legacy_ui()
+                       else "on their LinkedIn, their team page, or in the episode.")
                 )
         with subject_column:
             st.text_input(
@@ -1100,7 +1138,7 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
                 "✅ Mark as Sent",
                 type="primary",
                 key=f"mark_sent_{record_id}",
-                use_container_width=True,
+                width="stretch",
                 help="Click after you've sent it from Gmail. It moves to the 📨 Sent tab.",
             ):
                 try:
@@ -1120,7 +1158,75 @@ def _render_pitch_card(record: dict[str, Any]) -> None:
                         st.warning("This pitch is no longer pending. Refresh the page.")
         with pass_column:
             _render_pass_menu(channel_id, f"skip_lead_{record_id}")
-        _render_linkedin_messages(record, str(st.session_state.get(name_key) or ""))
+        if record.get("kind") != "intro":  # the LinkedIn messages talk about the clips
+            _render_marketer(record)  # Round 53: the same clips, for the person with the budget
+            _render_linkedin_messages(record, str(st.session_state.get(name_key) or ""))
+
+
+def _marketer_for(record: dict[str, Any], prospect: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The company's marketing or content lead: found for this pitch, or on its prospect."""
+    for found in (record.get("marketing_contact"), (prospect if prospect is not None else _prospect_of(record)).get("marketing_contact")):
+        if isinstance(found, dict) and found.get("name"):
+            return found
+    return {}
+
+
+def _render_marketer(record: dict[str, Any]) -> None:
+    """👥 Round 53: their marketing lead (core.marketing_contact) and the pitch written for them.
+    The executive is the face; the marketing person owns the LinkedIn calendar and the budget."""
+    from core.linkedin_harvester import EMAIL_CONFIDENCE
+
+    record_id = str(record["record_id"])
+    prospect = _prospect_of(record)
+    marketer = _marketer_for(record, prospect)
+    title = "👥 Also send to their marketing lead" + (f": {marketer['name']}" if marketer else "")
+    if record.get("marketer_sent_at"):
+        title += " · ✅ sent"
+    with st.expander(title, expanded=bool(marketer) and not record.get("marketer_sent_at")):
+        if not marketer:
+            st.caption("The marketing or content lead has the budget and the LinkedIn calendar. Look them up on "
+                       "the company's own team and about pages:")
+            if st.button("🔎 Find their marketing lead", key=f"find_marketer_{record_id}"):
+                with st.spinner("Reading their team and about pages…"):
+                    try:
+                        found = marketing_contact.lookup(record, prospect)
+                    except Exception:  # noqa: BLE001
+                        logging.exception("Marketing contact lookup failed")
+                        found = {}
+                if found:
+                    set_record_fields(record_id, marketing_contact=found)
+                    st.rerun()
+                st.session_state[f"marketer_none_{record_id}"] = True
+            if st.session_state.get(f"marketer_none_{record_id}"):
+                st.caption("No marketing person named on their site. On the company's LinkedIn page, open "
+                           "**People** and search \"marketing\" or \"content\".")
+            return
+        line = f"**{marketer['name']}** · {marketer.get('role', '')}"
+        if marketer.get("linkedin"):
+            line += f" · [LinkedIn]({marketer['linkedin']})"
+        if marketer.get("page"):
+            line += f" · [found here]({marketer['page']})"
+        st.markdown(line)
+        email = str(marketer.get("email") or "")
+        if email:
+            st.markdown(f"✉️ [{email}](mailto:{email})")
+            if marketer.get("confidence") in EMAIL_CONFIDENCE:
+                st.caption(EMAIL_CONFIDENCE[marketer["confidence"]])
+        facts = FP.email_facts(record)
+        subject, body = build_marketer_email(
+            str(marketer.get("name") or "").split(" ")[0], str(record.get("contact_name") or facts["first"]),
+            facts["show"], facts["episode"], facts["link"], facts["point"], facts["at"], facts["count"], facts["kind"])
+        st.text_input("Subject", value=subject, key=f"marketer_subject_{record_id}")
+        st.text_area("Email to them", value=body, height=260, key=f"marketer_body_{record_id}")
+        copy_column, sent_column = st.columns(2, vertical_alignment="center")
+        with copy_column:
+            _render_copy_email_button(st.session_state.get(f"marketer_body_{record_id}") or body)
+        if record.get("marketer_sent_at"):
+            sent_column.caption(f"Sent to them {str(record['marketer_sent_at'])[:10]}.")
+        elif sent_column.button("✅ Sent to them too", key=f"marketer_sent_{record_id}", width="stretch",
+                                help="Click after you've sent it from Gmail. The follow-ups won't write to them again."):
+            set_record_fields(record_id, marketer_sent_at=datetime.now().astimezone().isoformat())
+            st.rerun()
 
 
 def _render_linkedin_messages(record: dict[str, Any], first_name: str) -> None:
@@ -1154,6 +1260,10 @@ def _render_linkedin_messages(record: dict[str, Any], first_name: str) -> None:
 
 def _render_pitch_clips(record: dict[str, Any]) -> None:
     """The pitch's clips, playable here, each with a quick trim."""
+    if record.get("kind") == "intro":  # Round 51: a direct pitch has no clips
+        st.caption("✉️ **Direct pitch**: they have no recent upload to cut, so this is an intro email only "
+                   "(who you are, what you'd do for their show, and a free sample from their next recording).")
+        return
     record_id = str(record["record_id"])
     pitch = load_pitch(record_id)
     if pitch is None or not pitch.get("clips"):
@@ -1187,6 +1297,7 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
     if snap is not None:
         st.session_state[start_key], st.session_state[end_key] = snap
     waiting = bool(item.get("trim_waiting")) and "trim" in item
+    _replay_badge((item.get("clip") or {}).get("peak_retention_score"))
     preview = Path(item["trim_preview_path"] if waiting else item["preview_path"])
     with st.container(key=f"preview_{record_id}_{index}"):
         if preview.is_file():
@@ -1231,7 +1342,7 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
         st.caption(f"New cut: {_clock(new_start)}–{_clock(new_end)} ({new_end - new_start:.1f} s)")
         _render_cut_words(record_id, index, item, start, end, new_start, new_end)
         if st.button(
-            "🔄 Re-render", key=f"trim_go_{record_id}_{index}", use_container_width=True,
+            "🔄 Re-render", key=f"trim_go_{record_id}_{index}", width="stretch",
             disabled=new_start == start and new_end == end,
         ):
             with st.spinner("Re-rendering this clip (about 10–30 s)…"):
@@ -1251,10 +1362,10 @@ def _render_pitch_clip(record: dict[str, Any], index: int) -> None:
             )
             use_column, keep_column = st.columns(2)
             use_clicked = use_column.button(
-                "✅ Use this cut", key=f"trim_use_{record_id}_{index}", type="primary", use_container_width=True
+                "✅ Use this cut", key=f"trim_use_{record_id}_{index}", type="primary", width="stretch"
             )
             keep_clicked = keep_column.button(
-                "↩️ Keep the old cut", key=f"trim_keep_{record_id}_{index}", use_container_width=True
+                "↩️ Keep the old cut", key=f"trim_keep_{record_id}_{index}", width="stretch"
             )
             if use_clicked:
                 with st.spinner("Replacing the clip on their page and in Drive…"):
@@ -1294,7 +1405,7 @@ def _render_cut_words(
     if not cuts:
         return
     st.markdown(f":orange[✂ {' and '.join(cuts).capitalize()}.]")
-    if st.button("↔ Snap to whole words", key=f"trim_snapgo_{record_id}_{index}", use_container_width=True,
+    if st.button("↔ Snap to whole words", key=f"trim_snapgo_{record_id}_{index}", width="stretch",
                  help="Moves each cut that lands inside a word out to just before (or after) that word."):
         st.session_state[f"trim_snap_{record_id}_{index}"] = (
             round(report["snap_start"] - start, 2), round(report["snap_end"] - end, 2)
@@ -1348,12 +1459,12 @@ def _render_poster_picker(record: dict[str, Any], item: dict[str, Any]) -> None:
         st.caption(f"Their page shows the frame at {current:.1f} s "
                    + ("(picked by you)." if saved is not None else "(picked automatically: eyes open, face sharp)."))
         auto_column, use_column = st.columns(2)
-        if auto_column.button("✨ Auto", key=f"poster_auto_{record_id}_{index}", use_container_width=True,
+        if auto_column.button("✨ Auto", key=f"poster_auto_{record_id}_{index}", width="stretch",
                               help="Jump to the best frame of the first seconds: eyes open, face sharp."):
             st.session_state[f"poster_set_{record_id}_{index}"] = round(_auto_poster_time(str(clip_path), modified), 1)
             _rerun_this_clip()
         if use_column.button("✅ Use this frame", key=f"poster_use_{record_id}_{index}", type="primary",
-                             use_container_width=True, disabled=abs(at - current) < 0.05):
+                             width="stretch", disabled=abs(at - current) < 0.05):
             with st.spinner("Updating the poster on their page…"):
                 try:
                     used = clip_pages.replace_poster(page_name, index, clip_path, at)
@@ -1369,11 +1480,9 @@ def _render_poster_picker(record: dict[str, Any], item: dict[str, Any]) -> None:
 def _render_remove_clip(record: dict[str, Any], index: int, count: int) -> None:
     """🗑 Remove clip: confirm in a pop-over (floats, so nothing moves until you do)."""
     record_id = str(record["record_id"])
-    if count <= MIN_CLIPS:
-        st.button(
-            "🗑 Remove clip", key=f"remove_off_{record_id}_{index}", disabled=True, width="stretch",
-            help=f"A pitch keeps at least {MIN_CLIPS} clips. To send fewer, Pass this creator.",
-        )
+    if count <= OUTBOX_MIN_CLIPS:  # Round 49: any clip can go, down to the last one
+        with st.popover("🗑 Remove clip", width="stretch"):
+            st.markdown("This is the pitch's only clip. To drop the whole pitch, use **❌ Pass** below.")
         return
     places = [p for p in (
         "their clip page" if record.get("page_name") else "",
@@ -1448,10 +1557,17 @@ def _clip_replacer(record: dict[str, Any], start: float, end: float):
     return replace
 
 
+FIT_COLORS = {"strong": "green", "good": "blue", "weak": "orange", "skip": "gray", "partner": "violet"}
+
+
 def _render_pitch_badges(record: dict[str, Any]) -> None:
     """Clip count, the AI's clip scores, framing, channel size, video length."""
     clips = [clip for clip in record.get("clips") or [] if isinstance(clip, dict)]
     badges: list[tuple[str, str]] = []
+    if record.get("partner"):
+        badges.append(("🤝 Partner pitch · white-label", "violet"))
+    elif record.get("kind") == "intro":
+        badges.append(("✉️ Direct pitch · no clips", "violet"))
     if clips:
         badges.append((f"{len(clips)} clip{'s' if len(clips) != 1 else ''}", "blue"))
         scores = [clip.get("judge") for clip in clips if isinstance(clip.get("judge"), (int, float))]
@@ -1471,9 +1587,15 @@ def _render_pitch_badges(record: dict[str, Any]) -> None:
     seconds = record.get("video_seconds")
     if isinstance(seconds, (int, float)) and seconds > 0:
         badges.append((f"{int(seconds) // 60} min video", "gray"))
+    fit = buyer_fit(record)  # Round 53: is there a buyer behind it?
+    badges.insert(0, (f"{FIT_GRADES[fit['grade']]} · {fit['points']}", FIT_COLORS.get(fit["grade"], "gray")))
     if badges:
         # Streamlit's inline badge syntax: one row, no layout columns.
         st.markdown(" ".join(f":{color}-badge[{label.replace(']', ')')}]" for label, color in badges))
+    with st.popover("Why this fit"):
+        st.caption("Is there a B2B company behind this that could pay? (core/fit.py)")
+        for reason in fit["reasons"]:
+            st.write(f"• {reason}")
 
 
 def _about_url(record: dict[str, Any]) -> str:
@@ -1491,7 +1613,111 @@ def _about_url(record: dict[str, Any]) -> str:
 
 
 def _render_contact(record: dict[str, Any]) -> None:
-    """The email if the worker found one, then the big About page button."""
+    """Round 47: the B2B contact (name, role, email with its confidence badge, LinkedIn,
+    website); the creator-era About page button only in the legacy UI."""
+    if _legacy_ui():
+        _render_creator_contact(record)
+        return
+    from core.linkedin_harvester import EMAIL_CONFIDENCE
+
+    name, role = str(record.get("contact_name") or ""), str(record.get("contact_role") or "")
+    if name:
+        st.markdown(f"👤 **{name}**" + (f" · {role}" if role else ""))
+    contact = str(record.get("contact_email") or "")
+    if "@" in contact and not contact.startswith(("http://", "https://")):
+        st.markdown(f"✉️ [{contact}](mailto:{contact})")
+        confidence = str(record.get("contact_confidence") or ("shared_inbox" if is_shared_inbox(contact) else ""))
+        if confidence in EMAIL_CONFIDENCE:
+            st.caption(EMAIL_CONFIDENCE[confidence])
+    else:
+        st.caption("No email found: message them on LinkedIn or use their website's contact form (links below).")
+
+
+def _prospect_of(record: dict[str, Any]) -> dict[str, Any]:
+    """The B2B prospect a pitch came from (core.linkedin_harvester), for its links; {} if none."""
+    prospect_id = str(record.get("prospect_id") or "")
+    if not prospect_id:
+        return {}
+    try:
+        from core.linkedin_harvester import load_prospects
+
+        return next((p for p in load_prospects() if p.get("id") == prospect_id), {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+_SOCIAL_LABELS = (
+    ("linkedin.com/in/", "👤 LinkedIn"), ("linkedin.com/company/", "💼 Company LinkedIn"), ("linkedin.com", "💼 LinkedIn"),
+    ("twitter.com", "𝕏 X / Twitter"), ("x.com/", "𝕏 X / Twitter"), ("instagram.com", "📸 Instagram"),
+    ("tiktok.com", "🎵 TikTok"), ("facebook.com", "📘 Facebook"), ("podcasts.apple.com", "🎙 Apple Podcasts"),
+    ("open.spotify.com", "🎧 Spotify"), ("substack.com", "📰 Substack"), ("calendly.com", "📅 Calendly"),
+)
+
+
+def identity_links(record: dict[str, Any], prospect: dict[str, Any] | None = None) -> tuple[str, list[tuple[str, str]]]:
+    """Round 51: (their YouTube channel's About page, [(label, url)] of every other place that
+    identifies them or reaches them: website, company and people LinkedIn pages, contact form,
+    podcast listings and the social links in their channel description), no duplicates."""
+    prospect = prospect if prospect is not None else _prospect_of(record)
+    about = _about_url(record)
+    if not about and prospect.get("channel_id"):
+        about = f"https://www.youtube.com/channel/{prospect['channel_id']}/about"
+    found: list[tuple[str, str]] = []
+    contact = prospect.get("contact") if isinstance(prospect.get("contact"), dict) else {}
+    candidates: list[tuple[str, Any]] = [
+        ("🏢 Website", record.get("website") or prospect.get("website")),
+        (f"👤 {record.get('contact_name') or contact.get('name') or 'Contact'} on LinkedIn",
+         contact.get("linkedin") or (record.get("linkedin_url") if "/in/" in str(record.get("linkedin_url") or "") else "")),
+        ("💼 Company LinkedIn", prospect.get("linkedin_company") or record.get("linkedin_url")),
+        *[("👤 Team member on LinkedIn", link) for link in prospect.get("linkedin_people") or []],
+        ("📝 Contact form", prospect.get("contact_form")),
+        ("🎙 Apple Podcasts", prospect.get("apple_url")),
+        *[("", link) for link in record.get("social_links") or []],
+    ]
+    seen = {about.rstrip("/").lower()} if about else set()
+    for label, url in candidates:
+        url = str(url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        key = url.rstrip("/").lower()
+        if key in seen or "youtube.com" in key or "youtu.be" in key:
+            continue
+        seen.add(key)
+        if not label:
+            label = next((name for part, name in _SOCIAL_LABELS if part in key), "🔗 " + re.sub(r"^https?://(www\.)?", "", url)[:30])
+        found.append((label, url))
+    return about, found[:10]
+
+
+def _render_identity_links(record: dict[str, Any]) -> None:
+    """Round 51: their YouTube channel's description (About page) where the clip page button
+    was, then every other link that tells you who they are and how to reach them. (The legacy
+    creator UI keeps its clip page / Drive pair: its About button is in the contact block.)"""
+    if _legacy_ui():
+        drive_link, page_url = str(record.get("drive_link") or ""), str(record.get("page_url") or "")
+        small = []
+        if page_url:
+            small.append(("🌐 Their clip page", _own_view_link(page_url), "What they'll see when they open the link."))
+        if drive_link:
+            small.append(("📁 Drive backup" if page_url else "📁 Open the clips (Drive)", drive_link, None))
+        for column, (label, url, help_text) in zip(st.columns(len(small) or 1), small):
+            column.link_button(label, url, help=help_text, width="stretch")
+        return
+    about, others = identity_links(record)
+    if about:
+        st.link_button("▶️ Their YouTube channel (About)", about, width="stretch",
+                       help="The channel's description: who they are, their links, often the business email.")
+    if others:
+        st.markdown(" · ".join(f"[{label}]({url})" for label, url in others))
+    drive_link = str(record.get("drive_link") or "")
+    if drive_link and not record.get("page_url"):
+        st.link_button("📁 Open the clips (Drive)", drive_link, width="stretch")
+    if not about and not others:
+        st.caption("No channel or website found for them.")
+
+
+def _render_creator_contact(record: dict[str, Any]) -> None:
+    """The email if the worker found one, then the big About page button (legacy UI)."""
     contact = str(record.get("contact_email") or "")
     if "@" in contact and not contact.startswith(("http://", "https://")):
         st.markdown(f"✉️ [{contact}](mailto:{contact})")
@@ -1512,6 +1738,7 @@ def _render_pipeline(pending: list[dict[str, Any]]) -> None:
     forced = st.session_state.pop("lead_forced", None)
     if forced:
         st.success(f"⏩ {forced} is at the back of the queue. The worker gets to them after the creators already in it.")
+    _render_b2b_prospects()  # Round 46: LinkedIn Video Gap prospects (Round 47: first, and open)
     _render_lead_queue()
     _render_forceable_leads()
     lead_records = _latest_lead_records()
@@ -1521,6 +1748,177 @@ def _render_pipeline(pending: list[dict[str, Any]]) -> None:
         f"Finished (hidden): {finished_count} | "
         f"Pending in outbox: {len(pending)}"
     )
+
+
+# --- Round 46: B2B prospects (core.linkedin_harvester) -----------------------------------
+B2B_STATUS_ICONS = {"verified": "✅ verified", "published": "📄 published", "guess": "❔ guess (not sent)",
+                    "bad_domain": "⛔ domain takes no mail", "unknown": "– none"}
+B2B_CHECK_LABELS = {"unknown": "Not checked", "no": "No native video", "rare": "Rarely", "yes": "Posts native video"}
+B2B_SOURCE_LABELS = {"apple_search": "Apple Podcasts search", "seed_pages": "Your seed pages (lists, rosters)",
+                     "youtube": "YouTube search (100 quota units)", "yc": "Y Combinator B2B companies",
+                     "podcastindex": "Podcast Index (needs a free key)", "gpodder": "gpodder directory",
+                     "apple_charts": "Apple charts (mostly big shows)"}
+B2B_TIERS = {"Hot and warm": ("hot", "warm"), "Hot only": ("hot",), "Everything": ("hot", "warm", "cool")}
+
+
+def _render_b2b_prospects() -> None:
+    from core import b2b_sources as S
+    from core import linkedin_harvester as LH
+
+    prospects = LH.visible(LH.load_prospects())  # Round 51: passed and cleared ones never come back
+    hot = sum(p.get("tier") == "hot" and p.get("status") == "new" for p in prospects)
+    with st.expander(f"🔎 B2B prospects: LinkedIn Video Gap ({len(prospects)}, {hot} hot to review)",
+                     expanded=not _legacy_ui()):
+        st.caption("Each harvest picks up where the last one stopped, across every source below, and skips "
+                   "shows already looked at. Open a prospect's LinkedIn and mark whether they post native "
+                   "video: it moves the score. Shared inboxes can be queued; first.last@ guesses only if you allow it.")
+        cols = st.columns([2, 3, 1])
+        niche = cols[0].selectbox("Niche", ["all"] + S.niche_names(), key="b2b_niche",
+                                  format_func=lambda n: "All niches, in turn" if n == "all" else n.replace("_", " "))
+        sources = cols[1].multiselect("Sources", list(S.SOURCES), default=list(S.SOURCES), key="b2b_sources",
+                                      format_func=lambda k: B2B_SOURCE_LABELS.get(k, k))
+        limit = cols[2].number_input("How many", 1, 50, 10, key="b2b_limit")
+        go, query_column = st.columns([1, 3], vertical_alignment="bottom")
+        query = query_column.text_input("Or one exact Apple search (optional)", key="b2b_query",
+                                        placeholder="e.g. fintech podcast")
+        if go.button("🔎 Harvest", key="b2b_harvest", type="primary", width="stretch"):
+            try:
+                from core.graphics_director import ask_ai
+            except Exception:  # noqa: BLE001
+                ask_ai = None
+            report: dict[str, Any] = {}
+            with st.spinner("Searching every source, reading feeds, websites and YouTube…"):
+                try:
+                    found = LH.harvest([query] if query.strip() else None, int(limit), ask=ask_ai,
+                                       niche=None if niche == "all" else niche, sources=sources or None, report=report)
+                    st.session_state["b2b_report"] = LH.format_report(report)
+                    st.success(f"Found {len(found)} new prospect(s), {sum(p['tier'] == 'hot' for p in found)} hot.")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Harvest failed: {exc}")
+            prospects = LH.visible(LH.load_prospects())
+        if st.session_state.get("b2b_report"):
+            st.code(st.session_state["b2b_report"], language=None)
+        view, allow_column = st.columns([2, 2])
+        tiers = B2B_TIERS[view.radio("Show", list(B2B_TIERS), horizontal=True, key="b2b_view")]
+        allow_guess = allow_column.toggle("Allow first.last@ guesses when queueing", key="b2b_allow_guess",
+                                          help="A guess can bounce, and bounces hurt your Gmail's sending reputation.")
+        show_queued = allow_column.toggle("Show queued and pitched ones", key="b2b_all")
+        shown = [p for p in prospects if p.get("tier") in tiers and (show_queued or p.get("status") == "new")]
+        # Round 53: best buyer first: buyer fit (60%) with the Video Gap score (40%); partners and
+        # channels with no buyer behind them sink to the bottom.
+        fits = {p["id"]: buyer_fit(p) for p in shown}
+        shown.sort(key=lambda p: -fit_priority(p, fits[p["id"]]))
+        note = st.session_state.pop("b2b_note", None)
+        if note:
+            st.success(note)
+        missing = [p for p in shown if not p.get("marketing_contact")]
+        if missing and st.button(f"👥 Find their marketing leads ({len(missing)})", key="b2b_find_marketers",
+                                 help="Reads each company's team and about pages for a marketing or content lead "
+                                      "and their likely email. Takes about a minute."):
+            from core import marketing_contact as MC
+
+            everyone = LH.load_prospects()
+            wanted = {p["id"] for p in missing}
+            with st.spinner("Reading team and about pages…"):
+                found = MC.backfill([p for p in everyone if p.get("id") in wanted])
+            LH.save_prospects(everyone)
+            st.session_state["b2b_note"] = f"Found a marketing lead for {found} of {len(missing)}."
+            st.rerun()
+        count_column, clear_column = st.columns([3, 1], vertical_alignment="center")
+        count_column.caption(f"{len(shown)} shown, best first. **➕ Queue** makes sample clips from their latest "
+                             "episode; **✉️ Direct pitch** (no episode to cut) puts an intro email in your Outbox; "
+                             "**🚫 Pass** removes one for good.")
+        clearable = [p["id"] for p in shown if p.get("status") == "new"]
+        with clear_column.popover(f"🧹 Clear all ({len(clearable)})", width="stretch", disabled=not clearable):
+            st.markdown(f"Remove all {len(clearable)} prospects shown here? They won't come back in later harvests.")
+            if st.button("Yes, clear them", key="b2b_clear_all", type="primary", width="stretch"):
+                cleared = LH.pass_prospects(clearable, reason="cleared")
+                st.session_state["b2b_note"] = f"Cleared {cleared} prospect{'s' if cleared != 1 else ''}."
+                st.rerun()
+        for p in shown[:40]:
+            _render_b2b_prospect(p, allow_guess)
+
+
+def _render_b2b_prospect(p: dict[str, Any], allow_guess: bool) -> None:
+    from core import linkedin_harvester as LH
+
+    contact = p.get("contact") or {}
+    angle = p.get("calendar_angle") or {}
+    with st.container(border=True):
+        head = st.columns([4, 1])
+        fit = buyer_fit(p)
+        head[0].markdown(f"**{p.get('show', '')}** · {FIT_GRADES[fit['grade']]} **{fit['points']}** · "
+                         f"Video Gap **{p.get('score', 0)}** ({p.get('tier', '')})"
+                         + (" · queued" if p.get("status") == "queued" else "")
+                         + (" · ✉️ direct pitch in the Outbox" if p.get("status") == "direct" else "")
+                         + (" · 🤝 partner pitch in the Outbox" if p.get("status") == "partner" else "")
+                         + ("" if LH.has_upload(p) else " · no recent upload to cut"))
+        links = [f"[LinkedIn]({p['linkedin_company']})" if p.get("linkedin_company") else "",
+                 f"[Website]({p['website']})" if p.get("website") else "",
+                 f"[Contact form]({p['contact_form']})" if p.get("contact_form") else "",
+                 f"[Latest episode]({p['latest_video_url']})" if p.get("latest_video_url") else "",
+                 f"[Apple]({p['apple_url']})" if p.get("apple_url") else ""]
+        head[0].caption(" · ".join(l for l in links if l) or "No links found")
+        confidence = p.get("email_confidence") or LH.confidence_of(contact)
+        head[0].write(f"Contact: {contact.get('name') or '—'}"
+                      f"{' (' + contact['role'] + ')' if contact.get('role') else ''} · "
+                      f"{contact.get('email') or 'no email'} · "
+                      f"{LH.EMAIL_CONFIDENCE.get(confidence, B2B_STATUS_ICONS.get(contact.get('status', 'unknown')))}")
+        stack = [(p.get("host_platform") or {}).get("name", ""), ", ".join(p.get("video_stack") or []),
+                 f"produced by {p['agency']}" if p.get("agency") else ""]
+        facts = [f"via {p['discovered_via']}" if p.get("discovered_via") else "", *[x for x in stack if x]]
+        if any(facts):
+            head[0].caption(" · ".join(f for f in facts if f))
+        marketer = p.get("marketing_contact") or {}
+        if marketer.get("name"):  # Round 53: the person with the budget (core.marketing_contact)
+            head[0].write(f"👥 Marketing: **{marketer['name']}** ({marketer.get('role', '')}) · "
+                          f"{marketer.get('email') or 'no email'} · "
+                          f"{LH.EMAIL_CONFIDENCE.get(str(marketer.get('confidence')), '')}")
+        if angle.get("theme"):
+            head[0].write(f"This month: **{angle['theme']}**"
+                          + (f" · also {', '.join(angle['themes'][1:])}" if len(angle.get("themes", [])) > 1 else ""))
+        why_fit, why_gap = head[0].columns(2)
+        with why_fit.popover("Why this fit"):
+            st.caption("Buyer fit: is there a B2B company behind this that could pay?")
+            for reason in fit["reasons"]:
+                st.write(f"• {reason}")
+        with why_gap.popover("Why this Video Gap score"):
+            for reason in p.get("reasons") or []:
+                st.write(f"• {reason}")
+        check = head[1].selectbox("On LinkedIn", list(B2B_CHECK_LABELS), key=f"b2b_check_{p['id']}",
+                                  index=list(B2B_CHECK_LABELS).index(p.get("linkedin_native_video", "unknown")),
+                                  format_func=B2B_CHECK_LABELS.get)
+        if check != p.get("linkedin_native_video", "unknown"):
+            LH.set_check(p["id"], check)
+            st.rerun()
+        if fit["grade"] == "partner":  # Round 54: an agency resells; it isn't a client
+            if head[1].button("🤝 Partner pitch", key=f"b2b_partner_{p['id']}", disabled=p.get("status") != "new",
+                              width="stretch", type="primary",
+                              help="An agency: offer white-label clips for their clients (one deal, several shows). "
+                                   "The email goes straight to your Outbox."):
+                added = LH.partner_pitch([p["id"]], allow_guess=allow_guess)
+                st.session_state["b2b_note"] = (f"🤝 {p.get('show')} is in your Outbox with a partner pitch ready."
+                                                if added else f"{p.get('show')} is already in your Outbox.")
+                st.rerun()
+        elif LH.has_upload(p):
+            if head[1].button("➕ Queue", key=f"b2b_queue_{p['id']}", disabled=p.get("status") != "new", width="stretch",
+                              help="The worker cuts sample clips from their latest episode and the pitch lands in your Outbox."):
+                added = LH.queue([p["id"]], allow_guess=allow_guess)
+                st.session_state["b2b_note"] = f"Queued {p.get('show')}." if added else "Already in the queue."
+                st.rerun()
+        elif head[1].button("✉️ Direct pitch", key=f"b2b_direct_{p['id']}", disabled=p.get("status") != "new",
+                            width="stretch", type="primary",
+                            help="No recent upload to cut: an intro email (who you are, what you'd do for their show, "
+                                 "a free sample offer) goes straight to your Outbox, ready to copy."):
+            added = LH.direct_pitch([p["id"]], allow_guess=allow_guess)
+            st.session_state["b2b_note"] = (f"✉️ {p.get('show')} is in your Outbox with an intro email ready."
+                                            if added else f"{p.get('show')} is already in your Outbox.")
+            st.rerun()
+        if head[1].button("🚫 Pass", key=f"b2b_pass_{p['id']}", width="stretch",
+                          help="Not for you: removed from the prospects for good (a later harvest won't add them back)."):
+            LH.pass_prospects([p["id"]])
+            st.session_state["b2b_note"] = f"Passed on {p.get('show')}: they won't show up again."
+            st.rerun()
 
 
 # --- 🎬 Make clips: any video, by hand ---------------------------------------------------
@@ -1539,9 +1937,27 @@ CAP_LABEL = "⏱ 59 s max"
 CAP_HELP = (
     "Keeps every clip at 59 seconds or less, ending on a finished sentence. A Short over one "
     "minute with a copyright claim (for example a podcast quote) is blocked on YouTube."
+    + ("" if STANDARD_EDIT.max_seconds else
+       " Off (the default since Round 55): each clip runs 35 s to 3 min and ends where the speaker "
+       "lands the point. Tick it only for a channel that isn't the speaker's own.")
 )
 INSTANT_TITLE_LABEL = "⚡ Title on screen from the first frame"
 INSTANT_TITLE_HELP = "Off: the title card fades in over the first 0.2 s, as before."
+CLIMAX_HOOK_LABEL = "🎬 Open on the climax teaser (clips of 28 s+)"
+CLIMAX_HOOK_HELP = ("A 2.5–4 s flash-forward from the clip's back half, cut right before the answer, then a white "
+                    "flash and a sub-bass hit into the clip's start. Only when a strong line is found; off: as before.")
+
+
+EXECUTIVE_MODE_NOTE = (
+    "**LinkedIn B2B executive mode** (the default): the speaker full-screen; on two-person shots the "
+    "two-shot cuts to whoever holds the floor (a real close-up) and back for replies; a still camera "
+    "(one slow opening drift at most); a climax cold-open hook (flash and sub-bass hit); pauses and "
+    "filler words trimmed as clean cuts; a 3.5 s topic header; the executive's lower-third ID, sentence-case "
+    "captions, an .srt caption file, a cover image, a LinkedIn post and a Shorts & Reels caption for every "
+    "clip. Every render is checked for blank frames."
+    + ("" if STANDARD_EDIT.max_seconds else
+       " Clips run 35 s to 3 min: each one ends when the speaker has landed the point, never at a fixed time.")
+)
 
 
 def _render_clip_generator() -> None:
@@ -1549,6 +1965,8 @@ def _render_clip_generator() -> None:
         "Make clips from any YouTube link or video file, outside the worker. Nothing here is "
         "tracked as a pitch: the worker's pitches are in the 📬 Outbox."
     )
+    if not _legacy_ui():
+        st.caption(EXECUTIVE_MODE_NOTE)
     if st.session_state.get("clip_mode") not in CLIP_MODES:
         st.session_state["clip_mode"] = next(iter(CLIP_MODES))
     mode = st.radio(
@@ -1566,6 +1984,7 @@ def _render_clip_generator() -> None:
     st.session_state.setdefault("cap_59", STANDARD_EDIT.max_seconds is not None)
     st.session_state.setdefault("instant_title", not STANDARD_EDIT.title_fade_in)
     st.session_state.setdefault("pin_title", STANDARD_EDIT.pin_title)
+    st.session_state.setdefault("climax_hook", getattr(load_settings(), "enable_climax_hook", True))
     count_column, cap_column = st.columns([3, 2], vertical_alignment="bottom")
     clip_count = int(count_column.select_slider(
         "How many clips", options=list(HIGHLIGHT_COUNTS), key="clip_count",
@@ -1602,6 +2021,7 @@ def _render_clip_generator() -> None:
             webcam_corner, webinar_options = _webinar_controls()
         pin_title = st.checkbox(PIN_TITLE_LABEL, key="pin_title", help=PIN_TITLE_HELP)
         instant_title = st.checkbox(INSTANT_TITLE_LABEL, key="instant_title", help=INSTANT_TITLE_HELP)
+        climax_hook = st.checkbox(CLIMAX_HOOK_LABEL, key="climax_hook", help=CLIMAX_HOOK_HELP)
         generate_clicked = st.form_submit_button(f"Make {clip_count} vertical clips", type="primary")
 
     if generate_clicked:
@@ -1609,7 +2029,7 @@ def _render_clip_generator() -> None:
             video_url, uploaded_video, channel_name, layout_label,
             webcam_corner=webcam_corner, webinar_options=webinar_options, pin_title=pin_title,
             clip_count=clip_count, max_seconds=CAP_SECONDS if cap else None, instant_title=instant_title,
-            local_path=local_path,
+            local_path=local_path, climax_hook=climax_hook,
         )
     _render_generated_clips()
     _render_made_batches()
@@ -1663,6 +2083,7 @@ def _make_clips(
     max_seconds: float | None = None,
     instant_title: bool = False,
     local_path: str = "",
+    climax_hook: bool | None = None,
 ) -> None:
     try:
         _delete_previous_source_video()
@@ -1685,6 +2106,7 @@ def _make_clips(
         "outreach_title_override",
         "ai_clip_selection_error",
         "ai_outreach_email",
+        "made_pitch_facts",
         "ai_outreach_subject",
         "agent_video_title",
         "agent_channel_name",
@@ -1722,7 +2144,7 @@ def _make_clips(
         generated = _generate_clips(
             input_path, clip_count, LAYOUT_LABELS[layout_label], webcam_corner=webcam_corner,
             webinar_options=webinar_options, pin_title=pin_title, max_seconds=max_seconds,
-            title_fade_in=not instant_title,
+            title_fade_in=not instant_title, climax_hook=climax_hook,
         )
         st.session_state["generated_clips"] = generated
         st.session_state.pop("published_page", None)  # new clips: a new page
@@ -2012,20 +2434,47 @@ def _clock(seconds: float) -> str:
     return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}" if total >= 3600 else f"{total // 60}:{total % 60:02d}"
 
 
+def _replay_badge(score: Any) -> None:
+    """Round 36: "🔥 High Replay Moment" when a clip's hook is on a YouTube replay spike."""
+    try:
+        score = float(score or 0.0)
+    except (TypeError, ValueError):
+        return
+    if score >= heatmap_scorer.HOT_VALUE:
+        st.markdown(
+            f'<span title="Viewers rewatch this moment the most (replay score {score:.2f} of 1), so it ranks '
+            f'higher." style="display:inline-block;padding:2px 10px;border-radius:999px;'
+            f'background:rgba(255,120,40,.16);color:#ff8a3d;font-size:.82rem;font-weight:600">'
+            f'{heatmap_scorer.BADGE}</span>', unsafe_allow_html=True)
+
+
+def _dead_air_note(gaps: Any) -> str:
+    """Round 36: pauses over 0.65 s in a clip, flagged for a trim (never cut automatically)."""
+    try:
+        found = [(float(a), float(b)) for a, b in gaps or []]
+    except (TypeError, ValueError):
+        return ""
+    if not found:
+        return ""
+    where = ", ".join(f"{_clock(a)} ({b - a:.1f} s)" for a, b in found[:3])
+    return f" · ⏸ {len(found)} pause{'s' if len(found) > 1 else ''} over 0.65 s at {where}: trim if it drags"
+
+
 def _render_generated_clips() -> None:
     generated_clips = st.session_state.get("generated_clips", [])
+    note = st.session_state.pop("made_clips_toast", None)
+    if note:
+        st.toast(note, icon="🗑️")
     if not generated_clips:
         return
     settings = load_settings()
     st.subheader("Your vertical clips")
-    note = st.session_state.pop("made_clips_toast", None)
-    if note:
-        st.toast(note, icon="🗑️")
     columns = st.columns(len(generated_clips))
     for index, (clip_path, clip) in enumerate(generated_clips):
         with columns[index]:
             st.markdown(f"**{clip.viral_title or f'Clip {index + 1}'}**")
-            st.caption(f"{_clock(clip.start_time)}–{_clock(clip.end_time)} in the video")
+            _replay_badge(clip.peak_retention_score)
+            st.caption(f"{_clock(clip.start_time)}–{_clock(clip.end_time)} in the video" + _dead_air_note(clip.dead_air))
             clip_path = Path(clip_path).expanduser().resolve()
             if clip_path.is_file() and clip_path.stat().st_size > 0:
                 st.video(str(clip_path))
@@ -2037,8 +2486,23 @@ def _render_generated_clips() -> None:
                     mime="video/mp4",
                     key=f"download_{clip_path.name}",
                     on_click="ignore",
-                    use_container_width=True,
+                    width="stretch",
                 )
+                # Round 49: the same assets as the client page: the cover image (the frame at
+                # 0.5 s with the topic header on it) and the captions file.
+                cover_column, srt_column = st.columns(2)
+                if clip_pages.covers_on():
+                    cover_column.download_button(
+                        "Cover .jpg", data=functools.partial(poster_jpeg, clip_path, clip_pages.COVER_AT, 1080, 2),
+                        file_name=f"{clip_path.stem}_cover.jpg", mime="image/jpeg", key=f"cover_{clip_path.name}",
+                        on_click="ignore", width="stretch",
+                    )
+                srt_path = clip_path.with_suffix(".srt")
+                if srt_path.is_file():
+                    srt_column.download_button(
+                        "Captions .srt", data=functools.partial(srt_path.read_bytes), file_name=srt_path.name,
+                        mime="application/x-subrip", key=f"srt_{clip_path.name}", on_click="ignore", width="stretch",
+                    )
             else:
                 st.warning(f"Clip file not found: {clip_path.name}. Make the clips again.")
             _render_remove_generated(index, clip_path, len(generated_clips))
@@ -2049,7 +2513,8 @@ def _render_generated_clips() -> None:
                         st.markdown(" ".join(f"#{tag.lstrip('#')}" for tag in clip.hashtags))
             _render_trim_form(index, clip_path, clip, generated_clips, settings)
 
-    _render_data_cards(generated_clips)
+    if _legacy_ui():  # Round 47: the creator graphics (cards, palette) only in the legacy UI
+        _render_data_cards(generated_clips)
     _render_publish_page(generated_clips)
     _render_current_batch_sent()
 
@@ -2060,10 +2525,10 @@ def _render_generated_clips() -> None:
         approve_upload = st.button(
             "✅ Upload to Google Drive",
             disabled=bool(st.session_state.get("drive_folder_link")),
-            use_container_width=True,
+            width="stretch",
         )
     with discard_column:
-        discard_clips = st.button("🗑️ Discard these clips", use_container_width=True)
+        discard_clips = st.button("🗑️ Discard these clips", width="stretch")
 
     if discard_clips:
         try:
@@ -2082,14 +2547,15 @@ def _render_generated_clips() -> None:
     if drive_folder_link:
         st.link_button("📁 Open the Google Drive folder", drive_folder_link)
 
-    if st.session_state.get("ai_outreach_email") or st.session_state.get("outreach_pitch"):
-        with st.expander("Email draft for this creator", expanded=bool(drive_folder_link)):
+    if not st.session_state.get("published_page") and (
+            st.session_state.get("ai_outreach_email") or st.session_state.get("outreach_pitch")):
+        with st.expander("Email draft for this creator", expanded=False):
             if st.session_state.get("outreach_email_subject"):
                 st.text_input("Subject", key="outreach_email_subject")
             st.text_area("Email", height=300, key="outreach_email_body")
             _render_copy_email_button(st.session_state.get("outreach_email_body", ""))
-            if not drive_folder_link:
-                st.caption("The Drive link is added after you upload the clips.")
+            st.caption("Publish the client preview page above: the email is rewritten with the page link, "
+                       "their show and the episode, ready to copy.")
 
 
 # Round 27: what each graphic needs. "fields": the item columns shown (CardRow field -> header).
@@ -2137,10 +2603,29 @@ CARD_GUIDE: dict[str, tuple[str, dict[str, str]]] = {
                          "highlight": "Focus"}),
     "step_sequence": ("2–4 steps of the speaker's framework, in the order they say them. Each comes in on its words.",
                       {"label": "Step (speaker's words)", "detail": "Detail (optional)"}),
+    # Round 36: multi-niche cards (core.cards_niche)
+    "geo_map_card": ("1–3 countries the speaker names, lit on a world map, with optional moving trade lines and "
+                     "World Bank figures (fetched, with the source shown).",
+                     {"label": "Country", "value": "Number as said (optional)", "highlight": "Focus"}),
+    "prediction_gauge_card": ("Odds as a tug-of-war from 50%: the side and its odds as said (70%). Leave the odds "
+                              "blank and search Polymarket below for live odds, with the source shown.",
+                              {"label": "Side (Yes, Cut, a name)", "value": "Odds as said (70%)"}),
+    "flow_sankey_card": ("A value chain or where money goes: 2–5 companies or stages in order (ASML → TSMC → NVIDIA), "
+                         "each wearing its logo. Amounts only if said, in one unit.",
+                         {"label": "Company or stage", "detail": "Role (optional)", "value": "Amount as said (optional)",
+                          "highlight": "Focus"}),
+    "framework_matrix_card": ("The speaker's model: a 2x2 (4 boxes: top-left, top-right, bottom-left, bottom-right) "
+                              "or a flywheel (3–4 steps in a loop).",
+                              {"label": "Box (speaker's words)", "detail": "Line (optional)", "highlight": "Focus"}),
+    "headline_card": ("A tear-sheet of one quotable line: the exact sentence, the words to highlight (inside it) and "
+                      "who said it. Optional one-line Wikipedia background below.",
+                      {"label": "Quote (exact words)", "value": "Highlight (words in the quote)", "detail": "Who said it"}),
 }
 CARD_ROWS = {"kinetic_range": 1, "buckets": 3, "stat_pill": 1, "timeline": 3, "metric_bars": 3, "ranked_bars": 3,
              "diverging_bar": 2, "share_split": 3, "trend_line": 4, "arr_bridge": 4, "sankey_flow": 4,
-             "cac_payback": 2, "drawdown_curve": 2, "comparison_card": 2, "step_sequence": 3, "market_line": 0}
+             "cac_payback": 2, "drawdown_curve": 2, "comparison_card": 2, "step_sequence": 3, "market_line": 0,
+             "geo_map_card": 2, "prediction_gauge_card": 2, "flow_sankey_card": 3, "framework_matrix_card": 4,
+             "headline_card": 1}
 NAME_CARD_SECONDS = 3.3
 
 
@@ -2169,7 +2654,7 @@ def _render_current_batch_sent() -> None:
     sent_to = to_column.text_input("Sent to (optional)", key=f"made_sent_to_{batch_id}",
                                    placeholder="e.g. the client's name or email")
     if button_column.button("✅ Mark these clips as Sent", type="primary", key=f"made_send_{batch_id}",
-                            use_container_width=True,
+                            width="stretch",
                             help="Click after you've sent them (the page link, the Drive folder or the files). "
                                  "They move to 📨 Sent below, and stay there after the app restarts."):
         made_clips.mark_sent(str(batch_id), sent_to=sent_to)
@@ -2238,18 +2723,30 @@ def _toggle_made_clip(batch_id: str, path: str, key: str) -> None:
 
 
 def _render_brand_kit() -> None:
+    from core.palettes import PALETTE_LABELS, PALETTE_MODES
+
     brand = load_brand_kit()
-    with st.expander(f"🎨 Accent color: {brand.accent}"):
+    mode = brand.palette_mode if brand.palette_mode in PALETTE_MODES else "auto"
+    with st.expander(f"🎨 Palette: {PALETTE_LABELS[mode].split(' (')[0].split(':')[0]} · accent {brand.accent}"):
         with st.form("brand_kit_form", border=False):
-            accent = st.color_picker("The one highlight color (the client's brand color works well)", value=brand.accent)
+            # Round 40: the editorial palette the graphics wear (core.palettes).
+            palette_mode = st.selectbox(
+                "Graphics palette", list(PALETTE_MODES), index=list(PALETTE_MODES).index(mode),
+                format_func=lambda key: PALETTE_LABELS[key], key="palette_mode",
+                help="Auto picks per clip: Bloomberg obsidian for finance and tech, Economist slate for strategy and "
+                     "policy, NYT archival for editorial talk or a bright set, studio adaptive for a set with a strong "
+                     "colour of its own. Every palette's text passes WCAG AAA (7:1).",
+            )
+            accent = st.color_picker("The one highlight color (the client's brand color works well; the Classic palette and the captions use it)",
+                                     value=brand.accent)
             save = st.form_submit_button("Save")
         if save:
-            if contrast(accent, CARD_CANVAS) < MIN_CONTRAST:
+            if contrast(accent, CARD_CANVAS) < MIN_CONTRAST:  # captions use it on the video too
                 st.error(f"{accent} is too dark to read on the dark background (contrast "
                          f"{contrast(accent, CARD_CANVAS):.1f}, needs {MIN_CONTRAST}). Pick a lighter color.")
                 return
             save_brand_kit(BrandKit(wordmark=brand.wordmark, accent=accent, logo_path=brand.logo_path,
-                                    show_name=brand.show_name))
+                                    show_name=brand.show_name, palette_mode=palette_mode))
             st.success("Saved. New graphics use it.")
             st.rerun()
 
@@ -2309,25 +2806,70 @@ def _new_card(template: str, key: str, clip: Any, spans: list[tuple[float, float
                     else st.column_config.TextColumn(header, max_chars={
                         "value": CARD_LIMITS["value"], "parent": CARD_LIMITS["label"],
                         "detail": CARD_LIMITS["context" if template == "comparison_card" else "detail"],
-                        "label": 24 if template in {"comparison_card", "step_sequence"} else
+                        "label": 110 if template == "headline_card" else 24 if template in {
+                            "comparison_card", "step_sequence", "framework_matrix_card"} else
                         CARD_LIMITS["box" if template == "buckets" else "context" if template == "kinetic_range" else "label"],
                     }[field]))
             for field, header in fields.items()
         }
         edited = st.data_editor([dict(blank) for _ in range(CARD_ROWS[template])], column_config=config,
                                 num_rows="fixed" if template in {"kinetic_range", "diverging_bar", "cac_payback", "drawdown_curve",
-                                                                 "comparison_card"}
-                                else "dynamic", hide_index=True, use_container_width=True,
+                                                                 "comparison_card", "headline_card", "prediction_gauge_card"}
+                                else "dynamic", hide_index=True, width="stretch",
                                 key=f"card_rows_{key}_{template}")
         for item in edited:
             values = {field: (bool(item.get(field)) if field in {"highlight", "dashed"}
                               else str(item.get(field) or "").strip()) for field in fields}
             if values.get("label") or values.get("value") or values.get("detail"):
                 rows.append(CardRow(**values))
+    context = _niche_context(template, key)
     if not st.button("✔ Check and add", key=f"card_add_{key}"):
         return None
-    return Card(template, start=spans[first][0], end=spans[max(first, last)][1] + 0.15, headline=headline.strip(),
-                rows=rows, source=source.strip(), data_path=data_path)
+    if "arcs" in context:  # a line joins two of the countries entered
+        context["arcs"] = [pair for pair in context["arcs"] if max(pair) <= len(rows)] or None
+        if context["arcs"] is None:
+            context.pop("arcs")
+    card = Card(template, start=spans[first][0], end=spans[max(first, last)][1] + 0.15, headline=headline.strip(),
+                rows=rows, source=source.strip(), data_path=data_path, context=context)
+    if template in niche_director.NICHE_TEMPLATES:  # World Bank, Polymarket, Wikipedia: fetched now, with sources
+        notes: list[str] = []
+        with st.spinner("Fetching the data…"):
+            niche_director.enrich(card, notes)
+        for note in notes:
+            st.caption(note)
+    return card
+
+
+def _niche_context(template: str, key: str) -> dict[str, Any]:
+    """Round 36: the extra choices of a map, odds gauge, framework or tear-sheet."""
+    raw: dict[str, Any] = {}
+    if template == "geo_map_card":
+        left, right = st.columns(2)
+        if left.checkbox("Moving trade line from the first country to the others", value=True, key=f"geo_arcs_{key}"):
+            raw["arcs"] = [[1, 2], [1, 3]]
+        stat = right.selectbox("World Bank figure (optional)", ["", *niche_data.INDICATORS],
+                               format_func=lambda s: niche_data.INDICATORS[s][1] if s else "None", key=f"geo_stat_{key}")
+        if stat:
+            raw["stat"] = stat
+    elif template == "prediction_gauge_card":
+        query = st.text_input("Polymarket search (optional, when the odds aren't said)", max_chars=80,
+                              key=f"pm_query_{key}")
+        if query.strip():
+            raw["market"] = query.strip()
+    elif template == "framework_matrix_card":
+        layout = st.radio("Layout", ["matrix", "flywheel"], horizontal=True, key=f"fw_layout_{key}",
+                          format_func=lambda v: "2x2 matrix" if v == "matrix" else "Flywheel")
+        raw["layout"] = layout
+        if layout == "matrix":
+            x_col, y_col = st.columns(2)
+            raw["x"] = x_col.text_input("Across (x axis)", max_chars=18, key=f"fw_x_{key}")
+            raw["y"] = y_col.text_input("Up (y axis)", max_chars=18, key=f"fw_y_{key}")
+    elif template == "headline_card":
+        topic = st.text_input("Wikipedia background (optional: a law, event or company named)", max_chars=80,
+                              key=f"hl_topic_{key}")
+        if topic.strip():
+            raw["topic"] = topic.strip()
+    return niche_director.niche_context(template, raw)
 
 
 def _market_card(key: str, clip: Any, start: float, end: float) -> Card | None:
@@ -2388,8 +2930,15 @@ def _render_clip_version(
 
     problems: list[str] = []
     if drafts:
+        from core import palettes
+
+        # Round 40: the same palette the clip was made with (re-derived from its words and frames)
+        brand = load_brand_kit()
+        if context.get("palette"):
+            brand = _dc_replace(brand, palette_mode=str(context["palette"]))
+        brand, _note = palettes.for_clip(brand, clip_words, "", context["source_path"], clip.start_time, clip.end_time)
         edit = ClipEdit(start=clip.start_time, end=clip.end_time, cards=[Card(**draft) for draft in drafts],
-                        brand=load_brand_kit())
+                        brand=brand)
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
             # The title shows for the opening only, so it never sits under a graphic.
@@ -2406,10 +2955,36 @@ def _render_clip_version(
             )
             problems = [f"Graphic {n + 1}: {e}" for n, c in enumerate(checks) for e in c.errors]
             if made is not None:
-                return Path(made), problems
+                return _with_teaser(Path(made), clip, context, settings, work_dir), problems
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
-    return render(words, output, bool(context.get("pin_title"))), problems
+    return _with_teaser(render(words, output, bool(context.get("pin_title"))), clip, context, settings, work_dir), problems
+
+
+def _with_teaser(path: Path, clip: Any, context: dict[str, Any], settings: Any, work_dir: Path) -> Path:
+    """Round 40: a re-rendered clip opens on its climax teaser again (found again from its
+    words, so a trimmed clip gets the teaser of its new range, or none)."""
+    from core.pipeline import _explainer_caption_top, add_teaser, find_teaser
+
+    choice = context.get("climax_hook")
+    on = getattr(settings, "enable_climax_hook", True) if choice is None else bool(choice)  # older settings objects lack it
+    source = Path(context["source_path"])
+    words = [w for w in context["words"] if clip.start_time <= float(w.start) and float(w.end) <= clip.end_time]
+    teaser = find_teaser(source, words, clip.start_time, clip.end_time, on)
+    if teaser is None:
+        return path
+    layout = str(context["layout_mode"])
+    crop = context.get("crop") if isinstance(context.get("crop"), CropBox) else CropBox(x=0, y=0, width=2, height=2)
+    webinar = context.get("webinar")
+    try:
+        return add_teaser(source, path, teaser, words, clip.viral_title, settings, work_dir / "teaser",
+                          layout=layout, plan=context.get("crop_plan"), crop=crop, webinar=webinar,
+                          caption_top=webinar.caption_top if webinar else _explainer_caption_top(layout, source))
+    except Exception:  # noqa: BLE001 - the clip without its teaser is still a clip
+        logging.getLogger(__name__).warning("Climax teaser failed on the re-render.", exc_info=True)
+        return path
+    finally:
+        shutil.rmtree(work_dir / "teaser", ignore_errors=True)
 
 
 def _swap_clip(index: int, old_path: Path, new_path: Path, new_clip: Any, context: dict[str, Any]) -> None:
@@ -2525,9 +3100,18 @@ def _render_data_cards(generated_clips: list[tuple[Any, Any]]) -> None:
 
 def _render_remove_generated(index: int, clip_path: Path, count: int) -> None:
     """🗑 Remove clip (Make clips): confirm in a pop-over, like the Outbox's."""
-    if count <= 1:
-        st.button("🗑 Remove clip", key=f"remove_made_off_{clip_path.stem}", disabled=True, width="stretch",
-                  help="It's the only clip left. To drop it, use 🗑️ Discard these clips.")
+    if count <= 1:  # Round 49: the last clip can go too (that discards the batch)
+        with st.popover("🗑 Remove clip", width="stretch"):
+            st.markdown("Remove the last clip? That discards this batch from this Mac.")
+            if st.button("Yes, remove it", key=f"remove_made_last_{clip_path.stem}", type="primary", width="stretch"):
+                try:
+                    _discard_generated_clips()
+                except (OSError, ValueError) as exc:
+                    logging.exception("Could not discard the last clip")
+                    st.error(f"Couldn't remove it: {exc}")
+                    return
+                st.session_state["made_clips_toast"] = "Clip removed. That was the last one, so the batch is cleared."
+                st.rerun()
         return
     places = [p for p in (
         "the client preview page" if _published_paths() else "",
@@ -2619,7 +3203,7 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
         with copy_column:
             _render_copy_email_button(published["page_url"], label="📋 Copy Preview Link")
         with open_column:
-            st.link_button("Open the page", published["page_url"], width="stretch")
+            st.link_button("Open the page", _own_view_link(published["page_url"]), width="stretch")
         st.caption(
             "Opens, plays and downloads show under 'Published preview pages' at the bottom of 🧭 Pipeline. "
             "Trimmed a clip after publishing? Publish again for a new page."
@@ -2627,6 +3211,7 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
         if st.button("Publish again (new address)", key="publish_again"):
             st.session_state.pop("published_page", None)
             st.rerun()
+        _render_batch_email()
         return
     clips = [
         {"path": str(Path(path).expanduser().resolve()), "start": clip.start_time, "end": clip.end_time}
@@ -2651,7 +3236,7 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
         )
         episode = st.toggle("Podcast or interview (the page says 'episode')", value=True)
         publish = st.form_submit_button(
-            "🌐 Publish to Client Preview Page", type="primary", use_container_width=True, disabled=not clips,
+            "🌐 Publish to Client Preview Page", type="primary", width="stretch", disabled=not clips,
         )
     if not publish:
         return
@@ -2670,9 +3255,49 @@ def _render_publish_page(generated_clips: list[tuple[Any, Any]]) -> None:
             return
     # The page's clips in order, so 🗑 Remove clip can take one off it later.
     st.session_state["published_page"] = {**entry, "paths": [_clip_key(clip["path"]) for clip in clips]}
+    _write_batch_email(channel.strip(), title.strip(), url, len(clips), episode)
     if st.session_state.get("made_batch_id"):
         made_clips.set_page(str(st.session_state["made_batch_id"]), name, url)
     st.rerun()
+
+
+def _write_batch_email(channel: str, title: str, url: str, count: int, episode: bool = True) -> None:
+    """Round 49: the pitch email for a Make-clips batch, written the moment its page is
+    published: their show, the episode, the page link and the moment worth posting first (the
+    same executive template as the worker's pitches). The greeting you typed is kept."""
+    facts = st.session_state.get("made_pitch_facts") or {}
+    current = str(st.session_state.get("outreach_email_body") or st.session_state.get("ai_outreach_email") or "")
+    at = facts.get("at")
+    business = not _legacy_ui() or bool(facts.get("business"))
+    kind = "episode" if episode else "video"
+    body = build_outreach_email(
+        channel, video_title=title, video_topic=str(facts.get("topic") or ""), drive_link=url, clip_count=count,
+        opening_at=float(at) if isinstance(at, (int, float)) else None, key_point=str(facts.get("point") or ""),
+        greeting_name=greeting_name_of(current), content_format=kind, business=business,
+    )
+    st.session_state["ai_outreach_email"] = body
+    st.session_state["outreach_email_body"] = body
+    st.session_state["outreach_email_subject"] = build_subject(
+        str(facts.get("short_topic") or ""), kind, count, show=channel, business=business)
+    st.session_state["outreach_pitch"] = {"subject": st.session_state["outreach_email_subject"], "body": body}
+
+
+def _render_batch_email() -> None:
+    """Round 49: the batch's ready-to-send email under its published page: subject and body,
+    one click each to copy. Outreach takes seconds: paste into Gmail, add their name, send."""
+    body = str(st.session_state.get("outreach_email_body") or "")
+    if not body:
+        return
+    with st.container(border=True):
+        st.markdown("**✉️ Pitch email for this batch** · their show, the episode and this page's link")
+        st.text_input("Subject", key="outreach_email_subject")
+        st.text_area("Email", height=280, key="outreach_email_body")
+        first, second = st.columns(2)
+        with first:
+            _render_copy_email_button(str(st.session_state.get("outreach_email_subject") or ""), label="📋 Copy subject")
+        with second:
+            _render_copy_email_button(str(st.session_state.get("outreach_email_body") or ""), label="📋 Copy email")
+        st.caption("'Hi there' until you put their first name in. Your edits stay until you publish again.")
 
 
 def _render_manual_pages() -> None:
@@ -2688,7 +3313,7 @@ def _render_manual_pages() -> None:
         for page in pages[:30]:
             st.markdown(
                 f"**{page.get('channel_title') or 'Clips'}** · {str(page.get('created_at', ''))[:10]} · "
-                f"[{page['page_url']}]({page['page_url']})"
+                f"[{page['page_url']}]({_own_view_link(str(page['page_url']))})"
             )
             st.caption(clip_pages.describe_activity(activity.get(str(page["page_name"]))))
 
@@ -2717,7 +3342,7 @@ def _render_trim_form(
                 "Move the end (seconds)", min_value=-15.0, max_value=15.0, value=0.0, step=0.5,
                 key=f"end_shift_{index}_{clip_path.stem}",
             )
-            rerender_clicked = st.form_submit_button("🔄 Apply Trim & Re-render", use_container_width=True)
+            rerender_clicked = st.form_submit_button("🔄 Apply Trim & Re-render", width="stretch")
     if not rerender_clicked:
         return
     contexts = st.session_state.get("clip_render_contexts", {})
@@ -2786,6 +3411,30 @@ LOG_LINES = 40
 PREVIEW_PLAYER_WIDTH = 240  # vertical clips: ~430 px tall, so the email stays in view
 
 
+def _overlay_mode_text() -> str:
+    from core import executive
+
+    mode = executive.overlay_mode()
+    return mode + ("" if mode != "full" else " (creator graphics and the legacy UI)")
+
+
+def _camera_text() -> str:
+    from core import camera_path, speaker_director
+
+    still = "still, one opening drift" if camera_path.steady() else "flowing (Round 42 pushes)"
+    return f"{still}; speaker close-ups {'on' if speaker_director.enabled() else 'off'}"
+
+
+def _harvester_text() -> str:
+    from core import b2b_sources as S
+
+    state = S.load_state()
+    return (f"{len(S.SOURCES)} sources, {len(S.seed_pages())} seed pages (storage/b2b_seed_pages.txt), "
+            f"{len(state['seen'])} shows looked at, {len(state['backlog'])} in the backlog; "
+            f"Podcast Index key {'set' if all(S.podcastindex_keys()) else 'not set'}, "
+            f"B2B_YOUTUBE_SEARCHES={S.youtube_searches_per_run()}")
+
+
 def _render_system() -> None:
     st.subheader("Worker")
     st.caption(
@@ -2806,7 +3455,11 @@ def _render_system() -> None:
     loudness = loudness_target()
     st.table(
         [
-            {"Setting": "CAPTION_STYLE", "Now": os.getenv("CAPTION_STYLE") or "bold"},
+            {"Setting": "CAPTION_STYLE", "Now": caption_style_name()},
+            {"Setting": "VISUAL_OVERLAYS", "Now": _overlay_mode_text()},
+            {"Setting": "MIDCLIP_TRIM", "Now": "off" if os.getenv("MIDCLIP_TRIM", "").strip() == "0" else "on (pauses and fillers)"},
+            {"Setting": "B2B harvester", "Now": _harvester_text()},
+            {"Setting": "Camera (EXEC_CAMERA, SPEAKER_CLOSEUPS)", "Now": _camera_text()},
             {"Setting": "EMPHASIS_INTENSITY", "Now": os.getenv("EMPHASIS_INTENSITY") or f"{caption_style()['emphasis']} (the caption style's default)"},
             {"Setting": "SOURCE_MAX_HEIGHT", "Now": video_format_sort()[0].removeprefix("res:") + "p"},
             {"Setting": "YouTube sign-in (YTDLP_COOKIES_*)", "Now": sign_in_summary()},
@@ -2889,12 +3542,12 @@ def _render_pass_menu(channel_id: str, key: str) -> None:
     """Pass on a pitch with a one-click reason (saved so the worker can be tuned)."""
     with st.popover(
         "❌ Pass (not pitching)",
-        use_container_width=True,
+        width="stretch",
         help="You're not sending this one. The creator won't come back.",
     ):
         st.caption("Why? One click; it's saved so the lead finder and clip picking can be tuned.")
         for code, label in PASS_REASONS.items():
-            if st.button(label, key=f"{key}_{code}", use_container_width=True):
+            if st.button(label, key=f"{key}_{code}", width="stretch"):
                 try:
                     skipped = skip_lead(channel_id, pass_reason=code)
                 except Exception as exc:
@@ -2913,6 +3566,8 @@ _AUTO_SKIP_LABELS = {
     "auto_faceless": "nobody on camera",
     "auto_screen_share": "screen share with a corner webcam",
     "auto_age": "age-restricted video",
+    "auto_dubbed": "auto-dubbed video (not the speaker's own voice)",
+    "auto_low_fit": "not a buyer (core/fit.py: sports, schools, consumer money...)",
 }
 
 
@@ -2958,7 +3613,7 @@ def _render_recently_passed() -> None:
                     + (f" · {reason}" if reason else "")
                 )
             with right:
-                if st.button("I sent this one", key=f"restore_sent_{record_id}", use_container_width=True):
+                if st.button("I sent this one", key=f"restore_sent_{record_id}", width="stretch"):
                     restore_passed_as_sent(record_id)
                     st.rerun()
 
@@ -2969,7 +3624,8 @@ def _page_activity() -> dict[str, dict[str, Any]] | None:
     if not clip_pages.configured():
         return {}
     try:
-        return clip_pages.page_activity()
+        since = clip_pages.views_count_from()  # Round 51: 'Start counting from now'
+        return clip_pages.page_activity(since=since) if since else clip_pages.page_activity()
     except Exception:
         logging.exception("Could not read clip page activity")
         return None
@@ -2984,14 +3640,23 @@ def _render_sent_pitches() -> None:
         st.error(f"Could not load sent pitches: {exc}")
         return
     records = waiting + replies
-    activity = _page_activity() if any(record.get("page_name") for record in records) else {}
+    manual = clip_pages.manual_pages() if clip_pages.configured() else []
+    activity = _page_activity() if (manual or any(record.get("page_name") for record in records)) else {}
     if activity is None:
         st.caption("Couldn't check who opened their clip page just now.")
         activity = {}
+    _render_page_views(records, manual, activity)
     if records:
         _render_outreach_numbers(waiting, replies, activity)
+        _render_reply_stats(activity)
     if replies:
         _render_replies(replies, activity)
+    # Round 53: each follow-up fits what they did on their page (core.follow_up_plan): warm notes for
+    # people who watched, a new door (their marketing lead) or a resend for people who never opened.
+    prospects = _prospects_by_id()
+    waiting = [FP.apply(record, activity.get(str(record.get("page_name") or "")),
+                        prospect=prospects.get(str(record.get("prospect_id") or ""))) for record in waiting]
+    _render_follow_up_first(waiting)
     due_count = sum(1 for record in waiting if record.get("follow_up_due"))
     st.subheader(f"Sent: waiting for a reply ({len(waiting)})")
     if not waiting:
@@ -3008,11 +3673,142 @@ def _render_sent_pitches() -> None:
         help="People who pressed play on their clip page have seen your work: follow up with them first.",
     )
     shown = [record for record in waiting if not played_only or _played(record, activity)]
-    shown.sort(key=lambda record: not record.get("follow_up_due"))  # due first; newest first within each
+    shown.sort(key=FP.urgency)  # due first, the most engaged first, then oldest
     if played_only and not shown:
         st.caption("No one waiting for a reply has played a clip yet.")
     for record in shown:
         _render_waiting_pitch(record, activity)
+
+
+def _own_view_link(url: str) -> str:
+    """Round 49: the page address for YOUR clicks: ?me=1 marks this browser as yours on the
+    page, so your own visits never show up as the prospect's views. (Copy the plain link.)"""
+    if not url:
+        return url
+    return url + ("&" if "?" in url else "?") + "me=1"
+
+
+def _render_page_views(records: list[dict[str, Any]], manual: list[dict[str, Any]],
+                       activity: dict[str, dict[str, Any]]) -> None:
+    """📈 Round 49: who opened their clip page, when, and what they did there; new ones since you
+    last looked are flagged 🆕. Round 51: no pop-up notifications, and your own visits never
+    count (your networks are marked as yours: see register_own_network)."""
+    pages = [{"page_name": r.get("page_name"), "title": r.get("channel_title"), "url": r.get("page_url"),
+              "source": "Pitch", "sent_at": r.get("sent_at")} for r in records if r.get("page_name")]
+    pages += [{"page_name": m.get("page_name"), "title": m.get("channel_title"), "url": m.get("page_url"),
+               "source": "Make clips", "sent_at": m.get("created_at")} for m in manual]
+    if not pages:
+        return
+    seen_at = clip_pages.views_seen_at()
+    rows = clip_pages.views_feed(activity, pages, seen_at)
+    fresh = [row for row in rows if row["new"] and row["views"]]
+    viewed = [row for row in rows if row["views"]]
+    with st.container(border=True):
+        head, button = st.columns([4, 1], vertical_alignment="center")
+        head.subheader("📈 Page views" + (f" · {len(fresh)} new" if fresh else ""))
+        if fresh and button.button("Mark all seen", key="views_seen", width="stretch"):
+            clip_pages.mark_views_seen()
+            st.rerun()
+        live, opened, played, took, offer = st.columns(5)
+        live.metric("Pages sent", len(rows), border=True)
+        opened.metric("Viewed", f"{len(viewed)} / {len(rows)}", border=True,
+                      help="Page loads by them: your own visits from this app's buttons (?me=1) and link scanners "
+                           "aren't counted. Pages opened before this update may include your own previews.")
+        played.metric("Played a clip", sum(bool(row["played"]) for row in rows), border=True)
+        took.metric("Took an asset", sum(bool(row["took"]) for row in rows), border=True,
+                    help="Downloaded a video, captions file or cover image, or copied a LinkedIn post or "
+                         "Shorts & Reels caption.")
+        offer.metric("Offer or call", sum(bool(row["offer"] or row.get("call")) for row in rows), border=True,
+                     help="Opened the offer page, or pressed 'Request a call' (which opens an email to you).")
+        owner, counting = clip_pages.owner_link(), clip_pages.views_count_from()
+        st.caption(
+            "Your own visits, plays, downloads and copies don't count: this Mac's network is marked as yours "
+            "each time the app starts." + (f" On your phone's mobile data, open [this link]({owner}) once." if owner else "")
+            + (f" Counting since {counting.astimezone().strftime('%b %d, %H:%M')}." if counting else ""))
+        with st.popover("Start counting from now"):
+            st.markdown("Hides every view so far (older ones may include your own, from before this update) "
+                        "and counts only new ones.")
+            if st.button("Yes, start from now", key="views_reset", type="primary"):
+                clip_pages.start_counting_now()
+                st.rerun()
+        if not viewed:
+            st.caption("No views yet. They show up here as soon as someone opens their page.")
+            return
+        table = [{
+            "": "🆕" if row["new"] else "",
+            "Prospect": row["title"],
+            "Last viewed": clip_pages.ago(row["last_view"]),
+            "Views": row["views"],
+            "First viewed": row["first_view"].astimezone().strftime("%b %d, %H:%M") if row["first_view"] else "—",
+            "Played": ", ".join(str(n) for n in row["played"]) or "—",
+            "Took": " · ".join(row["took"]) or "—",
+            "Offer": "✓" if row["offer"] else "",
+            "Call": "📞" if row.get("call") else "",
+            "From": row["source"],
+            "Page": _own_view_link(row["url"]),
+        } for row in viewed[:40]]
+        st.dataframe(table, hide_index=True, width="stretch",
+                     column_config={"Page": st.column_config.LinkColumn("Page", display_text="Open")})
+
+
+def _prospects_by_id() -> dict[str, dict[str, Any]]:
+    try:
+        from core.linkedin_harvester import load_prospects
+
+        return {str(p.get("id")): p for p in load_prospects()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _render_follow_up_first(waiting: list[dict[str, Any]]) -> None:
+    """🔥 Round 53: the follow-ups to send today, most interested first, one line each."""
+    due = sorted([r for r in waiting if r.get("follow_up_due")], key=FP.urgency)
+    if not due:
+        return
+    hot = [r for r in due if (r.get("engagement") or {}).get("level", 0) >= 2]
+    with st.container(border=True):
+        st.subheader(f"🔥 Follow up today ({len(due)})" + (f" · {len(hot)} watched your clips" if hot else ""))
+        st.caption("Most interested first. Each one is written for what they did on their page (it never mentions "
+                   "that you can see it). Scroll down to each pitch to copy it.")
+        for record in due[:12]:
+            eng = record.get("engagement") or {}
+            st.markdown(f"{eng.get('label', '')} **{record.get('channel_title') or 'Creator'}** · "
+                        f"{record.get('follow_up_label', '')} · _{eng.get('detail', '')}_")
+
+
+def _render_reply_stats(activity: dict[str, dict[str, Any]]) -> None:
+    """📊 Round 54 (core.reply_stats): every pitch you've sent, broken down by niche, buyer fit, email,
+    subject, who it went to and the day, so you harvest more of what gets answers."""
+    try:
+        sent = get_all_sent()
+    except Exception:  # noqa: BLE001
+        logging.exception("Could not load sent pitches for the reply stats")
+        return
+    if not sent:
+        return
+    total = reply_stats.overall(sent)
+    with st.expander(f"📊 What gets replies · {total['replied']} of {total['sent']} replied "
+                     f"({100 * total['rate']:.1f}%)", expanded=False):
+        names = {key: label for key, (label, _) in reply_stats.DIMENSIONS.items()}
+        dimension = st.radio("Break down by", list(names), format_func=names.get, horizontal=True, key="reply_stats_by")
+        rows = reply_stats.breakdown(sent, activity, dimension)
+        winner = reply_stats.best(rows)
+        if winner:
+            st.caption(f"Best so far: **{winner['group']}**, {winner['replied']} of {winner['sent']} replied "
+                       f"({100 * winner['rate']:.0f}%). Harvest and pitch more like these.")
+        else:
+            st.caption(f"No group has {reply_stats.MIN_SAMPLE}+ sends and a reply yet: keep sending and check back. "
+                       "Rows under 10 sends are marked 'too few'.")
+        st.dataframe([{
+            names[dimension]: row["group"], "Sent": row["sent"],
+            "Opened page": f"{row['opened']} / {row['with_page']}" if row["with_page"] else "—",
+            "Played": row["played"] if row["with_page"] else "—", "Replied": row["replied"], "Said yes": row["yes"],
+            "Reply rate": f"{100 * row['rate']:.0f}%" + ("" if row["enough"] else " (too few)"),
+        } for row in rows], hide_index=True, width="stretch")
+        came = reply_stats.when_replies_came(sent)
+        if came:
+            st.caption("Replies came " + " · ".join(f"{c['when'].lower()}: {c['replies']}" for c in came)
+                       + ". Follow-ups count: keep sending them.")
 
 
 def _played(record: dict[str, Any], activity: dict[str, dict[str, Any]]) -> bool:
@@ -3042,17 +3838,14 @@ def _render_outreach_numbers(
     followed_col.metric("Followed up", followed, border=True)
     opened_col.metric(
         "Opened their page", f"{sum(_opened(r, activity) for r in with_page)} / {len(with_page)}", border=True,
-        help="Your own previews and email link scanners count as opens too. Plays are the signal to trust.",
+        help="Page loads by them (your own visits from this app's buttons and link scanners aren't counted). "
+             "Plays are the strongest signal.",
     )
     played_col.metric("Played a clip", f"{sum(_played(r, activity) for r in with_page)} / {len(with_page)}", border=True)
     replies_col.metric(
         "Replies", len(replies), border=True,
         delta=f"{yes} yes · {no} no" + (f" · {clients} client{'s' if clients != 1 else ''}" if clients else ""),
         delta_color="off", delta_arrow="off",
-    )
-    st.caption(
-        "Since round 25 the first email has no link, so a clip page only gets real visits after your "
-        "day-7 follow-up or your reply to a yes."
     )
 
 
@@ -3076,11 +3869,11 @@ def _render_replies(replies: list[dict[str, Any]], activity: dict[str, dict[str,
                     _render_copy_email_button(st.session_state.get(f"yes_body_{record_id}") or record["yes_reply_body"])
                 buttons = st.columns(2)
                 if record.get("reply") == "yes" and not record.get("client_at"):
-                    if buttons[0].button("🤝 They started a trial or signed", key=f"client_{record_id}", use_container_width=True):
+                    if buttons[0].button("🤝 They started a trial or signed", key=f"client_{record_id}", width="stretch"):
                         mark_follow_up(record_id, "client")
                         st.rerun()
                 if buttons[1].button(
-                    "↩ Undo (back to waiting)", key=f"undo_reply_{record_id}", use_container_width=True,
+                    "↩ Undo (back to waiting)", key=f"undo_reply_{record_id}", width="stretch",
                     help="Marked the wrong button? This puts the pitch back in the waiting list.",
                 ):
                     undo_reply(record_id)
@@ -3102,23 +3895,35 @@ def _render_waiting_pitch(record: dict[str, Any], activity: dict[str, dict[str, 
         if record.get("page_name"):
             st.caption(clip_pages.describe_activity(activity.get(str(record["page_name"]))))
         if record.get("follow_up_due"):
-            st.caption(f"{record.get('follow_up_label')}. Send it as a reply in the same thread.")
+            if record.get("follow_up_why"):
+                st.caption(f"**{record.get('engagement', {}).get('label', '')}** · {record['follow_up_why']}")
+            to = str(record.get("follow_up_to") or "")
+            if record.get("follow_up_new_thread") and to and "@" not in to:
+                st.caption(f"{record.get('follow_up_label')}. You reached them through a contact page: send it there "
+                           f"again ([open it]({to})).")
+            elif record.get("follow_up_new_thread"):
+                st.caption(f"{record.get('follow_up_label')}. Send it as a **new email** (not a reply)"
+                           + (f" to **{to}**." if to else "."))
+            else:
+                st.caption(f"{record.get('follow_up_label')}. Send it as a reply in the same thread.")
             st.text_input("Follow-up subject", value=record["follow_up_subject"], key=f"follow_subject_{record_id}")
             st.text_area("Follow-up", value=record["follow_up_body"], height=180, key=f"follow_body_{record_id}")
             _render_copy_email_button(st.session_state.get(f"follow_body_{record_id}") or record["follow_up_body"])
         sent_col, yes_col, no_col, other_col = st.columns(4)
         with sent_col:
             if record.get("follow_up_due") and st.button(
-                "Follow-up sent", key=f"followed_{record_id}", use_container_width=True
+                "Follow-up sent", key=f"followed_{record_id}", width="stretch"
             ):
-                mark_follow_up(record_id, "followed_up")
+                extra = ({"step": str(record.get("follow_up_step") or ""), "to": str(record.get("follow_up_to") or "")}
+                         if "engagement" in record else {})  # Round 53's plan: log which follow-up went out
+                mark_follow_up(record_id, "followed_up", **extra)
                 st.rerun()
         for column, outcome, label in (
             (yes_col, "yes", "👍 Said yes"),
             (no_col, "no", "👎 Not interested"),
             (other_col, "other", "💬 Other reply"),
         ):
-            if column.button(label, key=f"reply_{outcome}_{record_id}", use_container_width=True):
+            if column.button(label, key=f"reply_{outcome}_{record_id}", width="stretch"):
                 mark_follow_up(record_id, outcome)
                 st.rerun()
 

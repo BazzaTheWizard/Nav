@@ -10,6 +10,8 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from core import audio_polish, clip_length
+
 from core.face_tracker import PULL_IN, PULL_IN_CENTER_Y, PULL_IN_SECONDS, CropBox, SplitView, _probe_display_size
 from core.title_card import TitleOverlay, overlay_filter
 from core import explainer
@@ -59,30 +61,42 @@ KEYFRAME_INTERVAL = "60"
 AUDIO_SAMPLE_RATE = "48000"  # YouTube's upload guide
 # Loudness: every clip ends up at the same level (EBU R128 two-pass, linear).
 # -14 LUFS is where YouTube normalizes; set AUDIO_TARGET_LUFS=off in .env to skip.
-DEFAULT_TARGET_LUFS = -14.0
-TRUE_PEAK_DB = -1.0  # the finished file's ceiling: YouTube's and Spotify's (was -1.5)
+DEFAULT_TARGET_LUFS = audio_polish.TARGET_LUFS  # -14
+TRUE_PEAK_DB = audio_polish.TRUE_PEAK_DB  # the finished file's ceiling: -1.5 dBTP (Round 36 broadcast mastering)
 # AAC encoding adds ~0.2 dB of overshoot after loudnorm (measured: -1.0 in, -0.8 out),
-# so loudnorm aims this much lower and the delivered file lands at or under -1.0.
+# so loudnorm aims this much lower and the delivered file lands at or under the ceiling.
 AAC_OVERSHOOT_DB = 0.3
-# Light cleanup before the loudness step (both passes): a 75 Hz high-pass for rumble
-# (desk bumps, traffic, AC) and FFmpeg's FFT denoiser for steady noise (laptop fans,
-# hiss). Measured: on a clean podcast the voice band moves 0.3 dB; on a noisy one the
-# rumble drops ~8-10 dB and fan hiss in the pauses ~10 dB. It can't remove room echo.
-# AUDIO_CLEANUP=off in .env skips it. The denoiser delays the sound by exactly 25 ms
-# (measured at 44.1 and 48 kHz), which would put captions and lips ahead of the voice:
-# those 25 ms are trimmed off the start and padded back at the end.
-AUDIO_CLEANUP_CHAIN = (
-    "highpass=f=75:poles=2,afftdn=nr=12:nf=-45:tn=1,"
-    "atrim=start=0.025,asetpts=PTS-STARTPTS,apad=pad_dur=0.025"
-)
-LOUDNESS_RANGE = 11.0
+# Mastering before the loudness step (both passes; Round 36, core.audio_polish): an 80 Hz
+# high-pass for rumble (desk bumps, traffic, AC), FFmpeg's FFT denoiser for steady noise
+# (laptop fans, hiss) and a +2 dB presence lift at 3 kHz for clarity on phone speakers.
+# It can't remove room echo. AUDIO_CLEANUP=off in .env skips it. The denoiser's 25 ms
+# delay is trimmed off the start and padded back at the end (lips and captions stay in sync).
+AUDIO_CLEANUP_CHAIN = audio_polish.MASTERING_CHAIN
+LOUDNESS_RANGE = audio_polish.LOUDNESS_RANGE
 MAX_GAIN_DB = 20.0  # a nearly silent clip isn't boosted (that would only raise noise)
 _HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 
 
-@functools.lru_cache(maxsize=4)
 def _video_encoder_args(ffmpeg: str) -> tuple[str, ...]:
-    """Use the Mac hardware encoder when present, otherwise libx264."""
+    """Use the Mac hardware encoder when present, otherwise libx264. Round 57: during the
+    clean copy's pass (core.textless), the high-bitrate master settings instead."""
+    from core import textless
+
+    if textless.active():
+        return textless.encoder_args(_encoder_list(ffmpeg))
+    return _dirty_encoder_args(ffmpeg)
+
+
+@functools.lru_cache(maxsize=4)
+def _encoder_list(ffmpeg: str) -> str:
+    try:
+        return subprocess.run([ffmpeg, "-hide_banner", "-encoders"], check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+@functools.lru_cache(maxsize=4)
+def _dirty_encoder_args(ffmpeg: str) -> tuple[str, ...]:
     try:
         encoders = subprocess.run(
             [ffmpeg, "-hide_banner", "-encoders"],
@@ -158,7 +172,7 @@ def _measure_loudness(
             [
                 ffmpeg, "-hide_banner", "-nostats", "-ss", str(start), "-t", str(duration),
                 "-i", str(source), "-map", "0:a:0", "-vn",
-                "-af", f"{cleanup + ',' if cleanup else ''}loudnorm=I={target}:TP={TRUE_PEAK_DB - AAC_OVERSHOOT_DB:g}:LRA={LOUDNESS_RANGE}:print_format=json",
+                "-af", f"{cleanup + ',' if cleanup else ''}{audio_polish.loudnorm(target, TRUE_PEAK_DB - AAC_OVERSHOOT_DB)}",
                 "-f", "null", "-",
             ],
             check=True, capture_output=True, text=True, timeout=timeout,
@@ -178,21 +192,15 @@ def _measure_loudness(
 
 
 def _audio_filter(ffmpeg: str, source: Path, start: float, duration: float) -> str:
-    """Audio chain: resync, light cleanup, then (when measurable) two-pass EBU R128
-    loudness normalization to -14 LUFS, -1 dBTP."""
+    """Audio chain: resync, mastering (core.audio_polish), then (when measurable) two-pass
+    EBU R128 loudness normalization to -14 LUFS, -1.5 dBTP, LRA 11."""
     cleanup = audio_cleanup()
     chain = "aresample=async=1:first_pts=0" + (f",{cleanup}" if cleanup else "")
     target = loudness_target()
     measured = _measure_loudness(ffmpeg, source, start, duration, target, cleanup) if target is not None else None
     if measured is None or float(measured["input_i"]) < target - MAX_GAIN_DB:
         return chain
-    return (
-        f"{chain},loudnorm=I={target}:TP={TRUE_PEAK_DB - AAC_OVERSHOOT_DB:g}:LRA={LOUDNESS_RANGE}"
-        f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
-        f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
-        f":offset={measured['target_offset']}:linear=true:print_format=none,"
-        f"aresample={AUDIO_SAMPLE_RATE}"
-    )
+    return f"{chain},{audio_polish.loudnorm(target, TRUE_PEAK_DB - AAC_OVERSHOOT_DB, measured)},aresample={AUDIO_SAMPLE_RATE}"
 
 
 def _frame_rate(path: Path) -> float:
@@ -228,6 +236,18 @@ def _pull_in(filter_complex: str, until: float, rate: float) -> str:
                f"x2='{left}':y2='{bottom}':x3='{right}':y3='{bottom}'")
     return (filter_complex.replace("[base]", "[unzoomed]")
             + f";[unzoomed]perspective={corners}:interpolation=cubic:eval=frame:enable='lt(t\\,{until:.3f})'[base]")
+
+
+def punch_in_filter(filter_complex: str, zoom: float) -> str:
+    """Round 40: a steady ``zoom`` on the finished picture ([base], 1080x1920): scaled up
+    with Lanczos and cropped back to 1080x1920 around the centre column at the face's
+    height (PULL_IN_CENTER_Y, the same point the hook's pull-in zooms into)."""
+    if filter_complex.count("[base]") != 1:
+        return filter_complex
+    w, h = round(1080 * zoom / 2) * 2, round(1920 * zoom / 2) * 2
+    return (filter_complex.replace("[base]", "[unpunched]")
+            + f";[unpunched]scale={w}:{h}:flags=lanczos,"
+            f"crop=1080:1920:x={(w - 1080) // 2}:y={round((h - 1920) * PULL_IN_CENTER_Y)},setsar=1[base]")
 
 
 def _hold_edges(filter_complex: str, holds: tuple[float, float], duration: float) -> str:
@@ -275,11 +295,31 @@ def render_clip(
     webinar: WebinarLayout | None = None,
     holds: tuple[float, float] = (0.0, 0.0),
     pull_in_until: float = 0.0,
+    punch_in: float = 1.0,
+    emphasis: list[tuple[float, float]] | None = None,
+    camera: list[Any] | None = None,
+    reel: Any | None = None,
+    closeups: list[tuple[Any, list[tuple[float, float]]]] | None = None,
 ) -> Path:
     """Render one vertical clip.
 
+    ``closeups`` (Round 48, core.speaker_director, smart_crop only): (CloseUp, spans) per
+    speaker: during each span the picture cuts to that speaker's 9:16 close-up (laid over the
+    two-shot, so the two-shot returns between them).
+
     ``pull_in_until`` (seconds, from the pipeline): the hook's subtle pull-in zoom runs
     until then (the first camera cut); 0 means no pull-in (see _pull_in).
+
+    ``emphasis`` (Round 41, core.camera_energy): the clip seconds of each emphasis
+    punch-in (1.00x to 1.10x in 0.22 s, held, cut back on a sentence boundary).
+
+    ``reel`` (Round 43, core.reel_layout.ReelPlan, smart_crop only): the full-frame spans that
+    are slides are composed for 9:16 (the slide enlarged, the webcam as a circle) instead
+    of a 16:9 strip over blur; only its ``kept`` spans (wide shots of people) keep the strip.
+
+    ``punch_in`` (Round 40, the climax teaser): a steady zoom on the speaker (1.05 = 5 %
+    closer, centred at the face's height), on the picture only: the title card and the
+    captions keep their size and place. 1.0 is none.
 
     ``holds`` (head, tail) seconds (from CropPlan.holds): the clip opens or closes on a
     sliver of another camera; the main shot's first frame is held over the head and its
@@ -308,6 +348,9 @@ def render_clip(
         )
     if layout_mode == "webinar" and webinar is None:
         raise ValueError("The webinar layout needs the webcam and slide positions (core.webinar.plan_webinar).")
+    if layout_mode in {"smart_crop", "stacked"} and (crop.width < 64 or crop.height < 64):
+        # Round 48: a crop layout on a placeholder crop renders a flat colour, never a picture.
+        raise ValueError(f"{layout_mode} needs a real crop window, got {crop.width}x{crop.height}.")
 
     subtitle_file = Path(subtitle_path).expanduser().resolve(strict=True)
     if not subtitle_file.is_file():
@@ -323,7 +366,9 @@ def render_clip(
     shutil.copy2(subtitle_file, staged_subtitle)
 
     ass_path = staged_subtitle.name.replace("\\", "/").replace(":", "\\:")
-    ass_filter = f"ass='{ass_path}'"
+    from core.executive import FONTS  # Round 45: the bundled NavExec Inter caption fonts
+
+    ass_filter = f"ass='{ass_path}':fontsdir='{FONTS}'"
     crop_x = f"'{crop_x_expression}'" if crop_x_expression else str(crop.x)
     crop_filter = f"crop=w={crop.width}:h={crop.height}:x={crop_x}:y={crop.y}"
     crop_sharpen = _sharpen(1920 / crop.height)
@@ -363,18 +408,27 @@ def render_clip(
             f"[stack_face]{stacked_crop_filter},"
             f"scale=1080:960:flags=lanczos{_sharpen(960 / crop.height)}[bottom];[top][bottom]vstack=inputs=2[base]"
         )
-    elif layout_mode == "smart_crop" and (full_frame_ranges or (split_view and split_view.spans)):
+    elif layout_mode == "smart_crop" and (full_frame_ranges or (split_view and split_view.spans) or closeups):
         sources = ["[src_crop]"]
         parts: list[str] = []
         layers: list[tuple[str, list[tuple[float, float]]]] = []
-        if full_frame_ranges:
+        strip = full_frame_ranges
+        if full_frame_ranges and reel is not None and getattr(reel, "composed", False):
+            from core.reel_layout import layers as reel_layers
+
+            reel_sources, reel_graph, reel_out = reel_layers(reel, _sharpen(2.0))
+            sources += reel_sources
+            parts.append(reel_graph)
+            layers += reel_out
+            strip = list(reel.kept)
+        if strip:
             sources += ["[src_bg]", "[src_fg]"]
             parts.append(
                 _BLURRED_BACKGROUND.replace("[0:v]", "[src_bg]")
                 + f"[src_fg]scale=1080:-2:flags=lanczos{_sharpen(_scale_to(1080, 1e9, frame))}[fg];"
                 f"[bg][fg]overlay=x=(W-w)/2:y='max(0,{FULL_FRAME_BOTTOM_Y}-h)'[full];"
             )
-            layers.append(("[full]", full_frame_ranges))
+            layers.append(("[full]", strip))
         if split_view and split_view.spans:
             sources += ["[src_top]", "[src_bottom]"]
             panel = f"crop=w={split_view.width}:h={split_view.height}"
@@ -387,6 +441,16 @@ def render_clip(
                 f"[top][bottom]vstack=inputs=2,{SEAM_LINE}[pair];"
             )
             layers.append(("[pair]", list(split_view.spans)))
+        for number, (box, spans) in enumerate(closeups or []):
+            if not spans:
+                continue
+            label = f"[close{number}]"
+            sources.append(f"[src_close{number}]")
+            parts.append(
+                f"[src_close{number}]crop=w={box.width}:h={box.height}:x={box.x}:y={box.y},"
+                f"scale=1080:1920:flags=lanczos{_sharpen(1920 / box.height)}{label};"
+            )
+            layers.append((label, list(spans)))
         whole_clip_split = (
             not full_frame_ranges
             and len(layers) == 1
@@ -420,6 +484,16 @@ def render_clip(
     filter_complex = _hold_edges(filter_complex, holds, end_time - start_time)
     if pull_in_until > 0:
         filter_complex = _pull_in(filter_complex, min(pull_in_until, end_time - start_time), _frame_rate(source))
+    if punch_in > 1.0 + 1e-6:
+        filter_complex = punch_in_filter(filter_complex, punch_in)
+    if emphasis:
+        from core.camera_energy import punch_filter
+
+        filter_complex = punch_filter(filter_complex, emphasis, _frame_rate(source), PULL_IN_CENTER_Y)
+    if camera:  # Round 42: the flowing camera (core.camera_path), one smooth curve for the whole clip
+        from core.camera_path import path_filter
+
+        filter_complex = path_filter(filter_complex, camera, _frame_rate(source), PULL_IN_CENTER_Y)
     # Tag the picture as Rec. 709 (SDR HD) so captions, the title card and players
     # all use the same colors; some layouts dropped the source's tags.
     color = _source_color(source)
@@ -431,7 +505,11 @@ def render_clip(
         filter_complex = filter_complex.replace("[base]", "[untagged]") + f";[untagged]setparams={props}[base]"
         color_args = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     title_input: list[str] = []
-    if title is not None:
+    from core import textless
+
+    if textless.active():  # Round 57: the clean copy: the picture only (captions, title, lower third left out)
+        filter_complex += ";[base]null[v]"
+    elif title is not None:
         title_input = [
             "-loop", "1", "-framerate", "30", "-t", f"{title.seconds:.3f}",
             "-i", str(Path(title.image_path).resolve()),
@@ -472,6 +550,8 @@ def render_clip(
         "+faststart",
         destination.name,
     ]
+    # Round 55: a 3-minute clip gets a longer limit than a 60 s one (10 min floor).
+    render_timeout = clip_length.scaled_timeout(end_time - start_time, RENDER_TIMEOUT_SEC, 8.0)
     try:
         subprocess.run(
             command,
@@ -480,12 +560,12 @@ def render_clip(
             capture_output=True,
             text=True,
             shell=False,
-            timeout=RENDER_TIMEOUT_SEC,
+            timeout=render_timeout,
         )
     except subprocess.TimeoutExpired as exc:
         destination.unlink(missing_ok=True)
         raise RuntimeError(
-            f"FFmpeg clip rendering took longer than {RENDER_TIMEOUT_SEC // 60} minutes and was stopped."
+            f"FFmpeg clip rendering took longer than {render_timeout / 60:.0f} minutes and was stopped."
         ) from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()

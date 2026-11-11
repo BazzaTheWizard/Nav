@@ -146,8 +146,8 @@ P.render_selected_clip = real_render
 import core.video_renderer as V  # noqa: E402
 chain = V._audio_filter(FFMPEG, source, clip_start, 10)
 check("Audio chain: high-pass and denoiser before two-pass loudnorm at -14 LUFS",
-      chain.index("highpass=f=75") < chain.index("afftdn") < chain.index("loudnorm=I=-14") and "measured_I=" in chain, chain[:160])
-check("Loudnorm aims 0.3 dB under -1 dBTP (AAC adds about 0.2 dB)", "TP=-1.3" in chain)
+      chain.index("highpass=f=80") < chain.index("afftdn") < chain.index("loudnorm=I=-14") and "measured_I=" in chain, chain[:160])
+check("Loudnorm aims 0.3 dB under -1.5 dBTP (AAC adds about 0.2 dB; Round 36 broadcast ceiling)", "TP=-1.8" in chain)
 os.environ["AUDIO_CLEANUP"] = "off"
 check("AUDIO_CLEANUP=off: no cleanup", "afftdn" not in V._audio_filter(FFMPEG, source, clip_start, 10))
 os.environ["AUDIO_CLEANUP"] = ""

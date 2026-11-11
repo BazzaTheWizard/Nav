@@ -56,6 +56,12 @@ STYLES = {
     "light": {"box": (255, 255, 255, 255), "text": (17, 17, 17, 255)},
     # Dark glass card, white text.
     "dark": {"box": (12, 12, 12, 222), "text": (255, 255, 255, 255)},
+    # Round 49: the executive topic header. The captions' typeface (Inter Display SemiBold), in
+    # sentence case as written, a little smaller, on a quiet dark glass card with a hairline edge.
+    # No bright box, no all-caps, no emoji. (A "rule" colour draws a short line above the words.)
+    "executive": {"box": (13, 14, 18, 196), "text": (245, 245, 247, 255), "edge": (255, 255, 255, 34),
+                  "font": "NavExec-InterDisplay-SemiBold.ttf",
+                  "sizes": (52, 47, 43), "max_width": 860, "radius": 0.44, "fade_out": 0.45},
 }
 DEFAULT_STYLE = "light"
 
@@ -84,6 +90,7 @@ class TitleOverlay:
     pinned: bool = False
     # False: fully on screen from frame 0 (the worker's clips); True: fades in and rises.
     fade_in: bool = True
+    fade_out: float = 0.25  # Round 49: the executive header fades out over 0.45 s (STYLES)
 
 
 def clean_title(title: str | None) -> str:
@@ -102,9 +109,14 @@ def clean_title(title: str | None) -> str:
     return text
 
 
-@lru_cache(maxsize=8)
-def _font(size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(str(FONT_PATH), size)
+@lru_cache(maxsize=16)
+def _font(size: int, font_file: str = "") -> ImageFont.FreeTypeFont:
+    path = PROJECT_ROOT / "assets" / "fonts" / font_file if font_file else FONT_PATH
+    return ImageFont.truetype(str(path if path.is_file() else FONT_PATH), size)
+
+
+def _style(style: str) -> dict:
+    return STYLES.get(style, STYLES[DEFAULT_STYLE])
 
 
 def _text_width(text: str, font: ImageFont.FreeTypeFont) -> float:
@@ -128,18 +140,26 @@ def _balanced_lines(
     return None
 
 
-def _layout_text(text: str, max_font_size: int) -> tuple[ImageFont.FreeTypeFont, list[str]]:
+def _layout_text(text: str, max_font_size: int, style: str = DEFAULT_STYLE) -> tuple[ImageFont.FreeTypeFont, list[str]]:
     words = text.split()
-    sizes = [size for size in FONT_SIZES if size <= max_font_size] or [FONT_SIZES[-1]]
+    look = _style(style)
+    font_sizes = look.get("sizes", FONT_SIZES)
+    font_file = look.get("font", "")
+    max_width = look.get("max_width", MAX_CARD_WIDTH)
+    if max_font_size >= FONT_SIZES[0]:
+        max_font_size = font_sizes[0]
+    elif max_font_size <= FONT_SIZES[-1]:
+        max_font_size = font_sizes[-1]
+    sizes = [size for size in font_sizes if size <= max_font_size] or [font_sizes[-1]]
     for size in sizes:
-        font = _font(size)
+        font = _font(size, font_file)
         pad_x = round(size * 0.6)
         max_lines = 3 if size == sizes[-1] else 2
-        lines = _balanced_lines(words, font, MAX_CARD_WIDTH - 2 * pad_x, max_lines)
+        lines = _balanced_lines(words, font, max_width - 2 * pad_x, max_lines)
         if lines:
             return font, lines
     # A single word wider than the card: let it be wide rather than cut it.
-    font = _font(sizes[-1])
+    font = _font(sizes[-1], font_file)
     return font, _balanced_lines(words, font, 10_000, 3) or [text]
 
 
@@ -148,11 +168,12 @@ def render_title_card(
 ) -> tuple[Path, int, int]:
     """Draw the card; returns (path, card width, card height). The PNG has a
     transparent SHADOW_MARGIN on every side around the card."""
-    colours = STYLES.get(style, STYLES[DEFAULT_STYLE])
-    font, lines = _layout_text(text, max_font_size)
+    colours = _style(style)
+    font, lines = _layout_text(text, max_font_size, style)
     size = font.size
+    rule = colours.get("rule")
     pad_x = round(size * 0.6)
-    pad_top = round(size * 0.46)
+    pad_top = round(size * (0.86 if rule else 0.46))  # the executive card's short rule sits in the top padding
     pad_bottom = round(size * 0.52)  # a little extra so descenders (g, y, p) don't look cramped
     line_pitch = round(size * 1.22)
     cap_height = -font.getbbox("H", anchor="ls")[1]
@@ -160,7 +181,7 @@ def render_title_card(
     text_width = max(_text_width(line, font) for line in lines)
     card_width = round(text_width + 2 * pad_x)
     card_height = round(pad_top + cap_height + (len(lines) - 1) * line_pitch + pad_bottom)
-    radius = round(size * 0.42)
+    radius = round(size * colours.get("radius", 0.42))
 
     margin = SHADOW_MARGIN
     image = Image.new("RGBA", (card_width + 2 * margin, card_height + 2 * margin), (0, 0, 0, 0))
@@ -175,7 +196,14 @@ def render_title_card(
     image = Image.alpha_composite(image, shadow.filter(ImageFilter.GaussianBlur(SHADOW_BLUR)))
 
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle(box, radius=radius, fill=colours["box"])
+    if colours.get("edge"):
+        draw.rounded_rectangle(box, radius=radius, fill=colours["box"], outline=colours["edge"], width=2)
+    else:
+        draw.rounded_rectangle(box, radius=radius, fill=colours["box"])
+    if rule:
+        rule_width, rule_y = round(size * 0.8), margin + round(size * 0.42)
+        left = margin + (card_width - rule_width) / 2
+        draw.rounded_rectangle((left, rule_y, left + rule_width, rule_y + 3), radius=1.5, fill=rule)
     baseline = margin + pad_top + cap_height
     for line in lines:
         draw.text(
@@ -430,6 +458,7 @@ def prepare_title_overlay(
             placement=explainer.EXPLAINER_PLACEMENT,
             pinned=pinned,
             fade_in=fade_in,
+            fade_out=_style(style).get("fade_out", FADE_OUT),
         )
 
     if layout == "webinar" and webinar is not None:
@@ -448,6 +477,7 @@ def prepare_title_overlay(
             placement=WEBINAR_PLACEMENT,
             pinned=pinned,
             fade_in=fade_in,
+            fade_out=_style(style).get("fade_out", FADE_OUT),
         )
 
     zones: list[list[tuple[float, float]]] = []
@@ -483,6 +513,7 @@ def prepare_title_overlay(
                 placement=SEAM_PLACEMENT,
                 pinned=pinned,
                 fade_in=fade_in,
+                fade_out=_style(style).get("fade_out", FADE_OUT),
             )
         blocked = []
         if split_time > 0:
@@ -532,6 +563,7 @@ def prepare_title_overlay(
         placement=label,
         pinned=pinned,
         fade_in=fade_in,
+        fade_out=_style(style).get("fade_out", FADE_OUT),
     )
 
 
@@ -553,7 +585,8 @@ def overlay_filter(
     if overlay.fade_in:
         steps.append(f"fade=t=in:st=0:d={FADE_IN}:alpha=1")
     if not overlay.pinned:
-        steps.append(f"fade=t=out:st={max(0.0, overlay.seconds - FADE_OUT):.3f}:d={FADE_OUT}:alpha=1")
+        fade_out = min(overlay.fade_out, max(0.05, overlay.seconds / 2))
+        steps.append(f"fade=t=out:st={max(0.0, overlay.seconds - fade_out):.3f}:d={fade_out:.3f}:alpha=1")
     y = f"'{overlay.y}+{SLIDE_PX}*max(0,1-t/{FADE_IN})'" if overlay.fade_in else str(overlay.y)
     return (
         f"[{input_index}:v]format=rgba{''.join(',' + step for step in steps)}[title];"

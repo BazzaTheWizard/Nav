@@ -17,10 +17,11 @@ frame hook, which redraws it for that exact moment (eased with cubic-bezier(0.16
 0.3, 1)). The same frame always comes out the same. Numbers roll up to their value from
 the word where they're said.
 
-Split charts sit in a Bento card: output y 492-1340, x 28-1052 (above the small
-captions at 1370 and clear of the apps' bottom bars), in three zones: a header (18%:
-eyebrow, editorial headline, the punchline's change as a pill), the chart (68%) and a
-footer (14%: the "In context" strip, or the chart's key). With nothing for the footer
+Split charts sit in a Bento card. Round 39: the speaker keeps the top 54% of the frame
+(y 0-1040) and the card is compact and bottom-anchored right under it: output y 1056-1768,
+x 28-1052 (152 px left at the bottom for the apps' bars), in three zones: a header (16%:
+eyebrow, editorial headline, the punchline's change as a pill), the chart (72%) and a
+footer (12%: the "In context" strip, or the chart's key). With nothing for the footer
 the chart takes its room, so the card never shows an empty band. The empty card rides
 in with the panel, its contents draw once the panel lands, and it leaves with the panel.
 
@@ -48,28 +49,36 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _replace
 from pathlib import Path
+from typing import Any
 
 from core.card_checks import parse_value, signed_value
 from core.edl import MODES, BrandKit, Card
+from core.palettes import SENTINEL
 
 ENGINE = "r35"  # part of every cached render's key: a new engine draws everything again
 FPS = 30
 FRAME_W, FRAME_H = 1080, 1920
-SPLIT_TOP = 460  # 24/76 split: the speaker's strip (a 2.35:1 band of the frame), the chart below
-SPLIT_H = FRAME_H - SPLIT_TOP  # the chart page (76% of the frame)
+# Round 39: the speaker is the anchor. A split view keeps the speaker in the top 54% of
+# the frame (0-1040: never under 50%), face-centred (core.dynamic_layout.band_rect), and
+# the card is compact and bottom-anchored right under it: no dead black band anywhere.
+SPLIT_TOP = 1040  # the speaker's viewport (54.2% of 1920); the chart page starts here
+SPLIT_H = FRAME_H - SPLIT_TOP  # the chart page (880)
 W = FRAME_W
 
-# The Bento card, in output pixels. It ends above the small captions (core.dynamic_layout
-# CALM_CAPTIONS, from y 1370) and the apps' bottom bars (from about y 1540).
-CARD_X, CARD_TOP, CARD_W, CARD_BOTTOM = 28, 492, 1024, 1340
-CARD_H = CARD_BOTTOM - CARD_TOP  # 848
-CARD_Y = CARD_TOP - SPLIT_TOP  # where it sits on the chart page (32)
-HEADER_H, FOOTER_H = 153, 118  # 18% and 14% of the card; the chart zone is the 68% between
-HEADER_SLIM = 84  # no headline: just the eyebrow
-PAD = 44  # the card's inner margin
-IW = CARD_W - 2 * PAD  # the width content uses (936)
+# The Bento card, in output pixels: y 1056-1768 (37% of the frame), 16 px under the
+# speaker, its bottom 152 px above the frame's edge (the apps' bottom safe zone). While a
+# card is up the captions sit on the seam, at the bottom of the speaker's viewport
+# (core.dynamic_layout.SEAM_CAPTION_BOTTOM), not in the app's bars.
+CARD_X, CARD_TOP, CARD_W, CARD_BOTTOM = 28, 1056, 1024, 1768
+CARD_H = CARD_BOTTOM - CARD_TOP  # 712
+CARD_Y = CARD_TOP - SPLIT_TOP  # where it sits on the chart page (16)
+BOTTOM_MARGIN = FRAME_H - CARD_BOTTOM  # 152
+HEADER_H, FOOTER_H = 112, 84  # 16% and 12% of the card; the chart zone is the 72% between
+HEADER_SLIM = 60  # no headline: just the eyebrow
+PAD = 36  # the card's inner margin
+IW = CARD_W - 2 * PAD  # the width content uses (952)
 RADIUS = 20
 
 # Design tokens (the whole library uses only these).
@@ -82,7 +91,8 @@ INK = "#F5F6F8"
 SOFT = "#94A3B8"  # labels and axes (7.4:1 on the card)
 AXIS = SOFT
 GRAY = "#5B6474"  # neutral bars and flows
-LIGHT = "#E6E9EE"
+LIGHT = "#E6E9EE"  # a data neutral (bars next to the accent)
+TEXT_LIGHT = "#E7E9EE"  # Round 40: light secondary text (the same look; core.palettes reads it as text)
 POS = "#34D399"  # emerald: gains
 NEG = "#FB7185"  # rose: losses
 SHADES = [LIGHT, "#A3ACBA", "#6E7787", "#465062"]  # parts of a whole, after the accent
@@ -95,6 +105,7 @@ LIBRARIES = {
     "plot": ("d3.min.js", "plot.min.js"),
     "echarts": ("echarts.min.js",),
     "lightweight": ("lightweight-charts.standalone.production.js",),
+    "geo": ("d3.min.js", "topojson-client.min.js", "world-50m.js"),  # Round 36: the offline world map
 }
 MIN_CONTRAST = 4.5  # WCAG AA for text
 EASE = "cubic-bezier(0.16, 1, 0.3, 1)"  # entrances: fast in, long gentle settle
@@ -131,7 +142,10 @@ EYEBROWS = {
     "share_split": "Share of the total", "trend_line": "Trend", "arr_bridge": "ARR bridge", "sankey_flow": "Cash flow",
     "cac_payback": "CAC payback", "drawdown_curve": "Drawdown", "candlestick_ema": "Price action",
     "comparison_card": "The contrast", "step_sequence": "Step by step",
+    "geo_map_card": "The map", "prediction_gauge_card": "The odds", "flow_sankey_card": "The value chain",
+    "framework_matrix_card": "The framework", "headline_card": "The thesis",
 }
+SOURCED = {"geo_map_card", "prediction_gauge_card", "headline_card"}  # a footer with the source, when there is one
 KEYED = {"candlestick_ema", "market_line"}  # charts whose footer always holds their key (a source, a legend)
 DATA_CHARTS = {"candlestick_ema", "market_line"}  # drawn from a data file (with its source), not from speech
 
@@ -147,6 +161,7 @@ class Frames:
     height: int
     top: int
     blur: list[tuple[int, int, int, int, int]] = field(default_factory=list)
+    canvas: str = "#040507"  # Round 40: the panel around a split card, in the clip's palette (CANVAS: classic)
 
 
 class CardRenderError(RuntimeError):
@@ -583,13 +598,13 @@ def _context_footer(card: Card, accent: str) -> tuple[str, str, Motion]:
         extra = f'<span class="when">Said earlier, at <span class="num">{int(at // 60)}:{int(at % 60):02d}</span></span>'
     css = f"""
 .ctx {{ position: absolute; inset: 0; padding: 0 {PAD}px; }}
-.ctx .r1 {{ position: absolute; left: {PAD}px; right: {PAD}px; top: 20px; height: 26px; display: flex; align-items: center;
+.ctx .r1 {{ position: absolute; left: {PAD}px; right: {PAD}px; top: 10px; height: 24px; display: flex; align-items: center;
   justify-content: space-between; gap: 24px; }}
 .ctx .eye {{ font-size: 17px; font-weight: 650; letter-spacing: .18em; color: {SOFT}; white-space: nowrap; }}
 .ctx .ex {{ display: flex; align-items: center; gap: 26px; min-width: 0; overflow: hidden; }}
-.ctx .r2 {{ position: absolute; left: {PAD}px; right: {PAD}px; top: 52px; height: 52px; display: flex; align-items: baseline; gap: 20px; }}
-.ctx .big {{ font-size: 44px; font-weight: 700; letter-spacing: -.03em; color: {accent}; white-space: nowrap; }}
-.ctx .txt {{ flex: 1; min-width: 0; font-size: 28px; font-weight: 520; color: {LIGHT}; white-space: nowrap; overflow: hidden; }}
+.ctx .r2 {{ position: absolute; left: {PAD}px; right: {PAD}px; top: 36px; height: 44px; display: flex; align-items: baseline; gap: 20px; }}
+.ctx .big {{ font-size: 38px; font-weight: 700; letter-spacing: -.03em; color: {accent}; white-space: nowrap; }}
+.ctx .txt {{ flex: 1; min-width: 0; font-size: 26px; font-weight: 520; color: {TEXT_LIGHT}; white-space: nowrap; overflow: hidden; }}
 .unit {{ display: flex; align-items: center; gap: 10px; min-width: 0; }}
 .blks {{ display: flex; gap: 5px; }}
 .blk {{ display: inline-block; width: 22px; height: 22px; border-radius: 4px; flex: none; }}
@@ -621,11 +636,11 @@ def _card_css(accent: str, header_h: int, plot_h: int, footer: bool) -> str:
     linear-gradient(180deg, #0B0F16 0%, {CARD_BG} 46%, #07090E 100%); }}
 .spec-top {{ position: absolute; left: 32px; right: 32px; top: 0; height: 1px; pointer-events: none;
   background: linear-gradient(90deg, rgba(255,255,255,0), rgba(255,255,255,.42) 30%, rgba(255,255,255,.42) 70%, rgba(255,255,255,0)); }}
-.logo {{ flex: none; width: 64px; height: 64px; border-radius: 16px; background: #F5F6F8; display: flex; align-items: center;
+.logo {{ flex: none; width: 56px; height: 56px; border-radius: 14px; background: #F5F6F8; display: flex; align-items: center;
   justify-content: center; box-shadow: 0 0 0 1px rgba(255,255,255,.14), 0 10px 26px rgba(0,0,0,.45); overflow: hidden; }}
-.logo img {{ width: 46px; height: 46px; object-fit: contain; }}
+.logo img {{ width: 40px; height: 40px; object-fit: contain; }}
 .logo.badge {{ background: {accent}; }}
-.logo.badge img {{ width: 64px; height: 64px; }}
+.logo.badge img {{ width: 56px; height: 56px; }}
 .spot {{ position: absolute; left: -260px; top: -320px; width: 1000px; height: 760px; pointer-events: none;
   background: radial-gradient(closest-side, {_rgba(accent, 0.07)}, rgba(255,255,255,.02) 55%, rgba(255,255,255,0)); }}
 .beam {{ position: absolute; left: 0; top: 0; width: 260px; height: 1px; pointer-events: none; opacity: 0;
@@ -636,15 +651,15 @@ def _card_css(accent: str, header_h: int, plot_h: int, footer: bool) -> str:
   mask-composite: exclude; }}
 .grain {{ position: absolute; inset: 0; width: {CARD_W}px; height: {CARD_H}px; pointer-events: none; }}
 .hdr {{ position: absolute; left: 0; top: 0; width: {CARD_W}px; height: {header_h}px; }}
-.eye0 {{ position: absolute; left: {PAD}px; top: 34px; font-size: 18px; font-weight: 650; letter-spacing: .18em;
+.eye0 {{ position: absolute; left: {PAD}px; top: 22px; font-size: 17px; font-weight: 650; letter-spacing: .18em;
   color: {SOFT}; white-space: nowrap; text-transform: uppercase; }}
 .eye0::before {{ content: ""; display: inline-block; width: 8px; height: 8px; margin: 0 12px 2px 0; border-radius: 2px;
   background: {accent}; }}
-.hrow {{ position: absolute; left: {PAD}px; right: {PAD}px; top: 66px; height: 64px; display: flex; align-items: center; gap: 24px; }}
-.title {{ flex: 1; min-width: 0; font-family: "Instrument Serif", Georgia, serif; font-size: 60px; font-weight: 400;
+.hrow {{ position: absolute; left: {PAD}px; right: {PAD}px; top: 48px; height: 56px; display: flex; align-items: center; gap: 24px; }}
+.title {{ flex: 1; min-width: 0; font-family: "Instrument Serif", Georgia, serif; font-size: 52px; font-weight: 400;
   letter-spacing: -.012em; line-height: 1; white-space: nowrap; overflow: hidden; padding-bottom: 4px; }}
-.kpi {{ flex: none; display: flex; align-items: center; gap: 10px; height: 52px; padding: 0 20px 0 16px; border-radius: 26px;
-  border: 1px solid; font-size: 28px; font-weight: 700; letter-spacing: -.02em; white-space: nowrap; }}
+.kpi {{ flex: none; display: flex; align-items: center; gap: 10px; height: 46px; padding: 0 18px 0 14px; border-radius: 23px;
+  border: 1px solid; font-size: 25px; font-weight: 700; letter-spacing: -.02em; white-space: nowrap; }}
 .kpi svg {{ width: 16px; height: 14px; }}
 .note {{ flex: none; max-width: 420px; font-size: 20px; font-weight: 500; color: {SOFT}; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; }}
@@ -1365,7 +1380,7 @@ def with_entity(card: Card, brand: BrandKit) -> BrandKit:
     found = entity_enricher.cached(card.entity)
     if found is None or not found.color:
         return brand
-    return BrandKit(wordmark=brand.wordmark, accent=found.color, logo_path=brand.logo_path, show_name=brand.show_name)
+    return _replace(brand, accent=found.color)  # Round 40: the brand kit's palette goes with it
 
 
 def read_series(path: str) -> list[tuple[str, float]]:
@@ -1466,26 +1481,25 @@ def _comparison_card(card: Card, accent: str, ph: int) -> Chart:
     "Then we did, and it worked"). Each side lands on its words; the side the point is
     about (highlight, else the second) takes the accent and the other steps back."""
     main = next((k for k, row in enumerate(card.rows) if row.highlight), len(card.rows) - 1)
-    gap, top = 64, 24
+    gap, top = 56, 12
     side_w, side_h = (IW - gap) / 2, ph - 2 * top
     # Round 33: a "then → now" contrast (the tags or headings say when) gets an arrow between
     # the sides; "them vs us" keeps VS. Each side's words sit in its middle, not stacked at
-    # the top over an empty half, and a large faint numeral anchors each side.
+    # the top over an empty half. Round 39: no faint 01 / 02 watermark numerals behind the
+    # sides, and tighter type so the compact card holds both sides.
     words = {w for row in card.rows for w in re.findall(r"[a-z]+", f"{row.value} {row.label}".lower())}
     temporal = bool(words & {"before", "after", "then", "now", "today", "old", "new", "was", "became", "used"})
     css = f"""
 .cmp {{ position: absolute; top: {top}px; width: {side_w:.0f}px; height: {side_h:.0f}px; border-radius: 18px;
   border: 1px solid rgba(255,255,255,.10); background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.012));
-  padding: 34px 34px 34px 38px; display: flex; flex-direction: column; justify-content: center; overflow: hidden; }}
-.cmp .tag {{ align-self: flex-start; max-width: 100%; height: 46px; line-height: 44px; padding: 0 18px; border-radius: 23px;
-  border: 1px solid rgba(255,255,255,.18); font-size: 24px; font-weight: 650; color: {SOFT}; white-space: nowrap;
-  overflow: hidden; margin-bottom: 28px; flex: none; }}
-.cmp .head {{ font-family: "Instrument Serif", Georgia, serif; font-size: 66px; line-height: 1.06; letter-spacing: -.012em;
-  max-height: 216px; overflow: hidden; flex: none; }}
-.cmp .line {{ margin-top: 24px; font-size: 32px; font-weight: 500; line-height: 1.3; color: {SOFT}; max-height: 168px;
+  padding: 24px 26px 24px 30px; display: flex; flex-direction: column; justify-content: center; overflow: hidden; }}
+.cmp .tag {{ align-self: flex-start; max-width: 100%; height: 40px; line-height: 38px; padding: 0 16px; border-radius: 20px;
+  border: 1px solid rgba(255,255,255,.18); font-size: 22px; font-weight: 650; color: {SOFT}; white-space: nowrap;
+  overflow: hidden; margin-bottom: 16px; flex: none; }}
+.cmp .head {{ font-family: "Instrument Serif", Georgia, serif; font-size: 56px; line-height: 1.04; letter-spacing: -.012em;
+  max-height: 176px; overflow: hidden; flex: none; }}
+.cmp .line {{ margin-top: 14px; font-size: 28px; font-weight: 500; line-height: 1.28; color: {SOFT}; max-height: 144px;
   overflow: hidden; flex: none; }}
-.cmp .ix {{ position: absolute; right: 22px; bottom: -18px; font-family: "Instrument Serif", Georgia, serif; font-size: 200px;
-  line-height: 1; color: rgba(255,255,255,.035); pointer-events: none; }}
 .cmp .edge {{ position: absolute; left: 0; top: 22px; bottom: 22px; width: 4px; border-radius: 2px; background: {accent};
   opacity: 0; }}
 .vs {{ position: absolute; left: {PAD + side_w + gap / 2 - 32:.0f}px; top: {ph / 2 - 32:.0f}px; width: 64px; height: 64px;
@@ -1499,7 +1513,7 @@ def _comparison_card(card: Card, accent: str, ph: int) -> Chart:
         left = PAD + k * (side_w + gap)
         tag = f'<div class="tag num fit" id="ct{k}">{_e(row.value)}</div>' if row.value.strip() else ""
         line = f'<div class="line fitv">{_e(row.detail)}</div>' if row.detail.strip() else ""
-        parts.append(f'<div class="cmp" id="c{k}" style="left:{left:.0f}px"><div class="ix">{k + 1:02d}</div>'
+        parts.append(f'<div class="cmp" id="c{k}" style="left:{left:.0f}px">'
                      f'<div class="edge" id="ce{k}"></div>{tag}'
                      f'<div class="head fitv" id="ch{k}">{_e(row.label)}</div>{line}</div>')
         m.fade_up(f"#c{k}", times[k], rise=18, length=0.45)
@@ -1524,17 +1538,17 @@ def _step_sequence(card: Card, accent: str, ph: int) -> Chart:
     """Round 32: the speaker's framework as 2-4 steps in the order said. A rail draws down
     from step to step as each one is said; the newest step is the active one."""
     n = len(card.rows)
-    pitch = min(200.0 if n <= 3 else 176.0, (ph - 60) / n)
+    pitch = min(176.0 if n <= 3 else 140.0, (ph - 36) / n)
     top = (ph - pitch * n) / 2
-    dot_x = PAD + 34
-    text_x = PAD + 100
-    size = 60 if n <= 3 else 50  # Round 33: fewer steps, bigger type (the card's room is used)
+    dot_x = PAD + 30
+    text_x = PAD + 90
+    size = 54 if n <= 3 else 44  # Round 33: fewer steps, bigger type (Round 39: sized to the compact card)
     css = f"""
 .step {{ position: absolute; left: {text_x}px; right: {PAD}px; height: {pitch:.0f}px; display: flex; flex-direction: column;
   justify-content: center; }}
 .step .lbl {{ font-size: {size}px; font-weight: 650; letter-spacing: -.02em; line-height: 1.08; white-space: nowrap; overflow: hidden; }}
-.step .dtl {{ margin-top: 10px; font-size: {32 if n <= 3 else 30}px; font-weight: 500; color: {SOFT}; white-space: nowrap; overflow: hidden; }}
-.dot {{ position: absolute; left: {dot_x - 30}px; width: 60px; height: 60px; border-radius: 30px; border: {STROKE}px solid {RULE};
+.step .dtl {{ margin-top: 8px; font-size: {30 if n <= 3 else 26}px; font-weight: 500; color: {SOFT}; white-space: nowrap; overflow: hidden; }}
+.dot {{ position: absolute; left: {dot_x - 27}px; width: 54px; height: 54px; border-radius: 27px; border: {STROKE}px solid {RULE};
   background: {CARD_BG}; color: {SOFT}; font-size: 24px; font-weight: 700; display: flex; align-items: center;
   justify-content: center; }}
 .rail {{ position: absolute; left: {dot_x - STROKE / 2:.0f}px; width: {STROKE}px; background: {RULE}; }}
@@ -1551,7 +1565,7 @@ def _step_sequence(card: Card, accent: str, ph: int) -> Chart:
         m.tween(f"#rl{k}", "transform", max(times[k - 1] + 0.1, times[k] - 0.45), times[k], "scaleY(0)", "scaleY(1)")
     for k, row in enumerate(card.rows):
         detail = f'<div class="dtl fit">{_e(row.detail)}</div>' if row.detail.strip() else ""
-        parts.append(f'<div class="dot num" id="d{k}" style="top:{centers[k] - 30:.0f}px">{k + 1:02d}</div>'
+        parts.append(f'<div class="dot num" id="d{k}" style="top:{centers[k] - 27:.0f}px">{k + 1:02d}</div>'
                      f'<div class="step" id="s{k}" style="top:{centers[k] - pitch / 2:.0f}px">'
                      f'<div class="lbl fit" id="l{k}">{_e(row.label)}</div>{detail}</div>')
         t = times[k]
@@ -1666,15 +1680,15 @@ _BLUR = """() => [...document.querySelectorAll('.blur')].map(el => { const r = e
 
 
 def _scripts(libs: tuple[str, ...]) -> str:
-    files = [name for lib in ("plot", "echarts", "lightweight") if lib in libs for name in LIBRARIES[lib]]
-    return "".join(f'<script src="{(VENDOR / name).as_uri()}"></script>' for name in files)
+    files = [name for lib in ("plot", "echarts", "lightweight", "geo") if lib in libs for name in LIBRARIES[lib]]
+    return "".join(f'<script src="{(VENDOR / name).as_uri()}"></script>' for name in dict.fromkeys(files))
 
 
 def _split_scene(card: Card, brand: BrandKit) -> tuple[str, str, str, Motion, tuple[str, ...]]:
     """The Bento card for a split chart: (css, body, script, motion, libraries)."""
     accent = brand.accent
     context = bool(card.context.get("value"))
-    footer = context or card.template in KEYED
+    footer = context or card.template in KEYED or (card.template in SOURCED and bool(card.source.strip()))
     header_h = HEADER_H if card.headline or card.entity or _kpi_row(card) is not None else HEADER_SLIM
     plot_h = CARD_H - header_h - (FOOTER_H if footer else 0)
     chart = CHARTS[card.template](card, accent, plot_h)
@@ -1735,9 +1749,13 @@ def scene(card: Card, brand: BrandKit) -> tuple[str, Motion, int, int, int]:
     and fades out over its last 0.4 s; a split chart's card stays whole and leaves with
     the panel (core.dynamic_layout slides it down)."""
     duration = max(0.5, card.end - card.start)
-    brand = with_entity(card, brand)
+    palette, accent = card_palette(card, brand)
+    if palette is None:
+        brand = with_entity(card, brand)
+    else:  # Round 40: a split card is built with the sentinel accent and remapped below
+        brand = _replace(brand, accent=SENTINEL if MODES[card.template] != "overlay" else accent)
     css, body, script, motion, libs = _build(card, brand)
-    motion.warp_to(_lead(card), ENTRANCE_END)  # Round 35: in and still by 1.2 s
+    warp(card, motion)  # Round 35: in and still by 1.2 s (Round 39: unless its items are said later)
     if MODES[card.template] == "overlay":
         width, height, top = FRAME_W, FRAME_H, 0
         gone = motion.story(duration - 1 / FPS)  # fully faded on the last frame, so nothing pops off
@@ -1748,11 +1766,36 @@ def scene(card: Card, brand: BrandKit) -> tuple[str, Motion, int, int, int]:
     page = (f"<!doctype html><html><head><meta charset='utf-8'><style>{_base_css(width, height)}{css}</style>"
             f"<script>{RUNTIME}window.NAV_WARP = {json.dumps(list(motion.warp))};</script>{_scripts(libs)}</head>"
             f"<body><div class='stage'>{body}</div><script>{script}</script></body></html>")
+    if palette is not None and MODES[card.template] != "overlay":
+        page = palette.remap(page, accent)
     return page, motion, width, height, top
+
+
+def card_palette(card: Card, brand: BrandKit) -> tuple[Any, str]:
+    """Round 40: (the clip's palette, or None for classic; the accent this card wears).
+    A Bento card wears the palette's accent, or its company's colour made readable on the
+    palette's card (never on nyt_archival: monochrome); the over-the-speaker glass pills
+    keep their dark glass and wear the palette's overlay accent (or the company's colour,
+    as before)."""
+    from core import palettes
+
+    palette = palettes.of(brand)
+    if palette is None:
+        return None, with_entity(card, brand).accent
+    entity = with_entity(card, brand).accent if card.entity else None
+    entity = entity if entity and entity != brand.accent else None
+    if MODES[card.template] == "overlay":
+        return palette, (entity if entity and palette.entity_colors else palette.overlay_accent)
+    return palette, palette.card_accent(entity)
 
 
 def _build(card: Card, brand: BrandKit) -> tuple[str, str, str, Motion, tuple[str, ...]]:
     """(css, body, script, motion, libraries) of a card, its way out not included."""
+    from core.proof_cards import BUILDERS as PROOF_BUILDERS  # Round 41: the Visual Proof overlays
+
+    if card.template in PROOF_BUILDERS:
+        css, body, motion = PROOF_BUILDERS[card.template](card, brand)
+        return css, body, "", motion, ()
     if MODES[card.template] == "overlay":
         css, body, motion = OVERLAYS[card.template](card, brand.accent)
         return css, body, "", motion, ()
@@ -1766,7 +1809,7 @@ def cues(card: Card, brand: BrandKit | None = None) -> list[tuple[float, str]]:
     if card.template == "speaker_title":
         return []
     motion = _build(card, with_entity(card, brand or BrandKit()))[3]
-    motion.warp_to(_lead(card), ENTRANCE_END)
+    warp(card, motion)
     found = [(0.0, "whoosh")] + [(round(motion.real(t), 4), kind) for t, kind in motion.cues]
     return sorted(found)
 
@@ -1777,38 +1820,88 @@ def _lead(card: Card) -> float:
     return FIRST + 0.1 if MODES[card.template] == "split" else 0.12
 
 
-def pace_reveals(card: Card) -> None:
-    """Round 33 (mutates ``card``): the card starts as its first item is said (no empty card
-    waiting for its words), and every item starts coming in within BUILD_SECONDS of the
-    first, in the order said (a list said slowly is drawn in quicker than it's said, so the
-    finished graphic can hold still long enough to read). Items with no time of their own
-    come in a beat after the one before. A context layer follows the last item."""
-    from core.card_checks import BUILD_SECONDS
+WORD_LEAD = 0.12  # Round 39: an item lands this long before its anchor word starts (t_word - 0.12 s)
+MAX_SPREAD = 15.0  # Round 39: a multi-part card whose points are further apart comes in on its last point
+RECAP_BEAT = 0.6  # ...with the earlier points landing as a recap this long before the last one's word
 
+
+def spoken_times(card: Card) -> list[float]:
+    """Every time something in the card is tied to a spoken word (source seconds): its
+    items, a range's second number, and a quote's words (core.card_checks sets them all)."""
+    times = [t for row in card.rows for t in (row.reveal_at, row.reveal_to) if t is not None]
+    if card.template == "headline_card":
+        times += [float(t) for t in card.context.get("cadence") or []]
+    return times
+
+
+RECAP_STEP = 0.25  # items with no word of their own (said before the card, or never) land this far apart
+
+
+def word_synced(card: Card) -> bool:
+    """Round 39: something in the card lands on a word said after the card is in (a later
+    step, the other side, the rest of a quote). Such a card is never played faster than
+    it's said: the Round 35 entrance time-warp would show those items before their words.
+    Items with no word of their own sit on pace_reveals' beat grid (as the card lands,
+    then every RECAP_STEP): those may still be played faster."""
+    base = card.start + _lead(card)
+
+    def on_grid(t: float) -> bool:
+        steps = (t - base) / RECAP_STEP
+        return abs(steps - round(steps)) * RECAP_STEP < 2e-3
+
+    return any(t - base > 0.05 and not on_grid(t) for t in spoken_times(card))
+
+
+def warp(card: Card, motion: Motion) -> Motion:
+    """The entrance time-warp (Round 35), only for a card whose items are all in as it lands."""
+    from core.edl import PROOF_TEMPLATES
+
+    if card.template in PROOF_TEMPLATES or word_synced(card):  # Round 41: proof cards keep their own clock
+        motion.warp = (0.0, 0.0, 1.0, 0.0)
+    else:
+        motion.warp_to(_lead(card), ENTRANCE_END)
+    return motion
+
+
+def pace_reveals(card: Card, earliest: float | None = None) -> None:
+    """Round 39 (mutates ``card``): strict word-level sync. Every item lands WORD_LEAD
+    before the word where it's said (``reveal_at`` comes in as that word, from
+    core.card_checks), never earlier, and the card comes in so its first item lands on
+    its word (a chart's panel slides in just before). Nothing is squeezed into a fixed
+    build time any more (Round 35's BUILD_SECONDS), so a step or a comparison side never
+    shows before it's said. A multi-part chart whose points are more than MAX_SPREAD
+    apart comes in on its last point instead (the comparison lands on its punchline): the
+    earlier points, already said, land as a recap RECAP_BEAT before it. Items with no word
+    of their own come in a beat after the one before; a context layer follows the last
+    item. ``earliest``: the card never starts before this (the hook)."""
     rows = card.rows
     if not rows or card.template == "speaker_title":
         return
     lead = _lead(card)
-    known = [t for row in rows for t in (row.reveal_at, row.reveal_to) if t is not None]
-    first = min(known) if known else card.start + lead
-    if first - card.start > lead:
-        card.start = round(first - lead, 3)
-    base = max(first, card.start + lead)
-    span = (max(known) - first) if known else 0.0
-    squeeze = min(1.0, BUILD_SECONDS / span) if span > 1e-9 else 1.0
-
-    def paced(t: float) -> float:
-        return round(base + (t - first) * squeeze, 3)
-
-    previous = None
+    anchors = [row.reveal_at for row in rows if row.reveal_at is not None]
+    if anchors:
+        land = min(anchors) - WORD_LEAD
+        if MODES[card.template] == "split" and len(rows) > 1 and max(anchors) - min(anchors) > MAX_SPREAD:
+            land = max(anchors) - WORD_LEAD - RECAP_BEAT - 0.25 * (len(rows) - 2)
+        start = land - lead
+        if earliest is not None:
+            start = max(start, earliest)
+        card.start = round(start, 3)
+    base = card.start + lead
+    previous, recap = None, 0
     for row in rows:
         if row.reveal_at is None:
-            row.reveal_at = round(min(base + BUILD_SECONDS, (previous if previous is not None else base - 0.25) + 0.25), 3)
+            row.reveal_at = round(base if previous is None else previous + RECAP_STEP, 3)
+        elif row.reveal_at - WORD_LEAD <= base + 1e-6:  # said before the card is in: a recap as it lands
+            row.reveal_at = round(base + RECAP_STEP * recap, 3)
+            recap += 1
         else:
-            row.reveal_at = paced(row.reveal_at)
+            row.reveal_at = round(row.reveal_at - WORD_LEAD, 3)  # on its word
         if row.reveal_to is not None:
-            row.reveal_to = max(paced(row.reveal_to), row.reveal_at + 0.25)
+            row.reveal_to = round(max(row.reveal_to - WORD_LEAD, row.reveal_at + 0.25), 3)
         previous = row.reveal_to if row.reveal_to is not None else row.reveal_at
+    if card.template == "headline_card" and card.context.get("cadence"):
+        card.context["cadence"] = [round(max(float(t) - WORD_LEAD, base), 3) for t in card.context["cadence"]]
     if card.context.get("reveal") is not None:
         card.context["reveal"] = round(max(t for row in rows for t in (row.reveal_at, row.reveal_to) if t is not None)
                                        + 0.4, 3)
@@ -1821,7 +1914,7 @@ def settle_time(card: Card) -> float:
         if card.template in DATA_CHARTS and not Path(card.data_path).is_file():
             return ENTRANCE_END
         motion = _build(card, BrandKit())[3]
-        motion.warp_to(_lead(card), ENTRANCE_END)
+        warp(card, motion)
         return round(motion.real(motion.last()), 3)
     except Exception:  # noqa: BLE001 - a card the builder can't draw is caught at render time
         return ENTRANCE_END
@@ -1845,21 +1938,28 @@ def compact(card: Card) -> Card | None:
 def render_card(card: Card, brand: BrandKit, out_dir: Path) -> Frames:
     """Render the card's animation to PNG frames in ``out_dir`` (reused when nothing
     changed). Raises CardRenderError when text doesn't fit or the accent can't be read."""
-    if contrast(brand.accent, CARD_BG) < MIN_CONTRAST:
-        raise CardRenderError(f"The accent {brand.accent} is too dark to read on the card "
-                              f"(contrast {contrast(brand.accent, CARD_BG):.1f}; needs {MIN_CONTRAST}). Pick a lighter one.")
+    palette, accent = card_palette(card, brand)
+    surface = palette.bg if palette is not None and MODES[card.template] != "overlay" else CARD_BG
+    if contrast(accent if palette is not None else brand.accent, surface) < MIN_CONTRAST:
+        shown = accent if palette is not None else brand.accent
+        raise CardRenderError(f"The accent {shown} is too dark to read on the card "
+                              f"(contrast {contrast(shown, surface):.1f}; needs {MIN_CONTRAST}). Pick a lighter one.")
+    canvas = palette.canvas if palette is not None else CANVAS
     if card.template == "candlestick_ema" and len(read_prices(card.data_path) if Path(card.data_path).is_file() else []) < 10:
         raise CardRenderError("The price chart needs a price file with at least 10 rows (open, high, low, close).")
     page, motion, width, height, top = scene(card, brand)
     duration = max(0.5, card.end - card.start)
     count = math.ceil(duration * FPS)
     tracks = motion.js(duration)
+    if palette is not None and MODES[card.template] != "overlay":
+        tracks = palette.remap_json(tracks, accent)
     key = hashlib.sha1(json.dumps([ENGINE, page, tracks, count]).encode()).hexdigest()[:14]
     folder = Path(out_dir).resolve() / f"card_{key}"
     meta = folder / "frames.json"
     if meta.is_file():
         data = json.loads(meta.read_text())
-        return Frames(str(folder / "f_%05d.png"), data["count"], width, height, top, [tuple(b) for b in data["blur"]])
+        return Frames(str(folder / "f_%05d.png"), data["count"], width, height, top, [tuple(b) for b in data["blur"]],
+                      canvas)
     folder.mkdir(parents=True, exist_ok=True)
     page_file = folder / "card.html"
     page_file.write_text(page, encoding="utf-8")
@@ -1899,4 +1999,10 @@ def render_card(card: Card, brand: BrandKit, out_dir: Path) -> Frames:
         finally:
             browser.close()
     meta.write_text(json.dumps({"count": count, "blur": blur}))
-    return Frames(str(folder / "f_%05d.png"), count, width, height, top, blur)
+    return Frames(str(folder / "f_%05d.png"), count, width, height, top, blur, canvas)
+
+
+# Round 36: the cards for geopolitics, politics, value chains, frameworks and theses
+from core import cards_niche as _niche  # noqa: E402 - it builds on everything above
+
+CHARTS.update(_niche.CHARTS)

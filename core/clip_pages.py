@@ -5,6 +5,8 @@ shows them. R2 bucket layout:
     <page>/page.json            who it's for, the video, each clip's start/end
     <page>/clip_01.mp4          the clip as rendered (what they download and post)
     <page>/poster_01.jpg        first frame shown before they press play
+    <page>/captions_01.srt      the captions file (Round 46)
+    <page>/cover_01.jpg         Round 49: the full-size cover image (the frame at 0.5 s, title on it)
     _events/<page>/<ms>_<type>_<clip>_<id>    one empty file per open/play/download
 
 Settings in .env (see claude_review/round16/README.md):
@@ -34,7 +36,9 @@ logger = logging.getLogger(__name__)
 
 PAGE_NAME = re.compile(r"[a-z0-9-]{6,80}")  # same rule as the Worker
 CLIP_FILE = re.compile(r"clip_(0[1-9])\.mp4")
-EVENT_TYPES = ("open", "play", "half", "end", "dl")
+EVENT_TYPES = ("open", "play", "half", "end", "dl", "copy", "offer", "srt", "cover", "social", "call")
+# Round 45: copied a post, opened the offer; Round 49: downloaded the captions file / the cover image;
+# Round 50: copied the Shorts & Reels caption, pressed "Request a call"
 _ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"  # no look-alikes (l/1, o/0)
 
 
@@ -137,6 +141,47 @@ def make_poster(clip: Path, output: Path, at: float | None = None) -> float:
     return seconds
 
 
+COVER_AT = 0.5  # Round 49: the hook frame, with the topic header already up (it shows from frame 0)
+COVER_WIDTH = 1080
+
+
+def covers_on() -> bool:
+    """Round 49: cover images on (CLIP_COVERS=0 turns them off; tests/run_all.py does for the
+    suites written before them, which check the exact files a page uploads)."""
+    return os.getenv("CLIP_COVERS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def make_cover(clip: Path, output: Path, at: float = COVER_AT) -> Path:
+    """The cover image clients upload as the post's thumbnail (LinkedIn, Instagram, Meta):
+    the clip's frame at ``at`` seconds, full size (1080x1920), as a high-quality JPEG."""
+    from core.poster import poster_jpeg
+
+    try:
+        output.write_bytes(poster_jpeg(clip, at, width=COVER_WIDTH, quality=2))
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        raise RuntimeError(f"Could not make the cover image: {exc}") from exc
+    return output
+
+
+def cover_path(clip: Path) -> Path:
+    """Where a clip's cover image is kept on this Mac: <clip>_cover.jpg next to it."""
+    clip = Path(clip)
+    return clip.with_name(f"{clip.stem}_cover.jpg")
+
+
+def _upload_cover(client: Any, settings: PageSettings, name: str, index: int, clip: Path) -> bool:
+    """Make the clip's cover (next to the clip, so the app can offer it too) and upload it as
+    cover_NN.jpg. False when it can't be made (the page then has no cover button)."""
+    try:
+        cover = make_cover(clip, cover_path(clip))
+    except RuntimeError:
+        logger.warning("No cover image for %s.", clip, exc_info=True)
+        return False
+    client.upload_file(str(cover), settings.bucket, f"{name}/cover_{index:02d}.jpg",
+                       ExtraArgs={"ContentType": "image/jpeg", "CacheControl": "no-cache"})
+    return True
+
+
 def _upload_poster(client: Any, settings: PageSettings, name: str, index: int, clip: Path, at: float | None) -> float:
     with tempfile.TemporaryDirectory() as temporary:
         poster = Path(temporary) / "poster.jpg"
@@ -150,12 +195,42 @@ def _upload_poster(client: Any, settings: PageSettings, name: str, index: int, c
 
 def _upload_clip(
     client: Any, settings: PageSettings, name: str, index: int, clip: Path, poster_at: float | None = None
-) -> None:
+) -> dict[str, bool]:
+    """Upload a clip and its extras. Returns the page.json flags for them ({"srt", "cover"})."""
     client.upload_file(
         str(clip), settings.bucket, f"{name}/clip_{index:02d}.mp4",
         ExtraArgs={"ContentType": "video/mp4", "CacheControl": "no-cache"},
     )
     _upload_poster(client, settings, name, index, clip, poster_at)
+    flags: dict[str, bool] = {}
+    srt = Path(clip).with_suffix(".srt")  # Round 46: the captions file (core.srt_export)
+    if srt.is_file():
+        client.upload_file(str(srt), settings.bucket, f"{name}/captions_{index:02d}.srt",
+                           ExtraArgs={"ContentType": "application/x-subrip; charset=utf-8", "CacheControl": "no-cache"})
+        flags["srt"] = True
+    if covers_on() and _upload_cover(client, settings, name, index, Path(clip)):  # Round 49
+        flags["cover"] = True
+    return flags
+
+
+def _social_for(clip: dict[str, Any]) -> dict[str, Any] | None:
+    """Round 50: the clip's Shorts & Reels caption (core.social_post), if written."""
+    if isinstance(clip.get("social"), dict):
+        return clip["social"]
+    try:
+        from core.social_post import read_for_clip
+
+        return read_for_clip(Path(clip["path"])) if clip.get("path") else None
+    except (KeyError, TypeError):
+        return None
+
+
+def _clip_entry(clip: dict[str, Any], flags: dict[str, bool]) -> dict[str, Any]:
+    """A clip's page.json entry: its times, its LinkedIn post and Shorts & Reels caption, and
+    which extras it has."""
+    return {"start": round(float(clip["start"]), 2), "end": round(float(clip["end"]), 2),
+            **({"post": post} if (post := _post_for(clip)) else {}),
+            **({"social": social} if (social := _social_for(clip)) else {}), **(flags or {})}
 
 
 def replace_poster(name: str, index: int, clip: Path, at: float | None) -> float:
@@ -166,12 +241,26 @@ def replace_poster(name: str, index: int, clip: Path, at: float | None) -> float
     return _upload_poster(client, settings, name, int(index), Path(clip), at)
 
 
+def _post_for(clip: dict[str, Any]) -> str:
+    """Round 45: the clip's ready-to-post LinkedIn caption (core.linkedin_post), if written."""
+    if clip.get("post"):
+        return str(clip["post"])[:3000]
+    try:
+        from core.linkedin_post import post_path
+
+        path = post_path(Path(clip["path"]))
+        return path.read_text(encoding="utf-8")[:3000] if path.is_file() else ""
+    except (OSError, KeyError, TypeError):
+        return ""
+
+
 def publish_page(
     channel_title: str,
     video_title: str,
     clips: list[dict[str, Any]],
     kind: str = "video",
     slug: str = "",
+    theme: str = "",
 ) -> tuple[str, str]:
     """Upload a pitch's clips and make its page. ``clips``: [{"path", "start", "end"}]
     in order. Returns (page name, page address). The page appears only once every
@@ -183,14 +272,15 @@ def publish_page(
     settings, client = _require()
     name = make_page_name(slug.strip() or channel_title)
     try:
-        for index, clip in enumerate(clips, start=1):
-            _upload_clip(client, settings, name, index, Path(clip["path"]))
+        flags = [_upload_clip(client, settings, name, index, Path(clip["path"]))
+                 for index, clip in enumerate(clips, start=1)]
         info = {
             "v": 1,
             "channel_title": channel_title,
             "video_title": video_title,
             "kind": "episode" if kind == "episode" else "video",
-            "clips": [{"start": round(float(c["start"]), 2), "end": round(float(c["end"]), 2)} for c in clips],
+            "clips": [_clip_entry(c, f) for c, f in zip(clips, flags)],
+            **({"theme": " ".join(theme.split())[:80]} if theme.strip() else {}),  # Round 46: their theme this month
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         client.put_object(
@@ -265,12 +355,21 @@ def replace_clip(
     index = int(match.group(1))
     settings, client = _require()
     _check_name(name)
-    _upload_clip(client, settings, name, index, Path(clip), poster_at)
-    if start is None or end is None:
-        return
+    flags = _upload_clip(client, settings, name, index, Path(clip), poster_at)
     info = json.loads(client.get_object(Bucket=settings.bucket, Key=f"{name}/page.json")["Body"].read())
     if 1 <= index <= len(info.get("clips", [])):
-        info["clips"][index - 1] = {"start": round(float(start), 2), "end": round(float(end), 2)}
+        # Round 49: the entry keeps its post and gets the new clip's extras. It used to be
+        # replaced by the times alone, so a trimmed clip lost its LinkedIn post, its captions
+        # file link and (now) its cover on the client's page.
+        entry = dict(info["clips"][index - 1])
+        old_times = {"start": entry.get("start", 0.0), "end": entry.get("end", 0.0)}
+        entry.update(_clip_entry({"path": str(clip), **old_times,
+                                  **({"start": start, "end": end} if start is not None and end is not None else {})},
+                                 flags))
+        for extra in ("srt", "cover"):
+            if not (flags or {}).get(extra):
+                entry.pop(extra, None)
+        info["clips"][index - 1] = entry
         client.put_object(
             Bucket=settings.bucket, Key=f"{name}/page.json", Body=json.dumps(info).encode(),
             ContentType="application/json", CacheControl="no-cache",
@@ -301,14 +400,29 @@ def remove_clip(name: str, index: int, expected_count: int) -> int:
             ContentType="application/json", CacheControl="no-cache",
         )
 
-    files = [(number, kind, extension) for number in range(index + 1, expected_count + 1)
-             for kind, extension in (("clip", "mp4"), ("poster", "jpg"))]
     info = read_page()
     clips = list(info.get("clips") or [])
+
+    def files_for(entries: list[Any]) -> list[tuple[int, str, str]]:
+        """The later clips' files: the clip and poster always; the captions file and cover
+        when the page lists them (Round 49: they used to stay behind under the old number,
+        so the clip that moved up showed the removed clip's captions)."""
+        out = []
+        for number in range(index + 1, expected_count + 1):
+            entry = entries[number - 1] if number - 1 < len(entries) and isinstance(entries[number - 1], dict) else {}
+            out += [(number, "clip", "mp4"), (number, "poster", "jpg")]
+            if entry.get("srt"):
+                out.append((number, "captions", "srt"))
+            if entry.get("cover"):
+                out.append((number, "cover", "jpg"))
+        return out
+
     moving = info.get("moving")
     if not moving and len(clips) == expected_count:
         # 1. Copy the later clips aside (the originals are untouched until step 2).
-        moving = {"index": index, "count": expected_count, "run": secrets.token_hex(4)}
+        files = files_for(clips)
+        moving = {"index": index, "count": expected_count, "run": secrets.token_hex(4),
+                  "files": [list(f) for f in files]}
         for number, kind, extension in files:
             client.copy_object(
                 Bucket=bucket, Key=f"{name}/_moving/{moving['run']}/{kind}_{number:02d}.{extension}",
@@ -319,6 +433,8 @@ def remove_clip(name: str, index: int, expected_count: int) -> int:
     if moving:
         if (moving.get("index"), moving.get("count")) != (index, expected_count):
             raise RuntimeError("Another clip removal on this page didn't finish. Refresh the app and try again.")
+        files = ([(int(n), str(k), str(e)) for n, k, e in moving["files"]] if moving.get("files")
+                 else [(n, k, e) for n in range(index + 1, expected_count + 1) for k, e in (("clip", "mp4"), ("poster", "jpg"))])
         # 2. Put them under their new numbers (repeatable: always from the copies).
         for number, kind, extension in files:
             client.copy_object(
@@ -333,8 +449,9 @@ def remove_clip(name: str, index: int, expected_count: int) -> int:
     # 3. The last number's files (now copies) and the set-aside copies go.
     client.delete_objects(
         Bucket=bucket,
-        Delete={"Objects": [{"Key": f"{name}/clip_{expected_count:02d}.mp4"},
-                            {"Key": f"{name}/poster_{expected_count:02d}.jpg"}], "Quiet": True},
+        Delete={"Objects": [{"Key": f"{name}/{kind}_{expected_count:02d}.{extension}"}
+                            for kind, extension in (("clip", "mp4"), ("poster", "jpg"), ("captions", "srt"), ("cover", "jpg"))],
+                "Quiet": True},
     )
     _delete_prefixes(client, settings, [f"{name}/_moving/"])
     return expected_count - 1
@@ -362,11 +479,57 @@ def delete_page(name: str) -> int:
     return _delete_prefixes(client, settings, [f"{name}/", f"_events/{name}/"])
 
 
-def page_activity() -> dict[str, dict[str, Any]]:
+OWNER_PATH = "_nav_owner"  # Round 51: the Worker marks the caller's network as yours
+
+
+def register_own_network(timeout: float = 8.0) -> str:
+    """Round 51: tell the Worker this Mac's network is yours, so your own views, plays, downloads
+    and copies are never counted (the app does this by itself when it starts). Returns the
+    network's short hash ('' when it couldn't)."""
+    settings = page_settings()
+    if settings is None:
+        return ""
+    request = urllib.request.Request(f"{settings.base_url}/{OWNER_PATH}?app=1",
+                                     headers={"user-agent": "nav-studios-app"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=_https_context()) as response:
+            return str(json.loads(response.read(2000) or b"{}").get("network") or "")
+    except Exception as exc:  # noqa: BLE001 - views still work; yours may count until the next try
+        logger.info("Couldn't mark this network as yours on the clip pages: %s", exc)
+        return ""
+
+
+def owner_link() -> str:
+    """The address to open once on your phone (mobile data) to mark it as yours."""
+    settings = page_settings()
+    return f"{settings.base_url}/{OWNER_PATH}" if settings else ""
+
+
+def _owner_networks(client: Any, settings: PageSettings) -> set[str]:
+    """The networks marked as yours (_me/<hash> in the bucket)."""
+    owners: set[str] = set()
+    token = None
+    while True:
+        kwargs = {"Bucket": settings.bucket, "Prefix": "_me/"}
+        if token:
+            kwargs["ContinuationToken"] = token
+        listing = client.list_objects_v2(**kwargs)
+        owners.update(item["Key"].split("/", 1)[1] for item in listing.get("Contents", []) if "/" in item["Key"])
+        if not listing.get("IsTruncated"):
+            return owners
+        token = listing.get("NextContinuationToken")
+
+
+def page_activity(since: datetime | None = None) -> dict[str, dict[str, Any]]:
     """What each page's visitor did: {"opens", "played", "half", "finished",
-    "downloaded" (clip numbers), "last" (datetime)}. One listing for all pages."""
+    "downloaded" (clip numbers), "last" (datetime)}. One listing for all pages.
+    Round 51: events from your own networks are left out, and so are events before ``since``."""
     settings, client = _require()
     activity: dict[str, dict[str, Any]] = {}
+    try:
+        owners = _owner_networks(client, settings)
+    except Exception:  # noqa: BLE001 - an older bucket or a listing hiccup: count everything
+        owners = set()
     token = None
     while True:
         kwargs = {"Bucket": settings.bucket, "Prefix": "_events/"}
@@ -385,11 +548,24 @@ def page_activity() -> dict[str, dict[str, Any]]:
                 clip = int(fields[2])
             except ValueError:
                 continue
+            if fields[3][:8] in owners or (since is not None and when < since):
+                continue  # Round 51: you, or before you started counting
             page = activity.setdefault(parts[1], {
                 "opens": 0, "played": set(), "half": set(), "finished": set(), "downloaded": set(), "last": None,
+                "copied": set(), "offer": 0, "opened_at": [], "offer_at": [], "assets": set(),
             })
             if fields[1] == "open":
                 page["opens"] += 1
+                page["opened_at"].append(when)  # Round 49: when each view happened (Sent's page views)
+            elif fields[1] == "offer":
+                page["offer"] += 1
+                page["offer_at"].append(when)
+            elif fields[1] in {"srt", "cover", "social"}:  # Round 49/50: took a file or the Reels caption
+                page["assets"].add((fields[1], clip))
+            elif fields[1] == "call":  # Round 50: opened an email asking for a call
+                page["call"] = page.get("call", 0) + 1
+            elif fields[1] == "copy":
+                page["copied"].add(clip)
             else:
                 {"play": page["played"], "half": page["half"], "end": page["finished"], "dl": page["downloaded"]}[fields[1]].add(clip)
             if page["last"] is None or when > page["last"]:
@@ -423,11 +599,117 @@ def describe_activity(page: dict[str, Any] | None, now: datetime | None = None) 
         parts.append(f"👀 Opened{times}, no plays yet")
     if page["downloaded"]:
         parts.append(f"⬇ downloaded {numbers(page['downloaded'])}")
+    if page.get("copied"):
+        parts.append(f"📋 copied the LinkedIn post for {numbers(page['copied'])}")
+    if page.get("offer"):
+        parts.append("💼 opened the offer")
+    if page.get("call"):
+        parts.append("📞 started a call request")
     if page["last"] is not None:
         delta = (now or datetime.now(timezone.utc)) - page["last"]
         hours = delta.total_seconds() / 3600
         parts.append("just now" if hours < 1 else f"{int(hours)} h ago" if hours < 48 else f"{int(hours // 24)} days ago")
     return " · ".join(parts)
+
+
+# ---------- Round 49: page views (the 📈 panel at the top of 📨 Sent) ----------
+VIEWS_SEEN_PATH = Path(__file__).resolve().parents[1] / "storage" / "page_views_seen.json"
+
+
+def views_seen_at() -> datetime | None:
+    """When you last marked the page views as seen (None: never)."""
+    try:
+        stamp = json.loads(VIEWS_SEEN_PATH.read_text(encoding="utf-8")).get("seen_at")
+        return datetime.fromisoformat(stamp) if stamp else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _views_state() -> dict[str, Any]:
+    try:
+        data = json.loads(VIEWS_SEEN_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_views_state(state: dict[str, Any]) -> None:
+    VIEWS_SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = VIEWS_SEEN_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state), encoding="utf-8")
+    temporary.replace(VIEWS_SEEN_PATH)
+
+
+def mark_views_seen(now: datetime | None = None) -> None:
+    _write_views_state({**_views_state(), "seen_at": (now or datetime.now(timezone.utc)).isoformat()})
+
+
+def views_count_from() -> datetime | None:
+    """Round 51: page views before this time are left out (None: all of them)."""
+    try:
+        stamp = _views_state().get("count_from")
+        return datetime.fromisoformat(stamp) if stamp else None
+    except (ValueError, TypeError):
+        return None
+
+
+def start_counting_now(now: datetime | None = None) -> None:
+    """Round 51: count page views from now on (earlier ones may include your own visits from
+    before your network was marked as yours)."""
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
+    _write_views_state({**_views_state(), "count_from": stamp, "seen_at": stamp})
+
+
+def views_feed(activity: dict[str, dict[str, Any]], pages: Iterable[dict[str, Any]],
+               seen_at: datetime | None = None) -> list[dict[str, Any]]:
+    """One row per page you sent ({"page_name", "title", "url", "source"}), with what its
+    visitor did, most recent activity first: views (page loads by them, not you: the app
+    opens pages with ?me=1), first/last view, plays, what they took, the offer, and "new"
+    (viewed since ``seen_at``)."""
+    rows: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for page in pages:
+        name = str(page.get("page_name") or "")
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        act = activity.get(name) or {}
+        opened = sorted(act.get("opened_at") or [])
+        took = []
+        if act.get("downloaded"):
+            took.append(f"video {', '.join(str(n) for n in sorted(act['downloaded']))}")
+        if act.get("copied"):
+            took.append(f"post {', '.join(str(n) for n in sorted(act['copied']))}")
+        for kind, label in (("social", "reels caption"), ("srt", "captions"), ("cover", "cover")):
+            numbers = sorted(n for k, n in act.get("assets") or () if k == kind)
+            if numbers:
+                took.append(f"{label} {', '.join(str(n) for n in numbers)}")
+        last = act.get("last")
+        rows.append({
+            "page_name": name, "title": str(page.get("title") or name), "url": str(page.get("url") or ""),
+            "source": str(page.get("source") or ""), "sent_at": str(page.get("sent_at") or ""),
+            "views": int(act.get("opens") or 0), "first_view": opened[0] if opened else None,
+            "last_view": opened[-1] if opened else None, "played": sorted(act.get("played") or ()),
+            "finished": sorted(act.get("finished") or ()), "took": took, "offer": int(act.get("offer") or 0),
+            "call": int(act.get("call") or 0),
+            "last": last, "new": bool(last and (seen_at is None or last > seen_at)),
+        })
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    rows.sort(key=lambda row: (row["last"] or epoch, row["sent_at"]), reverse=True)
+    return rows
+
+
+def ago(when: datetime | None, now: datetime | None = None) -> str:
+    if when is None:
+        return "—"
+    seconds = ((now or datetime.now(timezone.utc)) - when).total_seconds()
+    if seconds < 90:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min ago"
+    if seconds < 48 * 3600:
+        return f"{int(seconds // 3600)} h ago"
+    return f"{int(seconds // 86400)} days ago"
 
 
 # ---------- Setup check: .venv/bin/python -m core.clip_pages --check ----------

@@ -29,6 +29,18 @@ class Settings:
     caption_highlight: bool = True
     # Round 28: the graphics director adds each clip's graphics automatically.
     auto_graphics: bool = True
+    # Round 40: clips of 28 s+ open on a 2.5-4 s climax teaser from their back half when a
+    # strong hinge line is found (core.climax_hook). ENABLE_CLIMAX_HOOK=0 turns it off.
+    enable_climax_hook: bool = True
+    # Round 45 (core.executive): "executive_minimal" (default: no graphics, one lower-third
+    # ID), "none", or "full" (the creator graphics of rounds 28-41). VISUAL_OVERLAYS in .env.
+    visual_overlays: str = "executive_minimal"
+    # Round 45 (core.linkedin_post): a ready-to-post LinkedIn caption next to every clip.
+    linkedin_posts: bool = True
+
+    @property
+    def b2b_clean_mode(self) -> bool:
+        return self.visual_overlays != "full"
 
 
 def _float_env(name: str, default: float) -> float:
@@ -57,6 +69,9 @@ def load_settings() -> Settings:
         caption_highlight=os.getenv("CAPTION_HIGHLIGHT", "1").strip().lower()
         not in {"0", "false", "no", "off"},
         auto_graphics=os.getenv("AUTO_GRAPHICS", "1").strip().lower() not in {"0", "false", "no", "off"},
+        enable_climax_hook=os.getenv("ENABLE_CLIMAX_HOOK", "1").strip().lower() not in {"0", "false", "no", "off"},
+        visual_overlays=(os.getenv("VISUAL_OVERLAYS", "executive_minimal").strip().lower() or "executive_minimal"),
+        linkedin_posts=os.getenv("LINKEDIN_POSTS", "1").strip().lower() not in {"0", "false", "no", "off"},
     )
     for directory in (settings.raw_dir, settings.temp_dir, settings.output_dir):
         directory.mkdir(parents=True, exist_ok=True)

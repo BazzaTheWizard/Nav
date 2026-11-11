@@ -3,14 +3,18 @@
 - overlay graphics (a number or range, wireframe boxes): the speaker stays full-screen;
   the graphic's frames go over the video, and the video behind each box is blurred
   (the frosted-glass look) while the box is up.
-- split charts (24/76): the speaker in a band on top (the camera's whole width, so
-  two-person shots keep both people) and the chart below. Getting there is one camera
-  move, never a cross-fade (two sizes of the same face at once): the picture zooms out
-  and shrinks into the band while the dark panel slides up from the bottom edge; leaving,
-  the reverse. Those frames are drawn here with sub-pixel resampling (no FFmpeg rounding
-  wobble); the rest of the split view is FFmpeg.
-- While a graphic is up, the bold word-by-word captions give way to small, calm,
-  sentence-case captions near the bottom, so the number isn't shown twice.
+- split charts (Round 39: 54/46): the speaker keeps the top 54% of the frame (y 0-1040,
+  never under half), face-centred: the viewport follows the full-screen crop's centre
+  (``crop_at``), so the face stays big with natural headroom. A wide shot with no single
+  face to follow (two people, the blurred-background layouts) shows the whole picture
+  across the viewport over its own blurred copy. The compact card sits right under it,
+  bottom-anchored (core.cards). Getting there is one camera move, never a cross-fade (two
+  sizes of the same face at once): the picture zooms out into the viewport while the dark
+  panel slides up from the bottom edge; leaving, the reverse. Those frames are drawn here
+  with sub-pixel resampling (no FFmpeg rounding wobble); the rest of the split view is FFmpeg.
+- While a graphic is up, the bold word-by-word captions give way to calm sentence-case
+  ones: under a split chart, one bold 50 px line on the seam (the bottom of the speaker's
+  viewport, just above the card); over the speaker, one 44 px line near the bottom.
 - Leaving: every graphic slides down and fades over its last 0.4 s: no snap back.
 
 render_with_cards() checks every card (core.card_checks), renders the ones that pass
@@ -39,8 +43,12 @@ from core.video_renderer import _video_encoder_args
 FRAME_W, FRAME_H = 1080, 1920
 FONTS = Path(__file__).resolve().parents[1] / "assets" / "fonts"
 MOVE = 0.4  # seconds (10 frames at 25 fps, 12 at 30): the move into and out of the split view
-CAPTION_BOTTOM = 1440  # calm captions sit with their bottom here (above where apps cover the screen)
+CAPTION_BOTTOM = 1440  # calm captions (over-the-speaker graphics) sit with their bottom here
 CAPTION_CHARS = 30
+CALM_SIZE = 44  # px: the calm captions over the speaker (Round 39: was 40)
+SPLIT_CAPTION_SIZE = 50  # px, bold: the captions under a split chart (Round 39: on the seam, never tiny)
+SEAM_CAPTION_BOTTOM = SPLIT_TOP - 24  # their bottom: just above the card, over the speaker's chest
+SPLIT_CAPTION_CHARS = 28  # one line at 50 px
 BLUR = "boxblur=15:2"  # behind glass pills: two 31-px box passes, a Gaussian of about 12.6 px (CSS blur(12px), Round 31)
 
 
@@ -72,6 +80,10 @@ def _box_rows(card: Any) -> tuple[float, float, float] | None:
     if card.template == "stat_pill":
         top = parse_place(card.place)[1] if card.place else STAT_PILL_TOP
         return top, top + STAT_PILL_SIZE[1], 1.0
+    from core.proof_cards import PILL_H, PILL_TEMPLATES, pill_top
+
+    if card.template in PILL_TEMPLATES:  # Round 41: under the captions, in the 1320-1580 band
+        return float(pill_top(card.template)), float(pill_top(card.template) + PILL_H[card.template]), 1.0
     return None
 
 
@@ -91,7 +103,8 @@ def keeps_bold_captions(card: Any, edit: ClipEdit, seams: list[tuple[float, floa
     return all(bottom + CAPTION_CLEARANCE <= low or top >= high + CAPTION_CLEARANCE for low, high in bands)
 
 
-CALM_CAPTIONS = (CAPTION_BOTTOM - 70, CAPTION_BOTTOM + 12)  # one small line, box included
+CALM_CAPTIONS = (CAPTION_BOTTOM - 74, CAPTION_BOTTOM + 12)  # one small line, box included
+SPLIT_CAPTIONS = (SEAM_CAPTION_BOTTOM - 80, SEAM_CAPTION_BOTTOM + 10)  # one bold line on the seam, box included
 NAME_CARD_TOP_LIMIT, NAME_CARD_BOTTOM_LIMIT = 130, 1700  # the app's own bars cover the rest
 
 
@@ -112,8 +125,8 @@ def clear_of_captions(card: Any, edit: ClipEdit, seams: list[tuple[float, float]
     them, a little smaller if it has to be (Round 30). The placer already avoids them;
     this is the last check before drawing, so a card and a caption never overlap."""
     box = _box_rows(card)
-    if box is None:
-        return card.place
+    if box is None or card.template in ("brand_proof", "wiki_proof", "stat_proof"):
+        return card.place  # Round 41: a proof pill's band (1320-1580) is always under the captions
     x, top, scale, align = parse_place(card.place) if card.place or card.template == "speaker_title" \
         else (56.0, float(STAT_PILL_TOP), 1.0, "left")
     tall_at_one = (box[1] - box[0]) / box[2]
@@ -183,8 +196,10 @@ def calm_captions(words: list[Any], edit: ClipEdit, path: Path,
     place (not while it slides past them: Round 30)."""
     events: list[tuple[float, float, str]] = []
     on_seam: set[int] = set()
+    on_split: set[int] = set()
     for card in edit.cards:
         first_event = len(events)
+        limit = SPLIT_CAPTION_CHARS if MODES[card.template] == "split" else CAPTION_CHARS
         inside = [w for w in words if _during(w, card)]
         texts = _sentence_case([str(w.text).strip() for w in inside])
         group: list[tuple[Any, str]] = []
@@ -196,10 +211,10 @@ def calm_captions(words: list[Any], edit: ClipEdit, path: Path,
                 group.clear()
 
         for word, text in zip(inside, texts):
-            if group and len(" ".join(t for _, t in group)) + len(text) + 1 > CAPTION_CHARS:
+            if group and len(" ".join(t for _, t in group)) + len(text) + 1 > limit:
                 flush(group, card.start)
             group.append((word, text))
-            if text.endswith((".", "?", "!", ",")) and len(" ".join(t for _, t in group)) > CAPTION_CHARS * 0.6:
+            if text.endswith((".", "?", "!", ",")) and len(" ".join(t for _, t in group)) > limit * 0.6:
                 flush(group, card.start)
         flush(group, card.start)
         for k in range(len(events) - 1):  # each line stays until the next one (no flicker)
@@ -217,6 +232,7 @@ def calm_captions(words: list[Any], edit: ClipEdit, path: Path,
                 if end - start >= 0.25:
                     kept.append((start, end, text))
             events[first_event:] = kept
+            on_split.update(range(first_event, len(events)))
         if MODES[card.template] == "overlay":
             for k in range(first_event, len(events)):
                 middle = (events[k][0] + events[k][1]) / 2 - edit.start
@@ -229,14 +245,21 @@ def calm_captions(words: list[Any], edit: ClipEdit, path: Path,
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
         "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
         "MarginR, MarginV, Encoding",
-        f"Style: Calm,Inter,40,&H00FFFFFF,&H00FFFFFF,&H64000000,&H64000000,-1,0,0,0,100,100,0,0,3,9,0,2,90,90,{margin_v},1",
+        f"Style: Calm,Inter,{CALM_SIZE},&H00FFFFFF,&H00FFFFFF,&H64000000,&H64000000,-1,0,0,0,100,100,0,0,3,9,0,2,90,90,{margin_v},1",
+        # Round 39: under a split chart, one bold line on the seam (the bottom of the speaker's
+        # viewport), on a soft dark box: readable, and clear of the card and the apps' bars.
+        f"Style: Split,Inter,{SPLIT_CAPTION_SIZE},&H00FFFFFF,&H00FFFFFF,&H50000000,&H50000000,-1,0,0,0,100,100,0,0,3,10,0,2,"
+        f"70,70,{FRAME_H - SEAM_CAPTION_BOTTOM},1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     for k, (start, end, text) in enumerate(events):
         safe = text.replace("\\", "").replace("{", "(").replace("}", ")")
-        if k in on_seam:
+        style = "Calm"
+        if k in on_split:
+            safe, style = rf"{{\an2\pos(540,{SEAM_CAPTION_BOTTOM})}}" + safe, "Split"
+        elif k in on_seam:
             safe = r"{\an5\pos(540,960)}" + safe
-        lines.append(f"Dialogue: 0,{_ass_time(start - edit.start)},{_ass_time(end - edit.start)},Calm,,0,0,0,,{safe}")
+        lines.append(f"Dialogue: 0,{_ass_time(start - edit.start)},{_ass_time(end - edit.start)},{style},,0,0,0,,{safe}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
@@ -300,19 +323,75 @@ def _ease(p: float) -> float:
     return 4 * p ** 3 if p < 0.5 else 1 - (-2 * p + 2) ** 3 / 2
 
 
-def strip_crop_top(scaled_height: int) -> int:
-    """The first row (of the picture scaled to 1080 wide) the top band shows, exactly as
-    FFmpeg's crop places it: rounded, then down to an even row (4:2:0 video). Measured:
-    52 for a 16:9 source, 122 for 4:3. The move lands on this row, so it can't jump 1-2 px
-    when the steady view takes over."""
-    return max(0, int(np.rint((scaled_height - SPLIT_TOP) * 0.35)) & ~1)
+BAND_ASPECT = FRAME_W / SPLIT_TOP  # the speaker's viewport in a split view: 1080 x 1040 (Round 39)
+BAND_HEADROOM = 0.35  # a source taller than the viewport's shape: the crop sits a little above centre (heads sit high)
+
+
+def band_rect(width: int, height: int, cx: float | None = None) -> tuple[float, float, float, float]:
+    """Round 39: the source rectangle the speaker's viewport shows in a split view (x, y,
+    w, h; even, as FFmpeg crops it): the viewport's 1080:1040 shape at the camera's full
+    height, centred on ``cx`` (the face: the centre of the full-screen crop) and kept in
+    the frame. 16:9 1920x1080 -> 1120 x 1078 around the face, about 1.7x the face size of
+    the old 2.35:1 strip."""
+    w = int(min(float(width), height * BAND_ASPECT)) // 2 * 2
+    h = int(round(w / BAND_ASPECT)) // 2 * 2
+    centre = width / 2 if cx is None else cx
+    x = int(min(max(centre - w / 2, 0.0), width - w)) // 2 * 2
+    y = int(round((height - h) * BAND_HEADROOM)) // 2 * 2
+    return float(x), float(y), float(w), float(h)
 
 
 def strip_rect(width: int, height: int) -> tuple[float, float, float, float]:
-    """The source rectangle the top band shows (the camera's whole width; see compose_cards)."""
-    scaled = round(FRAME_W * height / width / 2) * 2
-    top = strip_crop_top(scaled)
-    return 0.0, top * width / FRAME_W, float(width), SPLIT_TOP * width / FRAME_W
+    """The viewport's rectangle with no face to follow: centred (see band_rect)."""
+    return band_rect(width, height)
+
+
+def wide_fit(width: int, height: int) -> tuple[int, int, int, int]:
+    """Round 39: a wide shot (no single face to follow) in the speaker's viewport: the whole
+    picture, as large as fits (x, y, w, h in output px; even, as FFmpeg's scale and overlay
+    place it), over its own blurred copy."""
+    if width <= 0 or height <= 0:
+        return 0, 0, FRAME_W, SPLIT_TOP
+    tall = round(FRAME_W * height / width / 2) * 2  # scale=1080:-2
+    if tall <= SPLIT_TOP:
+        w, h = FRAME_W, tall
+    else:
+        w, h = round(SPLIT_TOP * width / height / 2) * 2, SPLIT_TOP  # scale=-2:1040
+    return int((FRAME_W - w) / 2) // 2 * 2, int((SPLIT_TOP - h) / 2) // 2 * 2, w, h
+
+
+def band_centres(crop_at: Callable[[float], tuple[float, float, float, float] | None] | None,
+                 a: float, b: float, step: float = 0.2) -> list[tuple[float, float | None]]:
+    """(clip second, face centre x in source px, None for a wide shot) through a split
+    chart's window, in runs: a new entry only where the centre moves 8 px or more (or the
+    shot changes kind). What the viewport's crop follows."""
+    out: list[tuple[float, float | None]] = []
+    t = a
+    while t < b + 1e-9:
+        rect = crop_at(t) if crop_at else None
+        cx = None if rect is None else round((rect[0] + rect[2] / 2) / 8) * 8.0
+        if not out or (cx is None) != (out[-1][1] is None) or (cx is not None and abs(cx - out[-1][1]) >= 8):
+            out.append((round(t, 3), cx))
+        t += step
+    return out
+
+
+def centre_at(centres: list[tuple[float, float | None]], t: float) -> float | None:
+    """The viewport's face centre at clip second t (see band_centres)."""
+    cx = centres[0][1] if centres else None
+    for since, value in centres:
+        if since <= t + 1e-9:
+            cx = value
+    return cx
+
+
+def _x_expression(centres: list[tuple[float, float | None]], width: int, height: int) -> str:
+    """FFmpeg's crop x for the viewport, per frame (t: clip seconds), from band_centres."""
+    runs = [(since, int(band_rect(width, height, cx)[0])) for since, cx in centres]
+    expr = str(runs[-1][1])
+    for (_since, x), (until, _next) in reversed(list(zip(runs, runs[1:]))):
+        expr = f"if(lt(t,{until:.3f}),{x},{expr})"
+    return expr
 
 
 # The blurred-background layouts (see video_renderer): the whole camera picture, 1080 wide,
@@ -336,30 +415,29 @@ def picture_band(layout: str, width: int, height: int) -> tuple[float, float, fl
 
 
 def _band_frame(picture: np.ndarray, backdrop: np.ndarray, chart: np.ndarray | None, eased: float,
-                band: tuple[float, float, float, float]) -> np.ndarray:
+                band: tuple[float, float, float, float], canvas: str = CANVAS) -> np.ndarray:
     """One frame of the move for a blurred-background clip: the camera picture (1080 wide)
-    glides up from its place in the middle to the top band, trimming to the band's shape,
-    over the clip's own blurred background, while the panel slides up from the bottom.
-    The panel never touches the picture until both land."""
+    glides up from its place in the middle to its place in the speaker's viewport (Round 39:
+    the whole picture, centred in the top 1040 rows, as the steady wide view shows it), over
+    the clip's own blurred background, while the panel slides up from the bottom."""
     pic_h = picture.shape[0]
-    _x, band_top, _w, band_h = band
-    strip_top = float(strip_crop_top(pic_h))  # the steady view's crop of the picture
-    top = band_top * (1 - eased)
-    shown = band_h + (SPLIT_TOP - band_h) * eased
-    crop_top = strip_top * eased  # rows of the picture cut above, rising from 0 to the band's
+    _x, band_top, _w, _band_h = band
+    target = float(wide_fit(FRAME_W, pic_h)[1]) if pic_h <= SPLIT_TOP else 0.0
+    top = band_top + (target - band_top) * eased
     out = backdrop.copy()
-    first, last = int(np.floor(top)), min(FRAME_H, int(np.ceil(top + shown)))
+    first, last = int(np.floor(top)), min(FRAME_H, int(np.ceil(top + pic_h)))
     if last > first:
-        matrix = np.float32([[1, 0, 0], [0, 1, top - crop_top - first]])
+        matrix = np.float32([[1, 0, 0], [0, 1, top - first]])
         rows = cv2.warpAffine(picture, matrix, (FRAME_W, last - first), flags=cv2.INTER_LANCZOS4,
                               borderMode=cv2.BORDER_REPLICATE)
         out[first:last] = rows
-    return _panel(out, chart, FRAME_H + (SPLIT_TOP - FRAME_H) * eased)
+    return _panel(out, chart, FRAME_H + (SPLIT_TOP - FRAME_H) * eased, canvas)
 
 
-def _panel(out: np.ndarray, chart: np.ndarray | None, band: float) -> np.ndarray:
-    """The dark panel from row ``band`` down (a soft sub-pixel top edge), its chart on it."""
-    canvas = np.array([int(CANVAS[k:k + 2], 16) for k in (1, 3, 5)], np.uint8)
+def _panel(out: np.ndarray, chart: np.ndarray | None, band: float, color: str = CANVAS) -> np.ndarray:
+    """The panel from row ``band`` down (a soft sub-pixel top edge), its chart on it.
+    ``color``: the panel (Round 40: the clip's palette canvas; CANVAS for classic)."""
+    canvas = np.array([int(color[k:k + 2], 16) for k in (1, 3, 5)], np.uint8)
     edge = int(np.floor(band))
     if edge < FRAME_H:
         out[edge + 1:] = canvas
@@ -374,12 +452,14 @@ def _panel(out: np.ndarray, chart: np.ndarray | None, band: float) -> np.ndarray
 
 
 def _move_frame(source: np.ndarray, base: np.ndarray, chart: np.ndarray | None, eased: float,
-                start_rect: tuple[float, float, float, float] | None) -> np.ndarray:
+                start_rect: tuple[float, float, float, float] | None,
+                end_rect: tuple[float, float, float, float] | None = None, canvas: str = CANVAS) -> np.ndarray:
     """One frame of the move between the full-screen speaker (eased = 0) and the split
-    view (eased = 1): the speaker's picture zooms out and shrinks into the top band while
-    the panel slides up from the bottom. ``start_rect``: the source rectangle the clip
-    shows full screen; None when it's not a plain crop (the whole frame or the two-person
-    split), then the full-screen picture stays put and the panel slides up over it."""
+    view (eased = 1): the speaker's picture zooms out into the viewport (``end_rect``, the
+    steady view's crop: band_rect around the face) while the panel slides up from the
+    bottom. ``start_rect``: the source rectangle the clip shows full screen; None when it's
+    not a plain crop (the whole frame or the two-person split), then the full-screen
+    picture stays put and the panel slides up over it."""
     src_h, src_w = source.shape[:2]
     band = FRAME_H + (SPLIT_TOP - FRAME_H) * eased  # where the panel's top edge is
     out = np.empty((FRAME_H, FRAME_W, 3), np.uint8)
@@ -387,7 +467,7 @@ def _move_frame(source: np.ndarray, base: np.ndarray, chart: np.ndarray | None, 
         out[:] = base
     else:
         x0, y0, w0, h0 = start_rect
-        x1, y1, w1, h1 = strip_rect(src_w, src_h)
+        x1, y1, w1, h1 = end_rect or band_rect(src_w, src_h, x0 + w0 / 2)
         cx = (x0 + w0 / 2) + ((x1 + w1 / 2) - (x0 + w0 / 2)) * eased
         cy = (y0 + h0 / 2) + ((y1 + h1 / 2) - (y0 + h0 / 2)) * eased
         width = min(w0 * (w1 / w0) ** eased, src_h * FRAME_W / band, float(src_w))  # zoom out, stay in frame
@@ -400,7 +480,7 @@ def _move_frame(source: np.ndarray, base: np.ndarray, chart: np.ndarray | None, 
         out[:rows] = cv2.warpAffine(source, matrix, (FRAME_W, rows), flags=cv2.INTER_LANCZOS4,
                                     borderMode=cv2.BORDER_REPLICATE)
         out[rows:] = 0
-    return _panel(out, chart, band)
+    return _panel(out, chart, band, canvas)
 
 
 def _size(path: Path) -> tuple[int, int]:
@@ -414,7 +494,8 @@ def _size(path: Path) -> tuple[int, int]:
 
 def split_moves(source_video: Path, base_clip: Path, edit_start: float, a: float, b: float, chart: Frames,
                 crop_at: Callable[[float], tuple[float, float, float, float] | None] | None, folder: Path,
-                rate: Fraction, layout: str = "") -> list[tuple[int, int, str]]:
+                rate: Fraction, layout: str = "",
+                centres: list[tuple[float, float | None]] | None = None) -> list[tuple[int, int, str]]:
     """The frames of the move into (from ``a``) and out of (until ``b``) one split chart,
     as PNG sequences: [(first clip frame, frame count, pattern)]. Clip frames are
     n / ``rate``; the move takes MOVE seconds each way.
@@ -456,9 +537,15 @@ def split_moves(source_video: Path, base_clip: Path, edit_start: float, a: float
                 page_rgba = np.zeros((FRAME_H, FRAME_W, 4), np.uint8)
                 page_rgba[:page.shape[0], :, :] = cv2.cvtColor(page, cv2.COLOR_BGRA2RGBA)[:FRAME_H]
             if mode == "band":
-                frame = _band_frame(sources[j], bases[j], page_rgba, eased, band)
+                frame = _band_frame(sources[j], bases[j], page_rgba, eased, band, chart.canvas)
             else:
-                frame = _move_frame(sources[j] if sources else bases[j], bases[j], page_rgba, eased, rect)
+                end_rect = None
+                if mode == "crop":  # land exactly on the steady view's crop (the face it follows then)
+                    edge = times[-1] + 1 / float(rate) if rising else times[0] - 1 / float(rate)
+                    cx = centre_at(centres, edge) if centres else rect[0] + rect[2] / 2
+                    end_rect = band_rect(width, height, cx if cx is not None else rect[0] + rect[2] / 2)
+                frame = _move_frame(sources[j] if sources else bases[j], bases[j], page_rgba, eased, rect, end_rect,
+                                    chart.canvas)
             cv2.imwrite(str(folder / f"{name}_{j:03d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         made.append((start_frame, count, str(folder / f"{name}_%03d.png")))
     return made
@@ -495,13 +582,32 @@ def compose_cards(
     inputs = ["-i", str(base_clip)]
     graph = ["[0:v]format=yuv420p[v0]"]  # the clip's own frame rate: no repeated or dropped frames
     next_input = 1
+    centres: dict[int, list[tuple[float, float | None]]] = {}
     if splits:
         inputs += ["-ss", f"{edit.start:.3f}", "-t", f"{duration:.3f}", "-i", str(source_video)]
-        labels = "".join(f"[sp{k}]" for k in splits)
-        # The speaker's strip: a 2.35:1 band of the frame, a little above centre so heads
-        # (which sit high in an interview frame) aren't cut.
-        graph.append(f"[1:v]fps={rate},scale={FRAME_W}:{SPLIT_TOP}:force_original_aspect_ratio=increase:flags=lanczos,"
-                     f"crop={FRAME_W}:{SPLIT_TOP}:0:'(ih-oh)*0.35',setsar=1,split={len(splits)}{labels}")
+        src_w, src_h = _size(source_video)
+        labels = "".join(f"[src{k}]" for k in splits)
+        graph.append(f"[1:v]fps={rate},split={len(splits)}{labels}")
+        for k in splits:
+            # Round 39: the speaker's viewport, 1080 x 1040 (54% of the frame). Following a face:
+            # a crop of the camera around it (band_rect), its x following the full-screen crop
+            # frame by frame. A wide shot: the whole picture over its own blurred copy.
+            a, b = windows[k]
+            centres[k] = band_centres(crop_at, a, b)
+            if any(cx is not None for _t, cx in centres[k]) and src_w and src_h:
+                runs = centres[k]
+                first = next(cx for _t, cx in runs if cx is not None)
+                runs = [(t, cx if cx is not None else first) for t, cx in runs]  # a wide moment keeps the face's place
+                centres[k] = runs
+                _x, y, w, h = band_rect(src_w, src_h, first)
+                graph.append(f"[src{k}]crop={int(w)}:{int(h)}:'{_x_expression(runs, src_w, src_h)}':{int(y)},"
+                             f"scale={FRAME_W}:{SPLIT_TOP}:flags=lanczos,setsar=1[sp{k}]")
+            else:
+                x, y, w, h = wide_fit(src_w, src_h)
+                graph.append(f"[src{k}]split[wa{k}][wb{k}]")
+                graph.append(f"[wa{k}]{BLURRED_BACKDROP},crop={FRAME_W}:{SPLIT_TOP}:0:0[wbg{k}]")
+                graph.append(f"[wb{k}]scale={w}:{h}:flags=lanczos[wfg{k}]")
+                graph.append(f"[wbg{k}][wfg{k}]overlay={x}:{y},setsar=1[sp{k}]")
         next_input = 2
     current, n = "v0", 0
     order = sorted(range(len(edit.cards)), key=lambda k: edit.cards[k].start)
@@ -535,14 +641,15 @@ def compose_cards(
         else:
             # The canvas at the clip's own frame rate: at the graphics' 30 fps, a 25 fps
             # camera picture repeated one frame in five (a small, steady judder).
-            graph.append(f"color=c={_hex(CANVAS)}:s={FRAME_W}x{FRAME_H}:r={rate}:d={duration:.3f}[cv{k}]")
+            graph.append(f"color=c={_hex(seq.canvas)}:s={FRAME_W}x{FRAME_H}:r={rate}:d={duration:.3f}[cv{k}]")
             graph.append(f"[cv{k}][sp{k}]overlay=0:0[sb{k}]")
             graph.append(f"[sb{k}][{graphic}]overlay=0:{SPLIT_TOP}:eof_action=repeat[split{k}]")
             # The move in, the steady split view and the move out, joined into one stream
             # (frame-exact: the parts follow each other inside it), laid over the clip once.
             # Before, each part was its own overlay; at 24 fps one FFmpeg build showed one
             # frame of the plain clip between the move in and the chart.
-            moves = split_moves(source_video, base_clip, edit.start, a, b, seq, crop_at, work / f"move{k}", rate, layout)
+            moves = split_moves(source_video, base_clip, edit.start, a, b, seq, crop_at, work / f"move{k}", rate, layout,
+                                centres.get(k))
             if len(moves) == 2:
                 (first_in, count_in, in_pattern), (first_out, count_out, out_pattern) = moves
                 tick = f"{rate.denominator}/{rate.numerator}"
@@ -577,7 +684,9 @@ def compose_cards(
         track = audio_polish.cue_track(audio_polish.clip_cues(edit, windows), duration, work / "sfx.wav")
         if track is not None:
             inputs += ["-i", str(track)]
-            graph.append(f"[0:a][{next_input}:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]")
+            # Round 36: a 1 ms look-ahead limiter keeps a whoosh on a loud word under the -1.5 dBTP master
+            graph.append(f"[0:a][{next_input}:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+                         f"{audio_polish.SFX_LIMITER}[aout]")
             audio = ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
             next_input += 1
     command = [
@@ -655,5 +764,7 @@ def render_with_cards(
     quiet = ClipEdit(start=edit.start, end=edit.end, brand=edit.brand,
                      cards=[card for card in passed if not keeps_bold_captions(card, edit, seams)])
     base = render_base(words_outside(words, quiet))
-    calm = [w for w in words if any(_during(w, card) for card in quiet.cards)]
+    # Round 41: under a newspaper tear-out the headline is the caption (its words highlight as said)
+    calm = [w for w in words if any(_during(w, card) for card in quiet.cards)
+            and not any(_during(w, card) for card in quiet.cards if card.template == "newspaper_tearout")]
     return compose_cards(Path(base), source_video, keep, frames, calm, output, seams, crop_at, layout), checks

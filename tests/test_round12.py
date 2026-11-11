@@ -8,6 +8,7 @@ ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(ROOT))
 for name in ("SOURCE_MAX_HEIGHT", "AUDIO_TARGET_LUFS", "CAPTION_STYLE"):
     os.environ.pop(name, None)
+os.environ["CAPTION_STYLE"] = "bold"  # Round 48: the default when this suite was written (Round 45 made it linkedin_executive)
 
 fails = 0
 def check(name, cond, detail=""):
@@ -109,7 +110,7 @@ check("Split view now tagged Rec. 709 (it lost its tags before)",
 os.environ["AUDIO_TARGET_LUFS"] = "off"
 check("AUDIO_TARGET_LUFS=off: no loudness change", "loudnorm" not in V._audio_filter("ffmpeg", src, 0, 5))
 os.environ["AUDIO_TARGET_LUFS"] = "-16"
-check("AUDIO_TARGET_LUFS=-16 is used", "loudnorm=I=-16.0" in V._audio_filter("ffmpeg", src, 0, 5))
+check("AUDIO_TARGET_LUFS=-16 is used", "loudnorm=I=-16:" in V._audio_filter("ffmpeg", src, 0, 5))
 os.environ.pop("AUDIO_TARGET_LUFS")
 silent = tmp / "silent.mp4"
 subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "3", str(silent)], check=True)

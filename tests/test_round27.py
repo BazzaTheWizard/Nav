@@ -66,9 +66,10 @@ check("Signed values for waterfalls (+$3.2M, −$0.4M)",
       K.signed_value("+$3.2M") == 3.2 and K.signed_value("−$0.4M") == -0.4)
 check("Sentences split on . ? !", SPANS[0][2] == "Where's all this money going to come from?" and len(SPANS) == 6,
       str(len(SPANS)))
-check("The library: 18 graphics, 4 over the speaker and 14 charts (Round 29 added the fall-and-recovery curve, "
-      "Round 30 the micro-stat, Round 32 the comparison card and the step sequence, Round 35 the market chart)",
-      len(TEMPLATES) == 18 and sum(MODES[t] == "overlay" for t in TEMPLATES) == 4)
+check("The library: 23 graphics, 4 over the speaker and 19 charts (Round 29 added the fall-and-recovery curve, "
+      "Round 30 the micro-stat, Round 32 the comparison card and the step sequence, Round 35 the market chart, "
+      "Round 36 the map, odds, value chain, framework and tear-sheet)",
+      len(TEMPLATES) == 23 and sum(MODES[t] == "overlay" for t in TEMPLATES) == 4)
 
 # ---------- the checks: a breakdown chart (the S&P moment) ----------
 card_start, card_end = SPANS[2][0], SPANS[4][1] + 0.15
@@ -84,11 +85,12 @@ def sp_card(**over):
 good = sp_card()
 result = K.check_card(good, WORDS, CLIP_START, CLIP_END)
 check("The S&P chart passes", result.ok, str(result.errors))
-# Round 33: the first number comes in on its word; the rest follow in the order said, all within
-# BUILD_SECONDS, so the finished chart can then hold still long enough to read.
+# Round 39 (was Round 33's 1 s squeeze): every number lands on its own word (t_word - 0.12 s),
+# in the order said, never before it's said; the chart then holds still to be read.
 reveals = [r.reveal_at for r in good.rows]
-check("Each number appears in the order said, the first on its word, all within 1 s",
-      reveals[0] == at("$17") and reveals == sorted(reveals) and reveals[-1] - reveals[0] <= K.BUILD_SECONDS + 1e-6,
+check("Each number appears in the order said, each on its own word (t_word - 0.12 s), none early",
+      abs(reveals[0] - (at("$17") - 0.12)) < 1e-6 and reveals == sorted(reveals)
+      and abs(reveals[1] - (at("11") - 0.12)) < 1e-6 and reveals[-1] - reveals[0] > K.BUILD_SECONDS,
       str(reveals))
 
 
@@ -111,8 +113,9 @@ check("Nothing in the last 2 s (the payoff)", any("last 2 s" in e for e in bad),
 short = sp_card(rows=[CardRow("Top-line revenue", "$17T"), CardRow("Expenses", "~$11–12T", highlight=True)],
                 end=at("expenses") + 0.3)
 bad = errors_of(short)
-check("A chart set too short is lengthened to be read (Round 33: 5-6 s, 3.5 s of it still)",
-      not bad and K.MIN_CARD_SECONDS <= short.end - short.start <= 6.7, f"{bad} {short.end - short.start:.2f}")
+check("A chart set too short is lengthened to be read (still for READ_HOLD after its last number lands)",
+      not bad and short.end - short.start >= K.MIN_CARD_SECONDS
+      and short.end >= max(r.reveal_at for r in short.rows) + K.READ_HOLD, f"{bad} {short.end - short.start:.2f}")
 bad = errors_of(sp_card(rows=[CardRow("A label that is far too long to fit", "$17T"), CardRow("E", "~$11–12T")]))
 check("Character limits", any("label is" in e for e in bad), str(bad))
 bad = errors_of(sp_card(rows=[CardRow("Revenue", "$17T"), CardRow("Expenses", "~$11–12T"),
@@ -147,10 +150,10 @@ card, res, words = moment("There are three kinds of founders here: builders, the
                           "buckets", [CardRow("Builders"), CardRow("Sellers", dashed=True),
                                       CardRow("Operators", highlight=True)])
 ok["buckets"] = card
-check("B: boxes appear in order, the first on its word, all within 1 s (Round 33)", res.ok
-      and card.rows[0].reveal_at == at("builders", words)
-      and [r.reveal_at for r in card.rows] == sorted(r.reveal_at for r in card.rows)
-      and card.rows[-1].reveal_at - card.rows[0].reveal_at <= K.BUILD_SECONDS + 1e-6, str(res.errors))
+check("B: boxes appear in order, each on its own word (Round 39: t_word - 0.12 s)", res.ok
+      and abs(card.rows[0].reveal_at - (at("builders", words) - 0.12)) < 1e-6
+      and abs(card.rows[2].reveal_at - (at("operators", words) - 0.12)) < 1e-6
+      and [r.reveal_at for r in card.rows] == sorted(r.reveal_at for r in card.rows), str(res.errors))
 _, res, _ = moment("There are three kinds of founders here: builders, then sellers, and finally operators.",
                    "buckets", [CardRow("Operators"), CardRow("Builders")])
 check("B: boxes out of spoken order are stopped", not res.ok, str(res.errors))
@@ -256,8 +259,10 @@ ok["candlestick_ema"] = candle
 check("Price chart with a file and a source passes (flagged as drawn from the file)", res.ok and res.warnings, str(res.errors))
 ok["metric_bars"] = good
 check("Every graphic has a passing example (the micro-stat's is in test_round30, Round 32's cards in test_round32, "
-      "the market chart's in test_round35)",
-      set(ok) == set(TEMPLATES) - {"stat_pill", "comparison_card", "step_sequence", "market_line"}, str(set(TEMPLATES) - set(ok)))
+      "the market chart's in test_round35, Round 36's cards in test_round36)",
+      set(ok) == set(TEMPLATES) - {"stat_pill", "comparison_card", "step_sequence", "market_line", "geo_map_card",
+                                   "prediction_gauge_card", "flow_sankey_card", "framework_matrix_card", "headline_card"},
+      str(set(TEMPLATES) - set(ok)))
 
 # ---------- restraint: clip-wide caps and gaps ----------
 results = K.check_edit(ClipEdit(CLIP_START, CLIP_END, cards=[sp_card(), sp_card(start=card_start + 1),
@@ -279,7 +284,8 @@ kept = words_outside(WORDS, ClipEdit(CLIP_START, CLIP_END, cards=[straddle]))
 check("Bold captions drop every word that overlaps a graphic (even partly)",
       all(w.end <= straddle.start or w.start >= straddle.end for w in kept) and len(kept) < len(WORDS))
 ass = calm_captions(WORDS, ClipEdit(CLIP_START, CLIP_END, cards=[straddle]), tmp / "calm.ass").read_text()
-check("Calm captions: small, sentence case, during the graphic", "Style: Calm,Inter,40" in ass and "$17" in ass)
+check("Calm captions: sentence case, during the graphic (Round 39: one bold 50 px line on the seam under a chart)",
+      "Style: Calm,Inter,44" in ass and "Style: Split,Inter,50" in ass and ",Split,," in ass and "$17" in ass)
 
 # ---------- drawing every graphic ----------
 from PIL import Image  # noqa: E402
@@ -296,8 +302,8 @@ for template, card in ok.items():
 broken = {t: str(f) for t, f in drawn.items() if isinstance(f, Exception)}
 check("All 14 graphics draw", not broken, str(broken))
 sizes = {t: (f.width, f.height, f.top) for t, f in drawn.items() if not isinstance(f, Exception)}
-check("Over-the-speaker graphics are full frame; charts are the lower 76% (Round 28: 24/76 split)",
-      all(sizes[t] == ((1080, 1920, 0) if MODES[t] == "overlay" else (1080, 1460, 460)) for t in sizes), str(sizes))
+check("Over-the-speaker graphics are full frame; charts are the panel under the speaker (Round 39: 54/46 split)",
+      all(sizes[t] == ((1080, 1920, 0) if MODES[t] == "overlay" else (1080, 880, 1040)) for t in sizes), str(sizes))
 frames = drawn["metric_bars"]
 first, middle, last = (Image.open(frames.pattern % k) for k in (0, frames.count // 2, frames.count - 1))
 
@@ -311,7 +317,7 @@ def bright(img):
 
 # Round 31: the empty Bento card rides in with the panel (it's on frame 0); its data draws once it lands.
 check("Chart frames: the empty card on frame 0 (it rides in with the panel), the data drawn mid-way",
-      first.getpixel((540, 400))[3] == 255 and first.getpixel((10, 1200))[3] == 0 and bright(first) < 40
+      first.getpixel((540, 400))[3] == 255 and first.getpixel((10, 800))[3] == 0 and bright(first) < 40
       and bright(middle) > 2000, f"{first.getpixel((540, 400))} {bright(first)} {bright(middle)}")
 lt = drawn["speaker_title"]
 mid = Image.open(lt.pattern % (lt.count // 2))
@@ -436,9 +442,9 @@ into = frames_between(made, chart_start - 100.0 - 0.05, chart_start - 100.0 + 0.
 out_of = frames_between(made, chart_end - 100.0 - 0.6, chart_end - 100.0 + 0.1)
 edges_in, edges_out = [panel_edge(f) for f in into], [panel_edge(f) for f in out_of]
 check("Into the chart: the panel slides up from the bottom edge (never a cross-fade)",
-      edges_in[0] >= 1900 and edges_in[-1] <= 470 and all(b <= a for a, b in zip(edges_in, edges_in[1:]))
+      edges_in[0] >= 1900 and edges_in[-1] <= C.SPLIT_TOP + 10 and all(b <= a for a, b in zip(edges_in, edges_in[1:]))
       and len(set(edges_in)) >= 6, str(edges_in))
-check("Out of the chart: it slides back down", edges_out[0] <= 470 and edges_out[-1] >= 1900
+check("Out of the chart: it slides back down", edges_out[0] <= C.SPLIT_TOP + 10 and edges_out[-1] >= 1900
       and all(b >= a for a, b in zip(edges_out, edges_out[1:])), str(edges_out))
 check("No frame blends two pictures (no double face)",
       not any(blended(tuple(int(v) for v in f[75, 135])) for f in into + out_of))

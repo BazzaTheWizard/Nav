@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 sys.path.insert(0, str(ROOT))
+import core.outreach as _outreach_r44; _outreach_r44.LINK_IN_FIRST_EMAIL = False  # tests round 25's ask-first email (round 44: tests/test_round44.py)
 os.environ.pop("NAV_NO_CLIP_PAGES", None)  # this file uses a fake bucket
 for name in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET", "CLIP_PAGES_URL", "DRIVE_BACKUP"):
     os.environ[name] = ""  # set (empty) so your .env can't fill them in
@@ -302,7 +303,7 @@ wrapper.write_text(textwrap.dedent(f"""
                        ("SKIPPED_LEADS_PATH", "skipped.json"), ("LOCK_PATH", ".lock")):
         setattr(W, name, W.STORAGE_DIR / file)
     import core.clip_pages as C
-    C.page_activity = lambda: {{{record6['page_name']!r}: {{"opens": 2, "played": {{2}}, "half": set(), "finished": set(), "downloaded": set(), "last": None}}}}
+    C.page_activity = lambda since=None: {{{record6['page_name']!r}: {{"opens": 2, "played": {{2}}, "half": set(), "finished": set(), "downloaded": set(), "last": None}}}}
     import runpy
     runpy.run_path({str(ROOT / "app.py")!r}, run_name="__main__")
 """))

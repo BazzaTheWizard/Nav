@@ -218,11 +218,14 @@ check("Outbox: the record keeps clips 1 and 3, and notes the removed one (for tu
 check("Outbox: this Mac's files match", [c["start"] for c in PF.load_pitch.__wrapped__("a")["clips"]] == [100.0, 300.0]
       if hasattr(PF.load_pitch, "__wrapped__") else
       [c["start"] for c in json.loads((pitches / "a" / "pitch.json").read_text())["clips"]] == [100.0, 300.0])
+# Round 49: any clip can go, down to the last one (that one: Pass the creator instead).
+result = W.remove_pitch_clip("a", 1)
+check("Outbox: a 2-clip pitch can lose a clip too (Round 49)", result["count"] == 1 and len(calls) == 4, str(calls))
 try:
     W.remove_pitch_clip("a", 1)
-    check("Outbox: never below 2 clips (Pass the creator instead)", False)
+    check("Outbox: never the last clip (Pass the creator instead)", False)
 except ValueError as exc:
-    check("Outbox: never below 2 clips (Pass the creator instead)", "at least 2" in str(exc) and len(calls) == 2)
+    check("Outbox: never the last clip (Pass the creator instead)", "only clip" in str(exc) and len(calls) == 4)
 
 W._write_json_atomic(W.PENDING_OUTREACH_PATH, [outbox_record("b")])
 def page_down(*a):
@@ -350,9 +353,8 @@ check("After removing: 2 clips, and the email and subject boxes say 2",
       and "cut 2 vertical clips" in next(t for t in at.text_area if t.key == "pending_pitch_p9").value
       and not any(b.key == "remove_clip_p9_3" for b in at.button))
 check("...a pop-up says so", any("Clip 2 removed" in t.value for t in at.toast))
-check("...and with 2 left, Remove is off (Pass the creator to send fewer)",
-      all(b.disabled for b in at.button if (b.key or "").startswith("remove_off_p9_")) and
-      sum((b.key or "").startswith("remove_off_p9_") for b in at.button) == 2)
+check("...and with 2 left, each can still be removed (Round 49)",
+      all(any(b.key == f"remove_clip_p9_{i}" for b in at.button) for i in (1, 2)))
 
 print(f"\n{'All' if not fails else fails} {'checks passed' if not fails else 'check(s) failed'}")
 sys.exit(1 if fails else 0)

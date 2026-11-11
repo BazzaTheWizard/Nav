@@ -80,7 +80,7 @@ tl = C.scene(Card("timeline", S, S + 4, rows=[row("", "2014", at=0.9, detail="Fo
 check("A two-point timeline sets its dates at 76 px", "font-size: 76px" in tl)
 steps = C.scene(Card("step_sequence", S, S + 4, rows=[row("Find the market", at=0.6), row("Hire the team", at=1.4)]),
                 BrandKit())[0]
-check("Two or three steps at 60 px", "font-size: 60px" in steps)
+check("Two or three steps at 54 px (Round 39: sized to the compact card)", "font-size: 54px" in steps)
 kin = C.scene(Card("kinetic_range", S, S + 3, rows=[row("a year in fees", "$850–$1,700", True, 0.5)]), BrandKit())[0]
 check("The kinetic range's dash has the same gap on both sides", 'class="rest" style="display:inline-flex;gap:22px' in kin)
 
@@ -90,8 +90,9 @@ check("Figures, not years or names: $5T, 40%, 14X, 3 are figures; 2023, 1990S, Q
 spoken = [Word("It", 0.0, 0.3), Word("grew", 0.3, 0.6), Word("40%", 0.6, 1.0), Word("in", 1.0, 1.2)]
 ass = create_ass_subtitles(spoken, tmp / "c.ass").read_text()
 lines = [line for line in ass.splitlines() if line.startswith("Dialogue")]
-check("A figure is green while another word is spoken, yellow while it's spoken",
-      f"{{\\c{NUMBER_COLOUR}}}40%" in lines[0] and "{\\c&H00FFFF&" in lines[2] and f"{NUMBER_COLOUR}}}40%" not in lines[2])
+check("A figure is green while another word is spoken, and stays green with a 1.08x pop while it's spoken (Round 36)",
+      f"{{\\c{NUMBER_COLOUR}}}40%" in lines[0] and f"{{\\c{NUMBER_COLOUR}\\fscx108\\fscy108" in lines[2]
+      and "{\\c&H00FFFF&" in lines[1])
 os.environ["NUMBER_EMPHASIS"] = "off"
 plain = create_ass_subtitles(spoken, tmp / "d.ass").read_text()
 os.environ.pop("NUMBER_EMPHASIS")
@@ -228,8 +229,9 @@ share = Card("share_split", 116.5, 124.6, headline="S&P 500 Tech Exposure",
              rows=[CardRow("Tech + Google/Amazon", "47%", True), CardRow("Rest of the S&P 500", "53%")])
 res = K.check_card(share, share_words, 100.0, 153.0, 3.3)
 said_at = next(w.start for w in share_words if w.text == "47%")
-check("The S&P 500 clip's card: it comes in as its number is said, not 5 s early and empty",
-      res.ok and share.start >= said_at - 0.5 and share.rows[0].reveal_at - share.start <= 0.5,
+check("The S&P 500 clip's card: it comes in as its number is said, not 5 s early and empty (Round 39: lands at t_word - 0.12 s)",
+      res.ok and abs(share.rows[0].reveal_at - (said_at - 0.12)) < 1e-6
+      and abs(share.start + C._lead(share) - share.rows[0].reveal_at) < 1e-6,
       f"{res.errors} start {share.start:.2f}, said {said_at:.2f}")
 held = share.end - share.start - C.settle_time(share) - 0.4
 check("...it's on screen 4.5-6 s and holds completely still at least 3.5 s before it leaves",
@@ -240,8 +242,9 @@ slow_words = [Word(t, 104.0 + k * 0.45, 104.4 + k * 0.45) for k, t in enumerate(
     "payroll is $4.2M then hosting which honestly is a big line for us at $1.1M and ads were $0.9M".split())]
 res = K.check_card(slow, slow_words, 100.0, 140.0, 3.3)
 reveals = [r.reveal_at for r in slow.rows]
-check("Bars said over 7 s are all drawn within 1 s of the first (in the order said), not one every few seconds",
-      res.ok and reveals == sorted(reveals) and reveals[-1] - reveals[0] <= BUILD_SECONDS + 1e-6, f"{res.errors} {reveals}")
+said_bars = [next(w.start for w in slow_words if w.text == v) for v in ("$4.2M", "$1.1M", "$0.9M")]
+check("Bars said over 7 s: each drawn on its own word (Round 39: t_word - 0.12 s), never squeezed in early",
+      res.ok and all(abs(r - (w - 0.12)) < 1e-6 for r, w in zip(reveals, said_bars)), f"{res.errors} {reveals}")
 page, motion, *_ = C.scene(slow, BrandKit())
 check("...after which nothing in the card moves until it leaves (frames are reused, not redrawn)",
       not any(motion.moving(t) for t in np.arange(C.settle_time(slow) + 0.1, slow.end - slow.start - 0.4, 0.1)))

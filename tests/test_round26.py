@@ -72,7 +72,7 @@ wrapper.write_text(textwrap.dedent(f"""
     C.configured = lambda: True
     C.page_settings = lambda: SimpleNamespace(base_url={BASE!r})
     C.MANUAL_PAGES_PATH = Path({str(store / "manual_pages.json")!r})
-    C.page_activity = lambda: {{"dana-growth-k7m2qx": {{"opens": 1, "played": {{1}}, "half": set(), "finished": set(),
+    C.page_activity = lambda since=None: {{"dana-growth-k7m2qx": {{"opens": 1, "played": {{1}}, "half": set(), "finished": set(),
                                                         "downloaded": set(), "last": None}}}}
     calls = Path({str(store / "calls.json")!r})
     def fake_publish(channel, title, clips, kind="video", slug=""):

@@ -37,6 +37,7 @@ from typing import Any, Callable
 from core.card_checks import (HOOK_SECONDS, MAX_GRAPHICS, MIN_CARD_SECONDS, MIN_GAP, MIN_OVERLAY_SECONDS,
                               PAYOFF_SECONDS, chartable_numbers, check_edit, incidental_card, parse_value,
                               same_amount, spoken_numbers)
+from core import niche_director
 from core.edl import MODES, TEMPLATES, BrandKit, Card, ClipEdit, CardRow, sentences
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,8 @@ _GUESTS_LOCK = threading.Lock()  # Make clips renders two clips at once
 SHORT_CLIP_SECONDS = 25  # under this, one Bento visual (two otherwise)
 EARLIER_FACTS = 12  # numbers said elsewhere in the video, offered for a chart's context layer
 DIRECTED = tuple(t for t in TEMPLATES if t not in {"speaker_title", "candlestick_ema"})
-QUALITATIVE = ("comparison_card", "buckets", "step_sequence", "timeline")  # Tier 2
+QUALITATIVE = ("comparison_card", "buckets", "step_sequence", "timeline",  # Tier 2
+               "geo_map_card", "flow_sankey_card", "framework_matrix_card", "headline_card")  # Round 36
 _STOP = {"of", "the", "and", "at", "for", "in", "on", "a", "an", "to", "&"}
 
 SYSTEM_PROMPT = """You are the motion-graphics editor for vertical (9:16) clips cut from
@@ -83,8 +85,10 @@ RULES
    ("a million times"), a hypothetical unless the hypothetical is the point.
 4. Tier 2 (qualitative) when the clip has no chartable metric: show the speaker's core
    framework or contrast: comparison_card (two sides: then vs now, them vs us, the myth vs
-   what happened), buckets (2-3 named ideas), step_sequence (2-4 steps in order) or
-   timeline (2-4 moments). ALWAYS also give your best Tier 2 idea in "fallback", even when
+   what happened), buckets (2-3 named ideas), step_sequence (2-4 steps in order),
+   timeline (2-4 moments), framework_matrix_card (a 2x2 or a flywheel), flow_sankey_card
+   (a value chain), geo_map_card (countries in a trade, chip or conflict story) or
+   headline_card (one quotable rule or thesis, as a tear-sheet). ALWAYS also give your best Tier 2 idea in "fallback", even when
    there are Tier 1 visuals: it's used only if they fail the checks.
 5. Exact words. Write every number as it was said, same number and scale
    ("17 trillion dollars" -> "$17T"; "about 11 or 12 trillion" -> "~$11–12T"). If the
@@ -137,6 +141,32 @@ TEMPLATES (items: label, value, detail, parent, dashed, highlight)
   number as said); highlight = the side the point lands on.
 - step_sequence: chart (Tier 2). 2-4 items in the order said: label = the step in the
   speaker's words (≤24 chars), detail = optional (≤30 chars).
+- geo_map_card: chart (Tier 2). A map for geopolitics, trade, supply chains, sanctions,
+  war: 1-3 items, each a country the speaker names (label = the country), in the order
+  named; highlight the one the point lands on; value = a number only if said about that
+  country. context (optional): {"arcs": [[1, 2]]} draws a moving trade/capital line from
+  item 1 to item 2; {"stat": "gdp"|"population"|"inflation"|"gdp_growth"|"debt"|"exports"}
+  asks the app to show that World Bank figure next to each country (never write it yourself).
+- prediction_gauge_card: chart (Tier 1). Odds of an outcome (elections, a rate cut, a
+  deal closing): item 1 = the side the speaker's odds are for (label ≤14 chars, "Cut",
+  "Yes", a name), value = its odds as said ("70%"); item 2 optional = the other side,
+  value "" (the app shows the rest). Headline = the question (≤30 chars, "A December cut?").
+  If the speaker asks about odds without a number, give items with value "" and context
+  {"market": "<3-6 word Polymarket search>"}: the app fetches the live odds with the source.
+- flow_sankey_card: chart (Tier 2, or Tier 1 with amounts). A value chain or where money
+  goes: 2-5 items in order (label = a company or stage as said, ≤20 chars; detail = its
+  role, ≤22 chars, e.g. "Lithography"; value = an amount only if said, one unit). E.g.
+  "ASML makes the machines, TSMC the chips, NVIDIA designs them" -> ASML, TSMC, NVIDIA.
+- framework_matrix_card: chart (Tier 2). The speaker's model of how things work: a 2x2
+  (exactly 4 items in reading order: top-left, top-right, bottom-left, bottom-right;
+  context {"layout": "matrix", "x": "<axis, ≤18 chars>", "y": "<axis>"}) or a flywheel /
+  loop (3-4 items in order, context {"layout": "flywheel"}). label = the speaker's words
+  (≤24 chars), detail optional (≤30 chars).
+- headline_card: chart (Tier 2). A tear-sheet of one quotable line: 1 item, label = the
+  speaker's exact sentence (≤110 chars), value = the 2-5 words of it to highlight (must be
+  inside the quote), detail = the speaker's name if known. Optional context
+  {"topic": "<law, event or private company named>"}: the app adds a one-line Wikipedia
+  background with its source. Use it for a rule, a thesis or a prediction worth reading.
 Set highlight = true on the one item the point is about. Chart headline: 2-4 words, or "".
 
 IN CONTEXT (charts only, optional): a second, smaller layer under a number chart that
@@ -168,18 +198,20 @@ Return JSON only:
 RETRY_PROMPT = """
 
 SECOND LOOK: none of the visuals proposed for this clip passed the checks ({why}). Propose
-ONE qualitative visual (comparison_card, buckets, step_sequence or timeline) of the
+ONE qualitative visual (comparison_card, buckets, step_sequence, timeline, framework_matrix_card,
+flow_sankey_card, geo_map_card or headline_card) of the
 speaker's main contrast or framework, in their exact words, timed to the sentences where
 those words are said. Return {"graphics": [that one visual]}."""
 
 
 @dataclass(frozen=True)
-class VideoInfo:
+class VideoInfo:  # Round 46: + theme, the prospect's content-calendar angle (core.linkedin_harvester)
     """What the director knows about the whole video (for the name cards)."""
 
     title: str = ""
     channel: str = ""
     description: str = ""
+    theme: str = ""  # Round 46: what the prospect is covering this month ("" when unknown)
 
 
 @dataclass(frozen=True)
@@ -311,10 +343,11 @@ def proposals(answer: dict[str, Any], spans: list[tuple[float, float, str]],
         if not 1 <= first <= last <= len(spans):
             continue
         template = str(entry["template"])
+        context = (niche_director.niche_context(template, entry.get("context")) if template in niche_director.NICHE_TEMPLATES
+                   else _context(entry.get("context"), earlier) if MODES[template] == "split" else {})
         card = Card(template, start=spans[first - 1][0], end=spans[last - 1][1] + 0.15,
                     headline=str(entry.get("headline") or "").strip() if MODES[template] == "split" else "",
-                    rows=_rows(template, entry.get("items")),
-                    context=_context(entry.get("context"), earlier) if MODES[template] == "split" else {})
+                    rows=_rows(template, entry.get("items")), context=context)
         found.append((strength, card, str(entry.get("reason") or "").strip()))
     return sorted(found, key=lambda item: -item[0])
 
@@ -673,7 +706,7 @@ class _Picker:
         if incidental_card(card, self.words):
             self.note(f"Skipped {what}: its numbers are said in passing, not a metric.")
             return False
-        if card.context:  # time to read the layer under the chart (the checks drop it if there isn't)
+        if card.context.get("kind"):  # time to read the layer under the chart (the checks drop it if there isn't)
             card.end = max(card.end, min(card.end + 2.0, self.clip_end - PAYOFF_SECONDS - 0.05))
         errors: list[str] = []
         clash = False
@@ -708,7 +741,7 @@ class _Picker:
         self.chosen.append(card)
         self.chosen.sort(key=lambda c: c.start)
         self.note(f"Added {what} at {_clock(card.start - self.clip_start)}: {reason}")
-        if card.context:
+        if card.context.get("kind"):
             self.note(f"...with an 'in context' layer: {card.context.get('value')} {card.context.get('text')}")
         return True
 
@@ -757,6 +790,17 @@ def _brand_entities(cards: list[Card], notes: list[str]) -> None:
     from core import entity_enricher
 
     for card in cards:
+        if card.template == "flow_sankey_card":  # Round 36: each company in a value chain wears its own logo
+            for row in card.rows:
+                key = entity_enricher.card_entity(row.label)
+                if key:
+                    try:
+                        entity_enricher.enrich(key)
+                    except Exception as exc:  # noqa: BLE001 - a logo is a bonus
+                        logger.warning("Logo for %s failed: %s", key, exc)
+            continue
+        if card.template == "geo_map_card":
+            continue  # a map's colour is the brand's: no single company owns it
         if not card.entity:
             text = " ".join([card.eyebrow, card.headline] + [f"{r.label} {r.detail}" for r in card.rows])
             card.entity = entity_enricher.card_entity(text)
@@ -842,6 +886,9 @@ def direct(
         if isinstance(spare, dict) else []
     # Tier 1 first, and within it a chart (a Bento card: Plot, ECharts, Lightweight Charts) before a number
     # over the speaker; then the strongest.
+    for _strength, card, _reason in ideas + backup:  # Round 36: World Bank, Polymarket, Wikipedia, with sources
+        if card.template in niche_director.NICHE_TEMPLATES:
+            niche_director.enrich(card, direction.notes)
     ranked = sorted(ideas, key=lambda idea: (tier(idea[1]), MODES[idea[1].template] != "split", -idea[0])) + backup
     weak: list[tuple[int, Card, str]] = []
     for strength, card, reason in ranked:
@@ -851,6 +898,16 @@ def direct(
             weak.append((strength, card, reason))
             continue
         picker.offer(card, strength, reason)
+    # Round 36: maps and odds found in the transcript itself (countries around trade or war, "a 70% chance").
+    if len(picker.chosen) < limit:
+        try:
+            for strength, card, reason in niche_director.moments(clip_words, spans, clip_start, clip_end, hook,
+                                                                 PAYOFF_SECONDS):
+                if len(picker.chosen) >= limit:
+                    break
+                picker.offer(card, strength, f"from the transcript: {reason}")
+        except Exception as exc:  # noqa: BLE001 - a bonus idea, never a reason to fail
+            logger.warning("Niche moments failed: %s", exc)
     # Round 35: a market the speaker names without saying its numbers ("NVIDIA's run", "the
     # 2008 crash", "inflation") gets a chart of the real data, with its source (core.market_data).
     if len(picker.chosen) < limit:
@@ -892,6 +949,13 @@ def direct(
             direction.notes.append(f"Dropped {card.template}: {result.errors[0]}")
     bento = [c for c in edit.cards if c.template != "speaker_title"]
     _brand_entities(bento, direction.notes)
+    from core import visual_proof
+
+    if visual_proof.enabled():
+        # Round 41: the signature edit. At most one split-screen card, and only with a figure or a
+        # tight A-vs-B contrast; the speaker stays full-screen with floating proof cards and a
+        # newspaper tear-out instead of text summaries.
+        return visual_proof.apply(direction, clip_words, clip_start, clip_end, hook)
     if len(bento) < MIN_BENTO:
         direction.notes.append("No Bento visual: nothing in this clip passed the checks"
                                + (f" ({picker.errors[0]})" if picker.errors else "") + ".")

@@ -449,7 +449,7 @@ check("App runs", not at.exception, str([e.value for e in at.exception]))
 buttons = {getattr(b.proto, "label", ""): getattr(b.proto, "url", "") for b in at.get("link_button")}
 check("Big About page button, built from the channel id",
       buttons.get("📇 Open their About page") == f"https://www.youtube.com/channel/{channel_id}/about", str(buttons))
-check("Their clip page and Drive backup are the small pair", buttons.get("🌐 Their clip page") == PAGE and "📁 Drive backup" in buttons)
+check("Their clip page and Drive backup are the small pair", buttons.get("🌐 Their clip page") in (PAGE, PAGE + "?me=1") and "📁 Drive backup" in buttons)
 check("Found email still shown", any("dana@example.com" in m.value for m in at.markdown))
 open_key = f"trim_open_{rid}_1"
 check("Trim panel starts closed", not at.session_state[open_key] if open_key in at.session_state else True)

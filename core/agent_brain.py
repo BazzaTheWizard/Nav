@@ -11,6 +11,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from core import clip_length as L
 from core.service_pause import ServicePause
 from core.gemini_resilience import (
     gemini_thinking_config,
@@ -33,17 +34,24 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _JSON_CODE_BLOCK = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
 DEFAULT_CANDIDATE_COUNT = 5
 
-_SYSTEM_PROMPT = """You are an expert short-form video editor.
+_LEGACY_SYSTEM_PROMPT = """You are an expert short-form video editor.
 Analyze the supplied transcript and return one JSON object with:
 - "clips": exactly "candidate_count" items (given in the request), ranked best
   first, each with numeric start_time and end_time (seconds), hook_title (string,
   under 60 characters, shown on screen as the clip's hook), reason (string),
   point and usual_take (both described below).
-- Each clip's "point": what the speaker argues, reveals or shows in that clip and
-  why it lands, as one phrase (4–14 words, lowercase except names, no quotes)
-  that completes "Your point at 12:34 about ___ stuck with me". Use what they
-  actually say in that clip, e.g. "parents doing more teaching than any
-  classroom", not "parenting".
+- Each clip's "point": the one claim the speaker makes in that clip, as one
+  phrase (5–12 words, no quotes) that completes the cold email line "Your point
+  at 12:34 about ___ makes a great short". The host reads this line first, so it
+  must sound like something they'd recognize saying: use their own terms and
+  the concrete thing (a number, a named example, a specific mistake or rule),
+  not a summary of the theme. Good: "founders paying 2x for legal work they
+  could template", "a 6-month CAC payback being the real bar for Series A".
+  Bad: "the importance of good legal advice", "business complexity being the
+  root enemy rather than specific symptoms" (abstract, and an "X rather than Y"
+  the speaker never said). Never flip or sharpen their claim: if they say AI
+  should speed up prep, don't write "AI replacing understanding". Lowercase
+  except names; keep acronyms and proper nouns as written (AI, CAC, SaaS, IRS).
 - Each clip's "usual_take": only if that clip goes against a common belief, the
   subject of that belief in 1–4 words (lowercase except names) that completes
   "especially how it flips the usual take on ___", e.g. "homework" or
@@ -64,18 +72,22 @@ Analyze the supplied transcript and return one JSON object with:
   clip must capture a complete, self-contained thought with a strong hook,
   explanation, and natural conclusion. Use only transcript timestamps and do not invent dialogue.
 - "video_topic": the specific topic of this video as a short phrase (3–10 words,
-  lowercase except names), written to complete the sentence "Your recent video
-  on ___ stuck with me". Be specific to what the video actually
+  lowercase except names), written to complete the sentence "I cut 3 clips from
+  your recent episode on ___". Be specific to what the video actually
   covers, e.g. "squatting pain-free with knee arthritis", not "fitness".
 - "key_point": one specific insight, claim or story from this video as a short
-  phrase (5–15 words, lowercase except names, no quotes), written to complete
-  "Your point about ___ stuck with me". Use what the
+  phrase (5–12 words, lowercase except names, no quotes), written to complete
+  "Your point about ___ makes a great short". Use what the
   speaker actually says, e.g. "squatting below parallel being fine for healthy
   knees", not a generic summary.
 - "short_topic": what this video is about in 1–3 words (lowercase except
   names) that completes the email subject "3 Shorts from your ___ episode".
   Aim for 9–23 characters, e.g. "knee arthritis", "Michigan offense",
-  "early parenting". Never the channel name or the word "video"/"episode".
+  "startup law", "AI sales reps". Keep acronyms and names capitalized (AI, VC,
+  SaaS). It goes in a cold email subject, so keep it safe for a work inbox:
+  for sexual, violent or medical topics use a neutral word ("ethics",
+  "relationships", "health"). Never the channel name or the word
+  "video"/"episode".
 - "format": "episode" for a podcast, interview or conversation between two or
   more people; "video" for a solo or educational upload.
 - "host_first_name": the first name of the channel's host, only if the
@@ -101,6 +113,38 @@ Analyze the supplied transcript and return one JSON object with:
 
 The application writes the outreach email itself; do NOT return an email.
 Do not include markdown or extra commentary."""
+
+# Round 55 (core.clip_length): the length follows the idea, 35-180 s. CLIP_LENGTH=legacy
+# keeps Round 54's prompt word for word.
+_LEGACY_TARGET = """  Target a cohesive, high-retention 30–50 second self-contained story or
+  tactical breakdown."""
+_IDEA_TARGET = """  Target one complete idea: a self-contained story, argument or tactical
+  breakdown that runs as long as the speaker needs to land it, from 35 seconds up to
+  180 seconds (3 minutes). Never shorten a clip to hit a time: a 95-second clip that
+  lands its point beats a 50-second clip that stops before it."""
+_LEGACY_LENGTH = """  Every clip must be between 30 and 60 seconds long. Each
+  clip must capture a complete, self-contained thought with a strong hook,
+  explanation, and natural conclusion."""
+_IDEA_LENGTH = """- IDEA-COMPLETE BOUNDARIES: every clip is 35 to 180 seconds long. Stay with the
+  speaker until they fully land their thesis, argument or story resolution: end_time
+  is the end of that concluding sentence, or a natural topic transition (a clear
+  pause, the other person's next question). Never end on a question the speaker is
+  about to answer, partway through a list they announced ("three things..."), right
+  before a "but", "so that's why" or "which means" that delivers the point, or on the
+  other person's "yeah" or "exactly". start_time may include the host's short question
+  when the answer depends on it. If an idea runs past 180 seconds, choose its strongest
+  complete stretch instead. Each clip must capture a complete, self-contained thought
+  with a strong hook, explanation, and natural conclusion."""
+
+
+def _length_prompt(prompt: str) -> str:
+    if L.LEGACY:
+        return prompt
+    assert _LEGACY_TARGET in prompt and _LEGACY_LENGTH in prompt
+    return prompt.replace(_LEGACY_TARGET, _IDEA_TARGET).replace(_LEGACY_LENGTH, _IDEA_LENGTH)
+
+
+_SYSTEM_PROMPT = _length_prompt(_LEGACY_SYSTEM_PROMPT)
 
 
 def _format_transcript_segments(
@@ -175,8 +219,8 @@ GEMINI_TIMEOUT_MS = 120_000  # per request; picking clips from a 2-hour transcri
 
 
 def _validated_clips(result: dict[str, Any], transcript_start: float, transcript_end: float) -> list[dict[str, Any]]:
-    """Every well-formed candidate, in rank order. Snapping to sentences, the 30-60 s
-    rule and overlap checks happen in hook_selector.finalize_candidates."""
+    """Every well-formed candidate, in rank order. Snapping to sentences, the length rule
+    (core.clip_length) and overlap checks happen in hook_selector.finalize_candidates."""
     clips = result.get("clips")
     if not isinstance(clips, list) or not clips:
         raise ValueError("The AI response must contain a list of clips.")
@@ -328,13 +372,15 @@ For each numbered clip (its exact words), give three scores from 1 to 10:
 - hook: do the first one or two sentences give someone scrolling a reason to keep watching?
 - standalone: does it make sense to someone who has not seen the rest of the video?
   Score low if it relies on something said earlier.
-- payoff: does it end on a point, answer, story ending or punchline instead of trailing off?
+- payoff: does it end on a point, answer, story ending or punchline instead of trailing off?{idea_payoff}
 Return JSON only: {"scores": [{"clip": 1, "hook": 7, "standalone": 8, "payoff": 6}, ...]}
-with exactly one entry per clip."""
+with exactly one entry per clip.""".replace(
+    "{idea_payoff}", "" if L.LEGACY else "\n  Score low if it stops before the speaker finishes the point, or ends on someone\n"
+    "  else's \"yeah\". Long clips are fine when every part builds to the payoff.")
 # Per clip. Round 17: was 160, which cut the ending (the "payoff" score) off any clip
 # longer than ~54 s at the 177 words a minute these creators speak. 300 covers 60 s
-# at 300 words a minute.
-JUDGE_MAX_WORDS = 300
+# at 300 words a minute. Round 55: 650 (core.clip_length) so a 3-minute clip's ending is read.
+JUDGE_MAX_WORDS = L.JUDGE_MAX_WORDS
 
 
 def _judge_scores(result: dict[str, Any], count: int) -> list[int]:

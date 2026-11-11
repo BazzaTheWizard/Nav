@@ -174,7 +174,7 @@ blip = [(t / 2, 1005 + (330 if 6 <= t < 8 else 0)) for t in range(20)]
 check("A brief lean (1 s) doesn't", F._reframes(blip, 600, crop_w, frame_w, 100.0) == ())
 moving = F.CropPlan(2560, 1440, 810, 1440, 0, (F.Shot(100.0, 110.0, 600, True, False, None, ((103.0, 930),)),))
 expression = moving.x_expression(100.0, 110.0)
-check("The re-frame is an eased pan, not a jump", "between(t,3.000,3.800)" in expression and "(3-2*" in expression, expression)
+check("The re-frame is an eased pan, not a jump", "between(t,3.000,3.800)" in expression and "exp(" in expression, expression)
 check("No re-frames: the same expressions as before", F.CropPlan(2560, 1440, 810, 1440, 0, (
     F.Shot(100.0, 104.0, 600, True, False), F.Shot(104.0, 110.0, 900, True, False))).x_expression(100.0, 110.0)
     == "if(lt(t,4.000),600,900)")
@@ -354,11 +354,17 @@ check("Make clips and the worker: the graphics are decided and rendered in autom
       rendered.graphics is not None and [c.template for c in rendered.graphics.cards if c.template != "speaker_title"]
       == ["kinetic_range"] and rendered.path.is_file() and any("Added kinetic_range" in n for n in rendered.graphics_notes),
       str(rendered.graphics_notes))
-check("...the director sees the clip's own sentences, with clip times", asked and "S2 [" in asked[-1] and "$2 million" in asked[-1])
+# Rounds 49-50 also ask the AI for each clip's LinkedIn post and Shorts & Reels caption (same ask_ai,
+# prompts starting "Speaker:" / "Show:"); the graphics director's prompt is the one starting "Video title:".
+director = [prompt for prompt in asked if prompt.startswith("Video title:")]
+check("...the director sees the clip's own sentences, with clip times",
+      director and "S2 [" in director[-1] and "$2 million" in director[-1], [prompt[:60] for prompt in asked])
 asked.clear()
 off = P.render_selected_clip(plain_source, clip, spoken_talk, dataclasses.replace(settings, auto_graphics=False),
                              tmp / "out" / "off.mp4", layout_mode="blurred_background", graphics=INFO)
-check("AUTO_GRAPHICS=0 turns it off", off.graphics is None and not asked)
+check("AUTO_GRAPHICS=0 turns it off (the post and caption writers still run)",
+      off.graphics is None and not [prompt for prompt in asked if prompt.startswith("Video title:")],
+      [prompt[:60] for prompt in asked])
 G.ask_ai = lambda prompt, system: "not json"
 fallback = P.render_selected_clip(plain_source, clip, spoken_talk, settings, tmp / "out" / "plain.mp4",
                                   layout_mode="blurred_background", graphics=INFO)

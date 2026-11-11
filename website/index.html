@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nav Studios: LinkedIn video for B2B executives</title>
+<meta name="description" content="Your podcast and webinar appearances, turned into LinkedIn clips your executives are proud to post. Each clip comes with a written LinkedIn post and a Shorts &amp; Reels caption, delivered within 24 hours. See 3 free clips first.">
+<meta property="og:title" content="Nav Studios: LinkedIn video for B2B executives">
+<meta property="og:description" content="Clips from the podcasts, webinars and talks your executives already did. Captioned for sound-off, written up for LinkedIn, delivered within 24 hours.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://navstudiolab.com/">
+<meta property="og:image" content="https://navstudiolab.com/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0B0C10">
+<link rel="canonical" href="https://navstudiolab.com/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230B0C10'/%3E%3Crect x='11' y='6' width='10' height='20' rx='2.5' fill='none' stroke='%23FFE600' stroke-width='2.5'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0B0C10; --panel: #0F1117; --panel-2: #141721; --line: #1F2430; --line-2: #2A3040;
+    --text: #F2F3F5; --muted: #9097A3; --dim: #646B78; --accent: #FFE600; --ok: #4ADE80; --bad: #F87171;
+    --linkedin: #0A66C2;
+    --sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 400 16px/1.6 var(--sans); -webkit-font-smoothing: antialiased; }
+  a { color: inherit; }
+  img, svg { display: block; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+  .skip { position: absolute; left: -999px; top: 8px; background: var(--accent); color: #000; padding: 8px 12px; border-radius: 8px; z-index: 50; }
+  .skip:focus { left: 8px; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+  /* nav */
+  .nav { position: sticky; top: 0; z-index: 20; background: rgba(11,12,16,0.82); backdrop-filter: saturate(140%) blur(12px);
+         border-bottom: 1px solid transparent; transition: border-color .2s; }
+  .nav.scrolled { border-bottom-color: var(--line); }
+  .nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 64px; gap: 16px; }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; font-weight: 650; letter-spacing: -0.02em; font-size: 17px; white-space: nowrap; }
+  .brand-mark { width: 13px; height: 22px; border: 2.5px solid var(--accent); border-radius: 4px; }
+  .links { display: flex; gap: 22px; font-size: 14px; color: var(--muted); }
+  .links a { text-decoration: none; }
+  .links a:hover { color: var(--text); }
+
+  /* buttons */
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; font: 600 15px/1 var(--sans); text-decoration: none;
+         padding: 14px 20px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; cursor: pointer; }
+  .btn-primary { background: var(--accent); color: #0B0C10; }
+  .btn-primary:hover { background: #FFF06B; }
+  .btn-ghost { color: var(--text); border-color: var(--line-2); background: transparent; }
+  .btn-ghost:hover { border-color: #4A5266; background: var(--panel-2); }
+  .btn-sm { padding: 10px 16px; font-size: 14px; }
+
+  /* hero */
+  .hero { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 56px; align-items: center; padding: 64px 0 24px; }
+  .eyebrow { color: var(--accent); font-weight: 600; font-size: 14px; letter-spacing: 0.02em; margin: 0 0 16px; }
+  h1 { font-size: clamp(34px, 4.6vw, 54px); font-weight: 720; letter-spacing: -0.045em; line-height: 1.02; margin: 0; text-wrap: balance; }
+  .lead { color: var(--muted); font-size: 19px; max-width: 54ch; margin: 22px 0 0; }
+  .actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 30px; }
+  .ticks { display: flex; flex-wrap: wrap; gap: 8px 20px; list-style: none; padding: 0; margin: 26px 0 0; color: var(--muted); font-size: 14px; }
+  .ticks li { display: flex; align-items: center; gap: 8px; }
+  .ticks li::before { content: ""; width: 7px; height: 7px; border-radius: 2px; background: var(--accent); }
+
+  /* hero: real sample cuts (website/samples), playable */
+  .showcase { justify-self: center; width: 100%; max-width: 440px; scroll-margin-top: 80px; }
+  .showcase-label { display: flex; align-items: center; gap: 10px; margin: 0 0 14px; font-size: 14px; font-weight: 600;
+                    letter-spacing: 0.01em; color: var(--text); }
+  .showcase-label::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+  .reels { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  .reel { margin: 0; }
+  .reel:nth-child(2) { margin-top: 44px; }
+  .reel-frame { position: relative; aspect-ratio: 9 / 16; border-radius: 22px; overflow: hidden; background: #05060A;
+                border: 1px solid var(--line-2); box-shadow: 0 30px 70px rgba(0,0,0,0.5); }
+  .reel video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; cursor: pointer; }
+  .sound { position: absolute; right: 10px; bottom: 10px; width: 40px; height: 40px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.22);
+           background: rgba(11,12,16,0.62); backdrop-filter: blur(8px); color: #fff; display: grid; place-items: center; cursor: pointer; padding: 0; }
+  .sound:hover { background: rgba(11,12,16,0.85); }
+  .sound svg { width: 18px; height: 18px; }
+  .sound .on, .sound[aria-pressed="true"] .off { display: none; }
+  .sound[aria-pressed="true"] .on { display: block; }
+  .play-hint { position: absolute; inset: 0; display: none; place-items: center; pointer-events: none; }
+  .play-hint span { width: 58px; height: 58px; border-radius: 50%; background: rgba(11,12,16,0.62); backdrop-filter: blur(8px);
+                    border: 1px solid rgba(255,255,255,0.22); display: grid; place-items: center; }
+  .play-hint svg { width: 20px; height: 20px; margin-left: 3px; }
+  .reel.paused .play-hint { display: grid; }
+  .reel figcaption { margin-top: 10px; font-size: 13px; color: var(--muted); line-height: 1.35; }
+  .reel figcaption b { display: block; color: var(--text); font-weight: 560; font-size: 13.5px; }
+  .showcase-note { margin: 14px 0 0; font-size: 12.5px; color: var(--dim); }
+
+  /* sections */
+  section { padding: 88px 0 0; scroll-margin-top: 72px; }
+  h2 { font-size: clamp(26px, 3.4vw, 38px); font-weight: 690; letter-spacing: -0.035em; line-height: 1.1; margin: 0 0 10px; max-width: 24ch; text-wrap: balance; }
+  .sub { color: var(--muted); margin: 0 0 32px; max-width: 62ch; font-size: 17px; }
+  .why { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .stat { border: 1px solid var(--line); border-radius: 18px; padding: 24px; background: var(--panel); }
+  .stat b { display: block; font-size: 22px; font-weight: 680; letter-spacing: -0.03em; line-height: 1.2; margin-bottom: 8px; }
+  .stat p { margin: 0; color: var(--muted); font-size: 15px; }
+  .stat cite { display: block; margin-top: 12px; font-style: normal; font-size: 12.5px; color: var(--dim); }
+  .stat cite a { color: var(--dim); }
+
+  .steps { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; counter-reset: s; }
+  .steps li { counter-increment: s; border-top: 2px solid var(--line-2); padding: 20px 4px 0; color: var(--muted); }
+  .steps li::before { content: counter(s, decimal-leading-zero); display: block; color: var(--accent); font-weight: 650; font-size: 14px; margin-bottom: 10px; }
+  .steps strong { color: var(--text); display: block; font-weight: 640; font-size: 18px; letter-spacing: -0.02em; margin-bottom: 6px; }
+
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .item { border: 1px solid var(--line); border-radius: 18px; padding: 22px; background: var(--panel); }
+  .item h3 { margin: 0 0 6px; font-size: 17px; font-weight: 640; letter-spacing: -0.02em; }
+  .item p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  .compare { width: 100%; border-collapse: separate; border-spacing: 0; border: 1px solid var(--line); border-radius: 18px; overflow: hidden; background: var(--panel); font-size: 15px; }
+  .compare th, .compare td { text-align: left; padding: 16px 18px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .compare tr:last-child td { border-bottom: 0; }
+  .compare thead th { font-size: 14px; color: var(--muted); font-weight: 600; background: var(--panel-2); }
+  .compare thead th.us { color: var(--accent); }
+  .compare td.us { color: var(--text); font-weight: 560; background: rgba(255,230,0,0.04); }
+  .compare td { color: var(--muted); }
+  .compare td:first-child { color: var(--text); font-weight: 560; width: 22%; }
+  .table-scroll { overflow-x: auto; border-radius: 18px; }
+
+  .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .plan { border: 1px solid var(--line); border-radius: 22px; padding: 28px; background: var(--panel); display: flex; flex-direction: column; }
+  .plan.featured { border-color: var(--accent); }
+  .plan h3 { margin: 0 0 12px; font-size: 18px; font-weight: 650; letter-spacing: -0.02em; }
+  .tag { align-self: flex-start; font-size: 13px; font-weight: 650; color: #0B0C10; background: var(--accent); border-radius: 999px; padding: 4px 10px; margin-bottom: 14px; }
+  .amount { font-size: clamp(40px, 4.6vw, 54px); font-weight: 720; letter-spacing: -0.05em; line-height: 1; font-variant-numeric: tabular-nums; }
+  .amount small { font-size: 17px; color: var(--muted); font-weight: 500; letter-spacing: 0; }
+  .plan p { color: var(--muted); font-size: 15px; margin: 14px 0 22px; flex: 1; }
+  .plan .btn { width: 100%; }
+  .every { margin: 18px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px 24px; color: var(--muted); font-size: 15px; }
+  .every li { display: flex; gap: 10px; }
+  .every li::before { content: "✓"; color: var(--accent); font-weight: 700; }
+  .guarantee { margin-top: 18px; border: 1px dashed var(--line-2); border-radius: 18px; padding: 18px 22px; color: var(--muted); }
+  .guarantee b { color: var(--text); }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: center; border: 1px solid var(--line); border-radius: 24px;
+           padding: 36px; background: var(--panel); }
+  .split ul { margin: 0; padding-left: 18px; color: var(--muted); }
+  .split li { margin: 8px 0; }
+  .split li b { color: var(--text); font-weight: 600; }
+
+  /* form */
+  .request { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 40px; align-items: start; }
+  form { border: 1px solid var(--line-2); border-radius: 22px; padding: 28px; background: var(--panel); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  label { display: block; font-size: 14px; font-weight: 560; margin: 0 0 6px; }
+  label .opt { color: var(--dim); font-weight: 400; }
+  input, textarea { width: 100%; font: 400 15px/1.4 var(--sans); color: var(--text); background: var(--bg); border: 1px solid var(--line-2);
+                    border-radius: 12px; padding: 12px 14px; margin-bottom: 4px; }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { min-height: 88px; resize: vertical; }
+  .field { margin-bottom: 14px; }
+  .err { color: var(--bad); font-size: 13px; min-height: 18px; }
+  .hp { position: absolute; left: -9999px; }
+  .fine { color: var(--dim); font-size: 13px; margin: 12px 0 0; }
+  .status { display: none; margin-top: 14px; border-radius: 12px; padding: 14px 16px; font-size: 15px; }
+  .status.show { display: block; }
+  .status.ok { background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.35); }
+  .status.warn { background: rgba(255,230,0,0.06); border: 1px solid rgba(255,230,0,0.3); }
+  .status p { margin: 0 0 6px; }
+
+  .faq { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 40px; }
+  details { border-bottom: 1px solid var(--line); padding: 18px 0; }
+  summary { cursor: pointer; font-weight: 600; font-size: 16.5px; list-style: none; display: flex; justify-content: space-between; gap: 16px; }
+  summary::-webkit-details-marker { display: none; }
+  summary::after { content: "+"; color: var(--accent); font-weight: 600; }
+  details[open] summary::after { content: "–"; }
+  details p { color: var(--muted); margin: 10px 0 0; }
+
+  .closing { text-align: center; padding: 96px 0 0; }
+  .closing h2 { margin: 0 auto 12px; }
+  .closing .sub { margin: 0 auto 28px; }
+  .closing .actions { justify-content: center; }
+  footer { color: var(--dim); font-size: 13px; padding: 72px 0 48px; }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: space-between; border-top: 1px solid var(--line); padding-top: 24px; }
+  footer a { color: var(--muted); }
+
+  @media (max-width: 920px) {
+    .links { display: none; }
+    .hero { grid-template-columns: 1fr; padding: 40px 0 8px; gap: 44px; }
+    .showcase { max-width: 460px; }
+    .why, .steps, .grid, .plans, .request, .split, .faq { grid-template-columns: 1fr; }
+    .every { grid-template-columns: 1fr; }
+    .split { padding: 24px; }
+    section { padding-top: 64px; }
+  }
+  @media (max-width: 520px) {
+    .wrap { padding: 0 16px; }
+    .row { grid-template-columns: 1fr; }
+    .reels { gap: 12px; }
+    .reel:nth-child(2) { margin-top: 28px; }
+    .reel-frame { border-radius: 16px; }
+    .sound { width: 36px; height: 36px; right: 8px; bottom: 8px; }
+    .nav .btn { padding: 9px 13px; }
+  }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<nav class="nav" id="nav"><div class="wrap">
+  <a class="brand" href="#top"><span class="brand-mark" aria-hidden="true"></span>Nav Studios</a>
+  <div class="links">
+    <a href="#samples">Samples</a><a href="#how">How it works</a><a href="#included">What you get</a><a href="#pricing">Pricing</a><a href="#agencies">Agencies</a><a href="#faq">FAQ</a>
+  </div>
+  <a class="btn btn-primary btn-sm" href="#free">Get 3 free clips</a>
+</div></nav>
+
+<main id="main">
+<div class="wrap" id="top">
+  <header class="hero">
+    <div>
+      <p class="eyebrow">The LinkedIn video desk for B2B executives</p>
+      <h1>Your podcast and webinar appearances, turned into LinkedIn clips your executives are proud to post.</h1>
+      <p class="lead">Nothing to record and nothing to upload. We find the strongest moments in what your executives already said, cut them for sound-off viewing, write the LinkedIn post, and deliver within 24 hours.</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="#free">Get 3 free clips</a>
+        <a class="btn btn-ghost" href="#pricing">See plans</a>
+      </div>
+      <ul class="ticks">
+        <li>See finished clips before any call</li>
+        <li>No logins or access needed</li>
+        <li>Month to month</li>
+      </ul>
+    </div>
+    <div class="showcase" id="samples" role="region" aria-labelledby="samples-h">
+      <p class="showcase-label" id="samples-h">Sample executive cuts</p>
+      <div class="reels">
+        <figure class="reel">
+          <div class="reel-frame">
+            <video muted autoplay loop playsinline preload="metadata" poster="samples/sample-how-i-invest.jpg" aria-label="Sample cut from How I Invest: The #1 mistake in business sales">
+              <source src="samples/sample-how-i-invest.mp4" type="video/mp4">
+            </video>
+            <div class="play-hint" aria-hidden="true"><span><svg viewBox="0 0 24 24" fill="#fff" aria-hidden="true"><path d="M7 4.5v15l13-7.5z"/></svg></span></div>
+            <button class="sound" type="button" aria-pressed="false" aria-label="Turn sound on: The #1 mistake in business sales"><svg class="off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="m22 9-6 6M16 9l6 6"/></svg><svg class="on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
+          </div>
+          <figcaption><b>The #1 mistake in business sales</b>Sample cut from How I Invest</figcaption>
+        </figure>
+        <figure class="reel">
+          <div class="reel-frame">
+            <video muted autoplay loop playsinline preload="metadata" poster="samples/sample-y-combinator.jpg" aria-label="Sample cut from Y Combinator: Why software outsourcing shops are dead">
+              <source src="samples/sample-y-combinator.mp4" type="video/mp4">
+            </video>
+            <div class="play-hint" aria-hidden="true"><span><svg viewBox="0 0 24 24" fill="#fff" aria-hidden="true"><path d="M7 4.5v15l13-7.5z"/></svg></span></div>
+            <button class="sound" type="button" aria-pressed="false" aria-label="Turn sound on: Why software outsourcing shops are dead"><svg class="off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="m22 9-6 6M16 9l6 6"/></svg><svg class="on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
+          </div>
+          <figcaption><b>Why software outsourcing shops are dead</b>Sample cut from Y Combinator</figcaption>
+        </figure>
+      </div>
+      <p class="showcase-note">Spec edits from public episodes, cut by our pipeline to show the style. Not client work. Tap the speaker for sound.</p>
+    </div>
+  </header>
+</div>
+
+<div class="wrap">
+  <section id="why" aria-labelledby="why-h">
+    <h2 id="why-h">LinkedIn is where B2B buyers watch video now</h2>
+    <p class="sub">Real executives talking on video is the format LinkedIn rewards. Most teams already have the recordings and no time to cut them.</p>
+    <div class="why">
+      <div class="stat">
+        <b>LinkedIn is the top channel for B2B video</b>
+        <p>81% of businesses call LinkedIn their primary video channel, ahead of YouTube, and it's the top channel for repurposed clips.</p>
+        <cite>Wistia 2026 State of Video · <a href="https://ppc.land/linkedin-beats-youtube-as-top-b2b-video-channel-wistia-report-finds/" rel="noopener" target="_blank">summary</a></cite>
+      </div>
+      <div class="stat">
+        <b>Generic AI content gets less reach</b>
+        <p>LinkedIn says its systems now catch generic, low-effort AI content and limit how far it spreads. Real people saying real things is what travels.</p>
+        <cite>LinkedIn, May 2026 · <a href="https://news.linkedin.com/2026/keeping-conversations-real-on-linkedin" rel="noopener" target="_blank">source</a></cite>
+      </div>
+      <div class="stat">
+        <b>People reach further than company pages</b>
+        <p>Posts from people reach far more of the feed than posts from company pages. Your executives are your best distribution.</p>
+        <cite>2025 LinkedIn Algorithm Insights Report · <a href="https://www.writtenlyhub.com/news/linkedin-engagement-down-50-algorithm-insights-report-2025" rel="noopener" target="_blank">summary</a></cite>
+      </div>
+    </div>
+  </section>
+
+  <section id="how" aria-labelledby="how-h">
+    <h2 id="how-h">How it works</h2>
+    <p class="sub">Your executives keep doing podcasts, webinars and talks. We turn each one into a week of LinkedIn posts.</p>
+    <ol class="steps">
+      <li><strong>We find the recording</strong>We pick up your published episodes and webinars, or you send a file or a link. Nobody on your side records anything new.</li>
+      <li><strong>We cut and write</strong>The moments worth posting, chosen and checked by a person, captioned for sound-off, each with its LinkedIn post. Grouped by your monthly themes.</li>
+      <li><strong>You post</strong>Everything arrives within 24 hours: the clips, the posts, the captions and covers. Ask for any change and we re-cut it.</li>
+    </ol>
+  </section>
+
+  <section id="included" aria-labelledby="included-h">
+    <h2 id="included-h">What every clip comes with</h2>
+    <p class="sub">Ready to post the moment it arrives. Professional, accurate and consistent with your brand.</p>
+    <div class="grid">
+      <div class="item"><h3>A vertical clip, cut by a person</h3><p>The moment an executive would want to be known for, 35 seconds to 3 minutes long: it starts where the idea starts and ends when they've landed the point. Never cut off to hit a time limit.</p></div>
+      <div class="item"><h3>A LinkedIn post</h3><p>A hook, three takeaways in the speaker's own words and a closing question that invites comments. Nothing invented.</p></div>
+      <div class="item"><h3>A Shorts &amp; Reels caption</h3><p>A title, a description and a handful of fitting hashtags for YouTube Shorts, Instagram Reels and TikTok.</p></div>
+      <div class="item"><h3>Executive captions</h3><p>Calm two-line captions in sentence case, synced to the voice. No bouncing, all-caps creator styling.</p></div>
+      <div class="item"><h3>A steady, brand-safe edit</h3><p>The speaker full-screen with a still camera, a short topic header, and a name and title only when we've confirmed who's speaking.</p></div>
+      <div class="item"><h3>A captions file and a cover</h3><p>An .srt file for native LinkedIn captions and a cover image for every clip. No watermark: everything is yours.</p></div>
+    </div>
+  </section>
+
+  <section id="compare" aria-labelledby="compare-h">
+    <h2 id="compare-h">Done for you, at a fraction of an agency</h2>
+    <p class="sub">Clipping apps leave the judging, fixing and posting with your team. Full-service podcast agencies do it all at agency prices. We sit in between.</p>
+    <div class="table-scroll">
+      <table class="compare">
+        <thead><tr><th scope="col"></th><th scope="col" class="us">Nav Studios</th><th scope="col">AI clipping apps</th><th scope="col">Podcast agencies</th></tr></thead>
+        <tbody>
+          <tr><td>Who does the work</td><td class="us">We do, start to finish</td><td>Your team picks, fixes and posts</td><td>They do</td></tr>
+          <tr><td>Who picks the moments</td><td class="us">A person, for an executive audience</td><td>An algorithm's score</td><td>An editor</td></tr>
+          <tr><td>LinkedIn post with every clip</td><td class="us">Yes, from the speaker's own words</td><td>AI-written, if any</td><td>Sometimes</td></tr>
+          <tr><td>Delivery</td><td class="us">Within 24 hours</td><td>Instant, then your edits</td><td>Days to weeks</td></tr>
+          <tr><td>Price</td><td class="us">From $500 a month</td><td>$15 to $70 a month, plus your team's time</td><td>Often $3,000 to $25,000 a month</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="pricing" aria-labelledby="pricing-h">
+    <h2 id="pricing-h">Plans</h2>
+    <p class="sub">Month to month, no contract. Start with a 2-week trial.</p>
+    <div class="plans">
+      <div class="plan featured">
+        <span class="tag" data-plan="spots">Founding clients: 3 spots</span>
+        <h3>Founding</h3>
+        <div class="amount" data-plan="founding">$500<small> / month</small></div>
+        <p>One executive, the full service, at the founding price, locked in while you stay.</p>
+        <a class="btn btn-primary" href="#free">Get 3 free clips first</a>
+      </div>
+      <div class="plan">
+        <h3>Executive</h3>
+        <div class="amount" data-plan="executive">$990<small> / month</small></div>
+        <p>One executive: your founder, CEO or the voice of your show, on your monthly themes.</p>
+        <a class="btn btn-ghost" href="#free">Get 3 free clips first</a>
+      </div>
+      <div class="plan">
+        <h3>Team</h3>
+        <div class="amount" data-plan="team">$2,500<small> / month</small></div>
+        <p data-plan="team-size">2 to 4 executives, 12 clips each, on one shared content calendar.</p>
+        <a class="btn btn-ghost" data-call href="#">Request a call</a>
+      </div>
+    </div>
+    <ul class="every">
+      <li>12 clips a month per executive</li>
+      <li>A LinkedIn post and a Shorts &amp; Reels caption for every clip</li>
+      <li>Delivered within 24 hours of each recording</li>
+      <li>Executive captions, .srt files and covers</li>
+      <li>Grouped by your monthly themes</li>
+      <li>Re-cuts on request</li>
+    </ul>
+    <div class="guarantee" data-plan="guarantee"><b>Our guarantee.</b> If your first 12 clips don't beat your last month of LinkedIn posts on impressions, your next month is free.</div>
+  </section>
+
+  <section id="agencies" aria-labelledby="agencies-h">
+    <div class="split">
+      <div>
+        <p class="eyebrow">For agencies</p>
+        <h2 id="agencies-h">Add LinkedIn video to your clients' packages, white-label</h2>
+        <p class="sub" style="margin-bottom:24px">For podcast, content and LinkedIn agencies: we cut the clips and write the posts, you deliver them under your brand. No editors to hire.</p>
+        <a class="btn btn-ghost" id="agency-mail" href="#">Ask about white-label</a>
+      </div>
+      <ul>
+        <li><b>Under your brand:</b> plain files, no Nav Studios name anywhere</li>
+        <li><b>Within 24 hours,</b> even when your shows batch-record</li>
+        <li><b>A wholesale rate</b> so the margin is yours</li>
+        <li><b>3 free sample clips</b> from one of your clients' episodes first</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="free" aria-labelledby="free-h">
+    <div class="request">
+      <div>
+        <h2 id="free-h">See 3 free clips from your latest episode</h2>
+        <p class="sub">Tell us where your executives show up: your podcast, a webinar, a guest appearance. We send back 3 finished clips, each with its LinkedIn post, usually within a day. Free, and yours to keep.</p>
+        <ul class="ticks" style="flex-direction:column">
+          <li>No call needed to get them</li>
+          <li>No logins, no payment details</li>
+          <li>Yours to post either way</li>
+        </ul>
+      </div>
+      <form id="request-form" novalidate>
+        <div class="row">
+          <div class="field"><label for="f-name">Your name</label><input id="f-name" name="name" autocomplete="name" required><div class="err" id="e-name"></div></div>
+          <div class="field"><label for="f-email">Work email</label><input id="f-email" name="email" type="email" autocomplete="email" required><div class="err" id="e-email"></div></div>
+        </div>
+        <div class="field"><label for="f-company">Company <span class="opt">(optional)</span></label><input id="f-company" name="company" autocomplete="organization"></div>
+        <div class="field"><label for="f-link">A recording or your show</label><input id="f-link" name="link" placeholder="A YouTube, podcast, Riverside or Zoom link, or your show's name" required><div class="err" id="e-link"></div></div>
+        <div class="field"><label for="f-note">Anything we should know <span class="opt">(optional)</span></label><textarea id="f-note" name="note" placeholder="Who speaks on it, this month's themes, where you post"></textarea></div>
+        <input class="hp" id="f-bot" name="botcheck" tabindex="-1" autocomplete="off" aria-hidden="true">
+        <button class="btn btn-primary" id="f-submit" type="submit" style="width:100%">Send me 3 free clips</button>
+        <p class="fine">We only use your email to send your clips and reply to you.</p>
+        <div class="status" id="status" role="status" aria-live="polite"></div>
+      </form>
+    </div>
+  </section>
+
+  <section id="faq" aria-labelledby="faq-h">
+    <h2 id="faq-h">Questions</h2>
+    <div class="faq">
+      <div>
+        <details><summary>Do we need to record anything new?</summary><p>No. We work from what your executives already did: your podcast, webinars, panels, conference talks and guest appearances. Camera shots and slides alike.</p></details>
+        <details><summary>How long is each clip?</summary><p>As long as the point takes: 35 seconds to 3 minutes. Each clip opens on the question, claim or story setup and ends on the sentence where the speaker lands it, never mid-thought.</p></details>
+        <details><summary>Who picks the moments?</summary><p>A person, every time. We look for what an executive would want to be known for, check every cut, and never add words they didn't say.</p></details>
+        <details><summary>What's in the free sample?</summary><p>3 finished clips from one recording, each with its LinkedIn post, Shorts &amp; Reels caption, captions file and cover. On a private page, yours to keep.</p></details>
+        <details><summary>Who owns the clips?</summary><p>You do. No watermark, and they're yours to post anywhere.</p></details>
+      </div>
+      <div>
+        <details><summary>What's the guarantee?</summary><p data-plan="guarantee-faq">If your first 12 clips don't beat your last month of LinkedIn posts on impressions, your next month is free. Compare them in your own LinkedIn analytics.</p></details>
+        <details><summary>Do you post for us?</summary><p>You post from your own profiles, so the reach stays yours. Everything arrives ready to paste: the clip, the post, the captions file and the cover.</p></details>
+        <details><summary>Is there a contract?</summary><p>No. Month to month after a 2-week trial.</p></details>
+        <details><summary>Who's behind Nav Studios?</summary><p>Nav Studios is run by Barry Navan. You'll deal with him directly, by email.</p></details>
+      </div>
+    </div>
+  </section>
+
+  <div class="closing">
+    <h2>Your executives already said something worth posting this week.</h2>
+    <p class="sub">See 3 clips from it, free, before you decide anything.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="#free">Get 3 free clips</a>
+      <a class="btn btn-ghost" data-call href="#">Request a call</a>
+    </div>
+  </div>
+</div>
+</main>
+
+<footer><div class="wrap">
+  <span>© <span id="year">2026</span> Nav Studios · Barry Navan</span>
+  <span><a id="footer-email" href="#">email</a></span>
+</div></footer>
+
+<script>
+/* ------------------------------------------------------------------
+   SETTINGS: the only part you need to edit.
+   The prices and guarantee must match core/outreach.py and the clip-page Worker
+   (tests/test_round54.py checks they agree).
+   ------------------------------------------------------------------ */
+const SETTINGS = {
+  contactEmail: "barrynavan@gmail.com",
+  // Free key from https://web3forms.com: requests from the form arrive in your inbox.
+  web3formsKey: "4d3ad13c-a73b-4065-a0e2-3542e7913c7f",
+};
+const PLANS = {
+  founding: "$500", spots: 3, executive: "$990", team: "$2,500", teamSize: "2 to 4 executives", clipsPerMonth: 12,
+  trial: "2-week trial",
+  guarantee: "If your first 12 clips don't beat your last month of LinkedIn posts on impressions, your next month is free.",
+};
+
+const $ = (id) => document.getElementById(id);
+$("year").textContent = new Date().getFullYear();
+const mail = (subject, body) => "mailto:" + SETTINGS.contactEmail + "?subject=" + encodeURIComponent(subject)
+  + (body ? "&body=" + encodeURIComponent(body) : "");
+const CALL = mail("A call about LinkedIn clips", "Hi Barry,\n\nWe'd like to talk about LinkedIn clips for our executives.\n\n"
+  + "Could we set up a quick 15-minute call this week?\n\nA few times that work for us:\n- \n- \n\nThanks,\n");
+document.querySelectorAll("[data-call]").forEach((a) => { a.href = CALL; });
+$("agency-mail").href = mail("White-label clips for our clients", "Hi Barry,\n\nWe're an agency and would like to hear about white-label clips for our clients.\n\nAgency: \nHow many client shows: \n\nThanks,\n");
+$("footer-email").href = "mailto:" + SETTINGS.contactEmail;
+$("footer-email").textContent = SETTINGS.contactEmail;
+addEventListener("scroll", () => $("nav").classList.toggle("scrolled", scrollY > 8), { passive: true });
+
+// The sample cuts: muted autoplay loops (captions are burned in); one tap on the speaker plays that
+// clip with sound from the start and mutes the other. Tap the video to pause. Paused off-screen, and
+// no autoplay for reduced motion or data saver.
+const reels = [...document.querySelectorAll(".reel")].map((fig) => ({
+  fig, video: fig.querySelector("video"), sound: fig.querySelector(".sound"), userPaused: false,
+}));
+const calm = matchMedia("(prefers-reduced-motion: reduce)").matches || (navigator.connection && navigator.connection.saveData);
+function setSound(r, on) {
+  r.video.muted = !on;
+  r.sound.setAttribute("aria-pressed", String(on));
+  r.sound.setAttribute("aria-label", (on ? "Turn sound off: " : "Turn sound on: ") + r.video.getAttribute("aria-label").split(": ").pop());
+}
+function play(r) {
+  r.userPaused = false;
+  const p = r.video.play();
+  if (p && p.catch) p.catch(() => r.fig.classList.add("paused"));
+}
+function pause(r, byUser) { r.userPaused = byUser; r.video.pause(); }
+reels.forEach((r) => {
+  r.video.addEventListener("play", () => r.fig.classList.remove("paused"));
+  r.video.addEventListener("pause", () => r.fig.classList.add("paused"));
+  if (calm) { r.video.removeAttribute("autoplay"); r.video.pause(); r.userPaused = true; r.fig.classList.add("paused"); }
+  r.sound.addEventListener("click", () => {
+    const on = r.video.muted;
+    reels.forEach((o) => { if (o !== r) setSound(o, false); });
+    setSound(r, on);
+    if (on) { r.video.currentTime = 0; play(r); }
+  });
+  r.video.addEventListener("click", () => {
+    if (r.video.paused) { if (calm) { reels.forEach((o) => { if (o !== r) setSound(o, false); }); setSound(r, true); } play(r); }
+    else pause(r, true);
+  });
+});
+if ("IntersectionObserver" in window) {
+  const seen = new IntersectionObserver((entries) => entries.forEach((e) => {
+    const r = reels.find((x) => x.video === e.target);
+    if (!r) return;
+    if (!e.isIntersecting) { if (!r.video.paused) { r.video.pause(); r.userPaused = false; } }
+    else if (!r.userPaused && !calm) play(r);
+  }), { threshold: 0.25 });
+  reels.forEach((r) => seen.observe(r.video));
+}
+
+// the request form: web3forms, with your email as the fallback
+const form = $("request-form"), statusBox = $("status");
+function showError(key, on, text) { $("e-" + key).textContent = on ? text : ""; }
+function showFallback(data, why) {
+  statusBox.className = "status show warn";
+  statusBox.innerHTML = "";
+  const p = document.createElement("p");
+  p.textContent = why + " Email us instead and we'll send your clips:";
+  const a = document.createElement("a");
+  a.href = mail("Free clips request", `Name: ${data.name}\nCompany: ${data.company || "-"}\nRecording or show: ${data.link}\n\n${data.note || ""}`);
+  a.className = "btn btn-ghost btn-sm";
+  a.textContent = "Email " + SETTINGS.contactEmail;
+  statusBox.append(p, a);
+}
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const data = { name: $("f-name").value.trim(), email: $("f-email").value.trim(), company: $("f-company").value.trim(),
+                 link: $("f-link").value.trim(), note: $("f-note").value.trim() };
+  const bad = { name: !data.name, email: !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email), link: !data.link };
+  showError("name", bad.name, "Please add your name.");
+  showError("email", bad.email, "Please add a valid email.");
+  showError("link", bad.link, "A link to a recording, or your show's name.");
+  const first = Object.keys(bad).find((k) => bad[k]);
+  if (first) { $("f-" + first).focus(); return; }
+  if ($("f-bot").value) return;
+  if (!SETTINGS.web3formsKey) { showFallback(data, "This form isn't connected yet."); return; }
+  const btn = $("f-submit");
+  btn.disabled = true; btn.textContent = "Sending...";
+  try {
+    const res = await fetch("https://api.web3forms.com/submit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        access_key: SETTINGS.web3formsKey, subject: "Free clips request: " + (data.company || data.link),
+        from_name: "Nav Studios website", replyto: data.email,
+        name: data.name, email: data.email, company: data.company || "-", recording: data.link, note: data.note || "-",
+      }),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok || out.success === false) throw new Error(out.message || "Request failed");
+    statusBox.className = "status show ok";
+    statusBox.innerHTML = "";
+    const p = document.createElement("p");
+    p.textContent = `Got it. Your 3 clips will arrive at ${data.email}, usually within a day.`;
+    statusBox.append(p);
+    form.reset();
+  } catch (err) {
+    showFallback(data, "The form couldn't send your request.");
+  } finally {
+    btn.disabled = false; btn.textContent = "Send me 3 free clips";
+  }
+});
+</script>
+</body>
+</html>

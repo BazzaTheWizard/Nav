@@ -23,11 +23,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.edl import MODES, Card, ClipEdit
+from core.edl import MODES, PROOF_TEMPLATES, Card, ClipEdit
 
 MIN_CARD_SECONDS = 5.0  # a chart is on screen 5-6 s: in by 1.2 s, still for 3.8 s, out in 0.4 s (Round 35)
 MIN_OVERLAY_SECONDS = 4.5  # a number or boxes over the speaker: 4.5-6 s
-BUILD_SECONDS = 0.5  # every item of a graphic starts coming in within this long of the first (Round 35)
+BUILD_SECONDS = 0.5  # Round 35's build squeeze; retired in Round 39 (every item lands on its own word, core.cards)
 READ_HOLD = 3.8  # ...then the finished graphic (in by 1.2 s, core.cards.ENTRANCE_END) holds completely still
 BENTO_MAX_SECONDS = 6.0  # and leaves: no graphic outstays what there is to read
 EXIT_SECONDS = 0.4  # the way out (an overlay fades and slides, a chart's panel slides down)
@@ -498,26 +498,38 @@ def _check_change(row: Any, window: list[Any], tokens: list[str], numbers: list[
 
 def check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
                hook_seconds: float = HOOK_SECONDS) -> CardCheck:
-    """Check one card (see _check_card), then pace it (Round 33): a data graphic comes in as
-    its first item is said, builds within BUILD_SECONDS, holds still READ_HOLD seconds and is
-    on screen MIN_OVERLAY_SECONDS / MIN_CARD_SECONDS to BENTO_MAX_SECONDS."""
+    """Check one card (see _check_card), then pace it (Round 39): a graphic comes in so its
+    first item lands on its word, every later item lands on its own word (WORD_LEAD before
+    it), then everything holds still READ_HOLD seconds; a quote leaves QUOTE_TAIL after its
+    last word."""
     result = _check_card(card, words, clip_start, clip_end, hook_seconds)
-    if result.ok and card.template != "speaker_title":
-        pace(card, clip_end, result.errors)
+    if result.ok and card.template != "speaker_title" and card.template not in PROOF_TEMPLATES:
+        pace(card, clip_end, result.errors, clip_start + max(HOOK_SECONDS, hook_seconds))
     return result
 
 
-def pace(card: Card, clip_end: float, errors: list[str]) -> None:
-    """Round 33's reading pace for a data graphic (mutates ``card``): never an empty card
-    waiting for its words (it comes in as its first item is said), every item in within
-    BUILD_SECONDS (later ones are drawn in sooner, in the order said), then everything still
-    for READ_HOLD seconds before it leaves. Its length follows: 4.5-6 s."""
+QUOTE_TAIL = 0.35  # Round 39: a quote card starts leaving this long after the quote's last word
+MIN_QUOTE_SECONDS = 2.0  # ...but is never on screen for less than this
+
+
+def pace(card: Card, clip_end: float, errors: list[str], earliest: float | None = None) -> None:
+    """The reading pace for a data graphic (mutates ``card``): never an empty card waiting
+    for its words, every item on its own word (Round 39: core.cards.pace_reveals; nothing
+    shown before it's said), then everything still for READ_HOLD seconds before it leaves.
+    A quote (headline_card) follows its own words instead: in as it starts, each word lit as
+    it's said, out QUOTE_TAIL after the last one. ``earliest``: never before this (the hook)."""
     from core.cards import pace_reveals, settle_time  # the renderer knows when its motion ends
 
     overlay = MODES.get(card.template) == "overlay"
     said = [t for row in card.rows for t in (row.reveal_at, row.reveal_to) if t is not None]
     last_said = max(said, default=card.start)  # stays on screen until its last number is said: a second check agrees
-    pace_reveals(card)
+    pace_reveals(card, earliest)
+    if card.template == "headline_card" and card.context.get("quote_end") is not None:
+        card.end = round(max(float(card.context["quote_end"]) + QUOTE_TAIL + EXIT_SECONDS,
+                             card.start + MIN_QUOTE_SECONDS), 3)
+        if card.end > clip_end - PAYOFF_SECONDS + 1e-6:
+            errors.append(f"The quote runs into the last {PAYOFF_SECONDS:.0f} s: pick a line said earlier.")
+        return
     settled = settle_time(card)  # seconds from card.start until nothing in it moves
     shortest = MIN_OVERLAY_SECONDS if overlay else MIN_CARD_SECONDS
     needed = max(shortest, settled + READ_HOLD + EXIT_SECONDS)
@@ -526,6 +538,60 @@ def pace(card: Card, clip_end: float, errors: list[str]) -> None:
     if card.end > clip_end - PAYOFF_SECONDS + 1e-6:
         errors.append(f"Needs {needed:.1f} s on screen to be read (built by {settled:.1f} s, then "
                       f"{READ_HOLD:g} s still), and that runs into the last {PAYOFF_SECONDS:.0f} s: move it earlier.")
+
+
+def _recap_at(card: Card) -> float:
+    """Round 40: the anchor for an item said before its card comes in (a recap). It is
+    the word-time that pace_reveals turns into "lands as the card lands" without moving
+    the card's start (start + entrance lead + WORD_LEAD), so a second check of an already
+    paced card gives the same start and the same reveal (was: start + 0.12, which let each
+    check pull the card WORD_LEAD earlier)."""
+    from core.cards import WORD_LEAD, _lead
+
+    return round(card.start + _lead(card) + WORD_LEAD, 3)
+
+
+PROOF_SECONDS = {"brand_proof": (2.4, 3.2), "wiki_proof": (2.4, 3.2), "stat_proof": (2.4, 3.2),
+                 "newspaper_tearout": (1.8, 2.5)}
+
+
+def _check_proof(card: Card, words: list[Any], errors: list[str]) -> None:
+    """Round 41: a proof card proves what's said while it's up (or just before): the brand,
+    the name or the figure is said, and a tear-out's headline and key words are the
+    speaker's own, each highlighted on its own word. It stays 2.4-3.2 s (a tear-out
+    1.8-2.5 s)."""
+    low, high = PROOF_SECONDS[card.template]
+    if not low - 1e-6 <= card.end - card.start <= high + 1e-6:
+        errors.append(f"A {card.template} stays {low:g}-{high:g} s.")
+    if not card.rows or not str(card.rows[0].label).strip():
+        errors.append("It needs its name, figure or line.")
+        return
+    near = [w for w in words if card.start - 1.0 <= float(w.start) < card.end]
+    said = {_clean(w.text) for w in near}
+    row = card.rows[0]
+    if card.template == "brand_proof":
+        from core import entity_enricher
+
+        if not card.entity or card.entity not in entity_enricher.detect(" ".join(str(w.text) for w in near)):
+            errors.append(f"{row.label} isn't named while its card is up.")
+    elif card.template == "wiki_proof":
+        if not _said(row.label, said, 0.5):
+            errors.append(f"{row.label} isn't named while its card is up.")
+    elif card.template == "stat_proof":
+        value = parse_value(row.value)
+        if not value.numbers or _match_numbers(value, spoken_numbers(near), set()) is None:
+            errors.append(f"\"{row.value}\" isn't said while its card is up.")
+    else:
+        lead_in = {_clean(w.text) for w in words if card.start - LINE_LOOKBACK <= float(w.start) < card.end}
+        if not _said(row.label, lead_in, 0.9):
+            errors.append("The headline must be the speaker's own words.")
+        key = card.context.get("key") or []
+        if not 3 <= len(key) <= 6:
+            errors.append("Highlight 3-6 key words.")
+        for text, start, _end in key:
+            if not any(_clean(w.text) == _clean(text) and abs(float(w.start) - float(start)) < 0.02 for w in words):
+                errors.append(f"\"{text}\" isn't said at {float(start):.2f} s: the highlight lands on each word as said.")
+                break
 
 
 def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float,
@@ -559,11 +625,15 @@ def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float
     said_in_clip = {_clean(w.text) for w in clip_words}
     numbers = spoken_numbers(window)
     rows = card.rows
+    if card.template in PROOF_TEMPLATES:  # Round 41: the Visual Proof overlays
+        _check_proof(card, words, errors)
+        return result
     count = {"kinetic_range": (1, 1), "buckets": (2, 3), "speaker_title": (1, 1), "timeline": (2, 4),
              "comparison_card": (2, 2), "step_sequence": (2, 4),
              "metric_bars": (2, 4), "ranked_bars": (2, 5), "diverging_bar": (2, 2), "share_split": (2, 5),
              "trend_line": (2, 6), "arr_bridge": (3, 7), "sankey_flow": (3, 8), "cac_payback": (2, 2),
-             "drawdown_curve": (2, 2), "candlestick_ema": (0, 0), "stat_pill": (1, 4), "market_line": (2, 3)}[card.template]
+             "drawdown_curve": (2, 2), "candlestick_ema": (0, 0), "stat_pill": (1, 4), "market_line": (2, 3),
+             **NICHE_COUNTS}[card.template]
     if not count[0] <= len(rows) <= count[1]:
         errors.append(f"This graphic takes {count[0]}{'' if count[0] == count[1] else f' to {count[1]}'} items.")
         return result
@@ -575,6 +645,9 @@ def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float
     # number's label is when, as said ("2022", "Q3").
     single = card.template == "kinetic_range" or (card.template == "stat_pill" and len(rows) == 1)
     series = card.template == "stat_pill" and len(rows) > 1
+    if card.template in NICHE_CARDS:  # Round 36: maps, odds, value chains, frameworks, a quote
+        _check_niche(card, window, clip_words, said_in_clip, errors, result)
+        return result
     if card.context and (MODES.get(card.template) != "split" or card.template not in numeric):
         card.context = {}
         result.warnings.append("Context layer left out: only number charts take one.")
@@ -621,7 +694,7 @@ def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float
                       errors, lead_in)
         if not errors:
             if rows[0].reveal_at < card.start:  # a recap: "C", then "→ A" a beat later
-                rows[0].reveal_at = card.start + 0.12
+                rows[0].reveal_at = _recap_at(card)
                 if rows[0].reveal_to < rows[0].reveal_at + 0.3:
                     rows[0].reveal_to = rows[0].reveal_at + 0.6
             card.start = max(card.start, rows[0].reveal_at - 0.12)
@@ -646,7 +719,7 @@ def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float
                 recap = spoken_numbers([w for w in recap_window if float(w.start) < card.start])
                 hits = _match_numbers(value, recap, set())
                 if hits is not None:  # said just before: it comes in as the graphic does
-                    row.reveal_at, row.reveal_to = card.start + 0.12, None
+                    row.reveal_at, row.reveal_to = _recap_at(card), None
                     if row.label and not _said(row.label, lead_in):
                         errors.append(f"The line under the number should use the speaker's words: \"{row.label}\".")
                     continue
@@ -733,7 +806,7 @@ def _check_card(card: Card, words: list[Any], clip_start: float, clip_end: float
     if overlay and not errors:
         for row in rows:  # a recap (said under the title) comes in as the graphic does
             if row.reveal_at is not None and row.reveal_at < card.start:
-                row.reveal_at = card.start + 0.12
+                row.reveal_at = _recap_at(card)
                 row.reveal_to = None
         first = min((row.reveal_at for row in rows if row.reveal_at is not None), default=card.start)
         # No empty frames: an overlay starts exactly as its first item comes in.
@@ -898,10 +971,10 @@ def _check_qualitative(card: Card, window: list[Any], clip_words: list[Any], sai
                     errors.append(f"{side} {position}: \"{row.value}\" isn't said in the clip.")
             elif not (_said(row.value, said_in_clip) or set(re.findall(r"[a-z]+", row.value.lower())) <= _FRAMING_TAGS):
                 errors.append(f"{side} {position}: the tag should be the speaker's words: \"{row.value}\".")
-        keys = {k for k in _keywords(f"{row.label} {row.detail}")} or {_clean(w) for w in row.label.split()}
-        spot = next((float(w.start) for w in window if float(w.start) > after and _clean(w.text) in keys), None)
+        keys = _anchor_keys(f"{row.label} {row.detail}") or {_stem(w) for w in row.label.split()}
+        spot = _where_said(keys, clip_words, after, card.end, _horizon(clip_words))
         if spot is None:
-            said_before = any(_clean(w.text) in keys and float(w.start) < card.start for w in clip_words)
+            said_before = any(_stem(w.text) in keys and float(w.start) < card.start for w in clip_words)
             if not said_before:
                 errors.append(f"{side} {position} (\"{row.label}\"): none of its words are said before or while it's up.")
                 continue
@@ -912,7 +985,280 @@ def _check_qualitative(card: Card, window: list[Any], clip_words: list[Any], sai
         errors.append("Highlight one side at most: the one the point is about.")
 
 
+# ------------------------------------------------------------ Round 39: where an item is said
+CLUSTER_SECONDS = 3.0  # an item's keywords said within this long of each other are one mention of it
+_FILLER = {"like", "that", "they", "them", "this", "with", "have", "what", "when", "then", "than", "just", "your",
+           "from", "were", "will", "been", "into", "about", "there", "their", "really", "very", "some", "does",
+           "doing", "thing", "things", "going", "gonna", "know", "much", "more", "only", "also", "even", "here",
+           "every", "other", "make", "made", "want", "need", "would", "could", "should", "because"}
+
+
+def _stem(word: str) -> str:
+    """A transcript word or keyword, cleaned, plural "s" off ("creators" = "creator")."""
+    word = _clean(word)
+    return word[:-1] if len(word) > 4 and word.endswith("s") and not word.endswith("ss") else word
+
+
+def _anchor_keys(text: str) -> set[str]:
+    """The words that say an item is being talked about: its keywords without the filler
+    ("like", "that", "make") that a speaker says all the time."""
+    keys = {_stem(k) for k in _keywords(text)}
+    return (keys - {_stem(f) for f in _FILLER}) or keys
+
+
+def _horizon(clip_words: list[Any]) -> float:
+    """The latest an item can be said and still get its graphic (the payoff stays clear)."""
+    return max((float(w.end) for w in clip_words), default=0.0) - PAYOFF_SECONDS
+
+
+def _densest(keys: set[str], words: list[Any], after: float, until: float) -> tuple[float | None, int]:
+    """(start, keywords) of the first word that opens the densest run of ``keys`` said
+    between ``after`` and ``until``: the moment the item is actually talked about."""
+    hits = [(float(w.start), _stem(w.text)) for w in words if after < float(w.start) < until and _stem(w.text) in keys]
+    best: tuple[float | None, int] = (None, 0)
+    for t, _key in hits:
+        n = len({key for u, key in hits if t <= u <= t + CLUSTER_SECONDS})
+        if n > best[1]:
+            best = (t, n)
+    return best
+
+
+def _where_said(keys: set[str], clip_words: list[Any], after: float, card_end: float, horizon: float) -> float | None:
+    """Round 39: the word an item lands on. Inside the card's window, the start of the
+    densest run of the item's own words. When that's only one stray word ("creators", in
+    "creators vs affiliates") and the item's phrase is said for real later ("like mini CMOs
+    testing styles"), the later phrase: the card then moves to it, so nothing is shown
+    before it's said."""
+    need = min(2, len(keys))
+    inside, n = _densest(keys, clip_words, after, card_end)
+    if inside is not None and n >= need:
+        return inside
+    later, m = _densest(keys, clip_words, after, horizon)
+    if later is not None and m >= need:
+        return later
+    return inside
+
+
+def _quote_cadence(quote: str, clip_words: list[Any], after: float, horizon: float) -> tuple[list[float], float] | None:
+    """Round 39: when each word of a quote is said: (start of every word of the quote, the
+    end of its last word), aligned to the transcript from the first place its opening is
+    said after ``after``. A word the transcript spells differently takes its neighbour's
+    time. None when the quote isn't said there (most of its words in order)."""
+    quote_words = quote.split()
+    q = [_stem(t) for t in quote_words]
+    words = [w for w in clip_words if after < float(w.start) < horizon]
+    said = [_stem(w.text) for w in words]
+    best: tuple[int, list, int] | None = None
+    for i, token in enumerate(said):
+        for k in range(min(3, len(q))):
+            if not q[k] or token != q[k]:
+                continue
+            times: list = [None] * len(q)
+            j, matched = i, 0
+            for qi in range(k, len(q)):
+                if not q[qi]:
+                    continue
+                for look in range(j, min(j + 4, len(words))):
+                    if said[look] == q[qi]:
+                        times[qi] = (float(words[look].start), float(words[look].end))
+                        j, matched = look + 1, matched + 1
+                        break
+            for back in range(k):  # the opening words before the first match: the words before it
+                if i - k + back >= 0:
+                    times[back] = (float(words[i - k + back].start), float(words[i - k + back].end))
+            if best is None or matched > best[0]:
+                best = (matched, times, i)
+    real = len([t for t in q if t])
+    if best is None or best[0] < max(2, 0.6 * real):
+        return None
+    times = best[1]
+    known = [t for t in times if t is not None]
+    filled, last = [], known[0]
+    for t in times:  # a word not found takes the time of the word before it
+        last = t if t is not None and t[0] >= last[0] else last
+        filled.append(last)
+    return [round(t[0], 3) for t in filled], max(t[1] for t in known)
+
+
 FIRST_REVEAL = 0.45  # a recap point comes in once the card has landed
+
+# Round 36: the multi-niche Bento cards (core.cards_niche) and how many items each takes.
+NICHE_COUNTS = {"geo_map_card": (1, 3), "prediction_gauge_card": (1, 2), "flow_sankey_card": (2, 5),
+                "framework_matrix_card": (3, 4), "headline_card": (1, 1)}
+NICHE_CARDS = set(NICHE_COUNTS)
+# A value the code fetched (never one the model wrote) may show without being said, with
+# its source: World Bank figures next to a country, Polymarket odds on a gauge.
+DATA_FEEDS = {"world_bank": "World Bank", "polymarket": "Polymarket"}
+_NICHE_CONTEXT = {"geo_map_card": {"arcs", "stat", "data"}, "prediction_gauge_card": {"data", "market"},
+                  "flow_sankey_card": set(), "framework_matrix_card": {"layout", "x", "y"},
+                  "headline_card": {"cadence", "quote_end"}}  # Round 39: set by the checks (the quote's word times)
+QUOTE_LIMIT = 110  # characters in a quote on a tear-sheet
+AXIS_LIMIT = 18
+
+
+def _fed(card: Card) -> str:
+    """The data feed a card's numbers came from ("" when they must be said)."""
+    feed = str(card.context.get("data") or "")
+    return feed if feed in DATA_FEEDS and DATA_FEEDS[feed].lower() in card.source.lower() else ""
+
+
+def _first_word(keys: set[str], window: list[Any], after: float) -> float | None:
+    return next((float(w.start) for w in window if float(w.start) > after and _clean(w.text) in keys), None)
+
+
+def _check_niche(card: Card, window: list[Any], clip_words: list[Any], said_in_clip: set[str],
+                 errors: list[str], result: CardCheck) -> None:
+    """Round 36 cards. Every name, heading and quote is the speaker's words; every number
+    is said in the clip unless the code fetched it from a named feed (``context["data"]``
+    with that feed as the source). Each item comes in on the first word of it said while
+    the card is up, in order; one said just before is drawn in as a recap."""
+    from core import niche_data
+
+    rows, template = card.rows, card.template
+    extra = set(card.context) - _NICHE_CONTEXT[template]
+    if extra:
+        for key in extra:
+            card.context.pop(key, None)
+        result.warnings.append("Left out context this card doesn't use: " + ", ".join(sorted(extra)) + ".")
+    feed = _fed(card)
+    if card.context.get("data") and not feed:
+        card.context.pop("data", None)
+        errors.append("Fetched figures need their feed named as the source (World Bank, Polymarket).")
+        return
+    clip_numbers = [n for n in spoken_numbers(clip_words) if n.start < card.end]
+    clip_text = " ".join(str(w.text) for w in clip_words)
+    recap, after = 0, card.start - 1.0
+
+    def number_said(position: int, value: str) -> bool:
+        parsed = parse_value(value)
+        if not parsed.numbers:
+            errors.append(f"Item {position}: \"{value}\" has no number.")
+            return False
+        if feed:
+            return True
+        if _match_numbers(parsed, clip_numbers, set()) is None:
+            errors.append(_unsaid(position, value, parsed))
+            return False
+        return True
+
+    def land(position: int, row: Any, keys: set[str]) -> None:
+        nonlocal recap, after
+        keys = {_stem(k) for k in keys}
+        spot = _where_said(keys, clip_words, after, card.end, _horizon(clip_words))
+        if spot is None:
+            if not any(_stem(w.text) in keys and float(w.start) < card.start for w in clip_words):
+                errors.append(f"Item {position} (\"{row.label}\"): none of its words are said before or while it's up.")
+                return
+            spot = card.start + FIRST_REVEAL + 0.6 * recap
+            recap += 1
+        row.reveal_at = after = max(spot, after + 0.3)
+
+    if template == "geo_map_card":
+        named = {c.iso3 for c in niche_data.countries_in(clip_text)}
+        for position, row in enumerate(rows, start=1):
+            place = niche_data.country(row.label)
+            _limit(errors, f"Country {position}", row.label, LIMITS["label"])
+            _limit(errors, f"Country {position} value", row.value, LIMITS["value"])
+            _limit(errors, f"Country {position} stat", row.detail, 12)
+            if place is None:
+                errors.append(f"Country {position}: \"{row.label}\" isn't a country the map knows.")
+                continue
+            if place.iso3 not in named:
+                errors.append(f"Country {position}: {place.name} isn't named in the clip.")
+                continue
+            if row.value.strip() and not number_said(position, row.value):
+                continue
+            keys = {_clean(w) for alias in (place.name, *place.aliases) for w in alias.split()} - {"the", "of", "and"}
+            land(position, row, keys)
+        if len({niche_data.country(r.label) for r in rows}) < len(rows):
+            errors.append("Each country once.")
+        arcs = card.context.get("arcs")
+        if arcs is not None and not (isinstance(arcs, list) and all(
+                isinstance(a, (list, tuple)) and len(a) == 2 and all(isinstance(i, int) and 1 <= i <= len(rows) for i in a)
+                and a[0] != a[1] for a in arcs)):
+            card.context.pop("arcs", None)
+            result.warnings.append("Arcs left out: each joins two of the map's countries by number.")
+    elif template == "prediction_gauge_card":
+        for position, row in enumerate(rows, start=1):
+            _limit(errors, f"Side {position}", row.label, 14)
+            value = parse_value(row.value)
+            if not row.label.strip():
+                errors.append(f"Side {position} needs a name (\"Yes\", \"Cut\", \"Trump\").")
+            if position == 2 and not row.value.strip():
+                continue  # the other side is the rest: drawn as 100% minus the first
+            if value.scale != "%" or not 0 <= (value.numbers or [-1])[0] <= 100:
+                errors.append(f"Side {position}: the odds are a percentage from 0 to 100 (\"{row.value}\").")
+                continue
+            first_value = parse_value(rows[0].value).numbers
+            rest = position == 2 and first_value and abs(first_value[0] + value.numbers[0] - 100) < 0.6
+            if not rest and not number_said(position, row.value):
+                continue
+            row.reveal_at = card.start + FIRST_REVEAL + 0.3 * (position - 1)
+            if not feed:
+                hit = _match_numbers(value, spoken_numbers(window), set())
+                if hit:
+                    row.reveal_at = max(hit[0].start, card.start + 0.2)
+        if len(rows) == 2 and rows[1].value.strip() and not errors:
+            total = sum(parse_value(r.value).numbers[0] for r in rows)
+            if abs(total - 100) > 3:
+                errors.append(f"The two sides add up to {total:g}%, not 100%.")
+        if feed:
+            result.warnings.append(f"Odds from {DATA_FEEDS[feed]}, not from what was said: the card shows its source.")
+    elif template == "flow_sankey_card":
+        for position, row in enumerate(rows, start=1):
+            _limit(errors, f"Step {position}", row.label, 20)
+            _limit(errors, f"Step {position} role", row.detail, 22)
+            _limit(errors, f"Step {position} value", row.value, LIMITS["value"])
+            if not _said(row.label, said_in_clip):
+                errors.append(f"Step {position}: the name should be the speaker's words: \"{row.label}\".")
+                continue
+            if row.value.strip() and not number_said(position, row.value):
+                continue
+            keys = set(_keywords(row.label)) or {_clean(w) for w in row.label.split()}
+            land(position, row, keys)
+        sized = [parse_value(r.value) for r in rows if r.value.strip()]
+        if sized and len({v.scale for v in sized}) > 1:
+            errors.append("One unit per chain: these mix scales.")
+    elif template == "framework_matrix_card":
+        layout = str(card.context.get("layout") or ("matrix" if len(rows) == 4 else "flywheel"))
+        if layout not in {"matrix", "flywheel"}:
+            errors.append("A framework is a 2x2 \"matrix\" or a \"flywheel\".")
+            return
+        if layout == "matrix" and len(rows) != 4:
+            errors.append("A 2x2 matrix takes 4 boxes.")
+            return
+        for axis in ("x", "y"):
+            label = str(card.context.get(axis) or "")
+            _limit(errors, f"Axis {axis}", label, AXIS_LIMIT)
+            if label and layout == "matrix" and not _said(label, said_in_clip):
+                result.warnings.append(f"Axis \"{label}\" isn't the speaker's words.")
+        _check_qualitative(card, window, clip_words, said_in_clip, errors)
+    elif template == "headline_card":
+        row = rows[0]
+        quote, phrase = row.label.strip(), row.value.strip()
+        _limit(errors, "Quote", quote, QUOTE_LIMIT)
+        _limit(errors, "Byline", row.detail, 30)
+        _limit(errors, "Background", card.footnote, LIMITS["footnote"])
+        if not quote:
+            errors.append("The tear-sheet needs the speaker's line.")
+            return
+        if not _said(quote, said_in_clip, 0.8):
+            errors.append(f"The quote should be the speaker's words: \"{quote}\".")
+            return
+        if phrase and phrase.lower() not in quote.lower():
+            errors.append(f"The highlight \"{phrase}\" isn't in the quote.")
+        if card.footnote.strip() and not card.source.strip():
+            errors.append("Background from outside the clip needs its source (\"Wikipedia\").")
+        card.context.pop("cadence", None)
+        card.context.pop("quote_end", None)
+        cadence = _quote_cadence(quote, clip_words, card.start - 1.0, float("inf"))  # pace() checks the payoff
+        if cadence is None:  # the transcript words it differently: the quote lands on its first keywords
+            land(1, row, set(_keywords(quote)[:3]) or {_clean(w) for w in quote.split()[:2]})
+        else:  # Round 39: in as the quote starts, every word lit as it's said, out after its last word
+            starts, end = cadence
+            row.reveal_at, row.reveal_to = starts[0], None
+            card.context["cadence"] = starts
+            card.context["quote_end"] = round(end, 3)
 # A comparison's side may carry a framing tag nobody has to say: it makes no claim.
 _FRAMING_TAGS = {"before", "after", "then", "now", "today", "them", "us", "old", "new", "myth", "reality", "expected",
                  "actual", "past", "future", "the", "way", "our", "their"}

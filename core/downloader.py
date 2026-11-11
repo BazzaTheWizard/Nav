@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import logging
 import math
 import os
@@ -41,6 +43,57 @@ def video_format_sort() -> list[str]:
         height = DEFAULT_SOURCE_MAX_HEIGHT
     height = min(2160, max(720, height))
     return [f"res:{height}", *VIDEO_FORMAT_SORT[1:]]
+
+
+def download_format_sort() -> list[str]:
+    """Round 51: what downloads sort by: "lang" first, so the audio is always the video's original
+    track, never one of YouTube's dubs (a user sort order otherwise ranks above yt-dlp's own
+    language preference), then video_format_sort()."""
+    return ["lang", *video_format_sort()]
+
+
+# --- Round 51: auto-dubbed videos ----------------------------------------------------------
+# YouTube auto-dubs videos into other languages: the video then has one audio track per
+# language, and yt-dlp marks the creator's own one "original". A clip of a dub is an AI voice
+# over someone else's lips, so the worker never makes one (the lead is skipped as not a fit).
+AUTO_DUBBED = "auto_dubbed"
+
+
+def audio_tracks(info: object) -> dict[str, Any]:
+    """{"languages": every audio track's language, "original": the original track's language
+    or None} from yt-dlp's info."""
+    languages: set[str] = set()
+    original = None
+    for item in (info.get("formats") or []) if isinstance(info, dict) else []:
+        if not isinstance(item, dict) or item.get("acodec") in (None, "none") or not item.get("language"):
+            continue
+        language = str(item["language"]).lower()
+        if language.endswith("-desc"):  # an audio-description track isn't a dub
+            continue
+        languages.add(language)
+        if "original" in str(item.get("format_note") or "").lower() and original is None:
+            original = language
+    return {"languages": sorted(languages), "original": original}
+
+
+def _english(language: str | None) -> bool:
+    return bool(language) and str(language).lower().split("-")[0] in {"en", "eng"}
+
+
+def auto_dub_reason(info: object) -> str | None:
+    """Why this video counts as auto-dubbed for our purposes, or None. A video with one audio
+    language isn't; nor is an English original that YouTube dubbed into other languages (we
+    use the original). It is when the original isn't English (its English is a dub), or when
+    there are several languages and no track says which one is the original."""
+    tracks = audio_tracks(info)
+    languages, original = tracks["languages"], tracks["original"]
+    if len(languages) <= 1:
+        return None
+    if original is None:
+        return f"{AUTO_DUBBED}: {len(languages)} audio languages ({', '.join(languages[:5])}) and none marked original"
+    if not _english(original):
+        return f"{AUTO_DUBBED}: the original audio is {original}; its English track is an AI dub"
+    return None
 
 # YouTube refusing the worker for a while (bot check, rate limit): pause the worker
 # instead of using up creators' attempts. A plain 403 is often just one video or an
@@ -183,6 +236,11 @@ def _with_sign_in(run: Callable[[dict[str, object]], T], options: dict[str, obje
 _DOWNLOAD_INFO: dict[str, dict[str, object]] = {}
 
 
+def peek_download_info(url: str) -> dict[str, object] | None:
+    """downloaded_video_info without using it up (Round 51: the worker's dub check)."""
+    return _DOWNLOAD_INFO.get(url)
+
+
 def downloaded_video_info(url: str) -> dict[str, object] | None:
     """Title, channel, duration and heatmap from this URL's download (once), or None
     when the file came from the cache or the download didn't report them."""
@@ -286,7 +344,7 @@ def _download_url(
     )
     options = {
         "format": VIDEO_FORMAT,
-        "format_sort": video_format_sort(),
+        "format_sort": download_format_sort(),
         "outtmpl": output_template,
         "noplaylist": True,
         "merge_output_format": "mp4",
@@ -312,6 +370,7 @@ def _download_url(
 
     if isinstance(info, dict):
         _DOWNLOAD_INFO[url] = {
+            "auto_dub": auto_dub_reason(info),  # Round 51
             "title": info.get("title"),
             "channel": info.get("channel") or info.get("uploader"),
             "duration": info.get("duration"),
@@ -398,6 +457,7 @@ def fetch_video_info(url: str) -> dict[str, object]:
         raise RuntimeError(f"Could not read video metadata for {url}")
     heatmap = info.get("heatmap")
     return {
+        "auto_dub": auto_dub_reason(info),  # Round 51: None, or why it's auto-dubbed
         "title": info.get("title"),
         "channel": info.get("channel") or info.get("uploader"),
         "duration": info.get("duration"),
@@ -452,6 +512,7 @@ def download_audio_only(
     output_template = str(destination_dir / f"{download_id}.%(ext)s")
     options = {
         "format": "ba[ext=m4a]/ba",
+        "format_sort": ["lang"],  # Round 51: the original audio track, never a dub
         "outtmpl": output_template,
         "noplaylist": True,
         "quiet": True,

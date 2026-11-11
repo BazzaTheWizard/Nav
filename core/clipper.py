@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from config import PROJECT_ROOT
-from core import explainer
+from core import clip_length, explainer
 from core.face_tracker import CropBox, CropPlan, _probe_display_size
 from core.subtitle_engine import create_ass_subtitles
 from core.title_card import TitleOverlay, prepare_title_overlay, title_above_captions
@@ -19,8 +19,9 @@ from core.webinar import WebinarLayout, plan_webinar
 logger = logging.getLogger(__name__)
 
 
-MIN_CLIP_DURATION = 15.0
-MAX_CLIP_DURATION = 90.0
+# Manual re-cuts. Round 55 (core.clip_length): up to 180 s, any length a delivered clip has.
+MIN_CLIP_DURATION = clip_length.RECUT_MIN_SECONDS
+MAX_CLIP_DURATION = clip_length.RECUT_MAX_SECONDS
 
 
 def _word_value(word: Word | dict[str, Any], key: str) -> Any:
@@ -87,6 +88,10 @@ def _center_crop(source_path: Path, cached_crop_x: int | None) -> CropBox:
     return CropBox(crop_x, crop_y, crop_width, crop_height)
 
 
+class _NoTitleHere(Exception):
+    """No title card on this re-render (core.executive.title_plan)."""
+
+
 def rerender_clip(
     source_path: str | Path,
     new_start: float,
@@ -112,7 +117,8 @@ def rerender_clip(
     ``title_fade_in``: False shows the title card fully from the first frame."""
     duration = new_end - new_start
     if not MIN_CLIP_DURATION <= duration <= MAX_CLIP_DURATION:
-        raise ValueError("Adjusted clip duration must remain between 15 and 90 seconds.")
+        raise ValueError(f"Adjusted clip duration must remain between {MIN_CLIP_DURATION:g} and "
+                         f"{MAX_CLIP_DURATION:g} seconds.")
     if new_start < 0:
         raise ValueError("Adjusted clip start must be non-negative.")
     if source_duration is not None and new_end > source_duration:
@@ -175,7 +181,17 @@ def rerender_clip(
         if layout_mode == "webinar" and webinar is None:
             webinar = plan_webinar(source, new_start, new_end)
 
+        # Round 49: the same title rule as first renders (core.executive.title_plan): the creator
+        # pill only in the creator look, else the executive topic header for 3.5 s (or none).
+        from core import executive
+
+        title_on, plan_style, plan_seconds, topic_header = executive.title_plan(None)
+        pill = title_on and not topic_header
+        if topic_header:
+            hook_style, hook_seconds, title_fade_in = plan_style, plan_seconds, False
         try:
+            if not title_on:
+                raise _NoTitleHere
             title = prepare_title_overlay(
                 hook_title,
                 hook_seconds,
@@ -192,6 +208,8 @@ def rerender_clip(
                 webinar=webinar,
                 fade_in=title_fade_in,
             )
+        except _NoTitleHere:
+            title = None
         except Exception:
             logger.warning("Title card failed; using the plain subtitle title.", exc_info=True)
         create_ass_subtitles(
@@ -200,7 +218,7 @@ def rerender_clip(
             clip_duration=duration,
             highlight_active_word=highlight_active_word,
             # The card replaces the old subtitle-style title; that one is only a fallback.
-            hook_title=None if title else hook_title,
+            hook_title=None if (title or not pill) else hook_title,
             hook_seconds=duration if pin_title else hook_seconds,
             seam_spans=split.spans if split else None,
             seam_title=title_above_captions(title),

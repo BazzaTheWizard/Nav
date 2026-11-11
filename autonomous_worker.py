@@ -26,6 +26,8 @@ from core.downloader import (
     allow_browser_cookies,
     download_source_video,
     downloaded_video_info,
+    peek_download_info,
+    AUTO_DUBBED,
     extract_audio_only,
     fetch_video_info,
     yt_dlp_version,
@@ -37,6 +39,10 @@ from core.hook_selector import ClipResult
 from core.outreach import (
     FOLLOW_UP_DAYS,
     FOLLOW_UP_LABELS,
+    FOLLOW_UP_STEPS_INTRO,
+    FOLLOW_UP_STEPS_PARTNER,
+    build_partner_yes_reply,
+    build_intro_yes_reply,
     LEGACY_SITE_URL,
     SITE_URL,
     build_follow_up_step,
@@ -46,6 +52,7 @@ from core.outreach import (
     follow_up_steps,
     fill_drive_link,
     greeting_name_of,
+    set_greeting,
     is_old_template,
     modern_subject,
     set_clip_count,
@@ -62,6 +69,7 @@ from core.lead_harvester import (
     generate_search_queries,
     lead_profile,
 )
+from core.fit import buyer_fit, fit_gate_on
 from core.graphics_director import VideoInfo
 from core.hook_selector import cap_clip_length, replay_peaks
 from core.pipeline import (
@@ -577,15 +585,35 @@ def init_storage_files() -> None:
             )
 
 
+DIRECT_KIND = "intro"  # Round 51: a direct pitch (an email only: the prospect has no upload to cut)
+
+
+def _takes_a_slot(record: dict[str, Any]) -> bool:
+    """A pending pitch that fills one of the worker's MAX_PENDING_LEADS Outbox slots. Direct
+    pitches don't: the worker made nothing for them, so they never hold it up."""
+    return record.get("status", "pending") == "pending" and record.get("kind") != DIRECT_KIND
+
+
+def add_direct_pitch(record: dict[str, Any]) -> bool:
+    """Round 51: put a direct pitch (core.linkedin_harvester.direct_pitch) in the Outbox. False when
+    it's already there (pending or sent)."""
+    record = {**record, "kind": DIRECT_KIND, "status": "pending", "clips": []}
+    record.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+    with _worker_lock():
+        pending = _pending_records()
+        if any(r.get("record_id") == record["record_id"] for r in pending):
+            return False
+        pending.append(record)
+        _write_json_atomic(PENDING_OUTREACH_PATH, pending)
+    return True
+
+
 def _wait_for_pending_slot(
     poll_interval_sec: float = PENDING_SLOT_POLL_INTERVAL_SEC,
 ) -> None:
     while True:
         with _worker_lock():
-            pending_count = sum(
-                record.get("status", "pending") == "pending"
-                for record in _pending_records()
-            )
+            pending_count = sum(_takes_a_slot(record) for record in _pending_records())
         if pending_count < MAX_PENDING_LEADS:
             return
         _set_status("outbox_full", f"{pending_count}/{MAX_PENDING_LEADS} pitches waiting")
@@ -612,7 +640,8 @@ def get_pending_outreach() -> list[dict[str, Any]]:
             # Unsent drafts written with an older template get the current email once
             # (same clip count, link and first name; a subject you wrote stays).
             body = str(record.get("full_email_body") or "")
-            if record.get("status", "pending") == "pending" and is_old_template(body):
+            if record.get("status", "pending") == "pending" and record.get("kind") != DIRECT_KIND \
+                    and is_old_template(body):
                 clips = [clip for clip in record.get("clips") or [] if isinstance(clip, dict)]
                 record["full_email_body"] = rewrite_old_draft(
                     body,
@@ -646,7 +675,8 @@ FOLLOW_UP_AFTER_DAYS = FOLLOW_UP_DAYS["bump"]  # the first follow-up (kept for o
 
 
 def _link_in_first_email(record: dict[str, Any]) -> bool:
-    """True for pitches sent before round 25: their first email had the clip link."""
+    """True when the first email had the clip link (before round 25, and again from
+    round 44): the follow-ups are then the bump with the link and the last note."""
     body = str(record.get("full_email_body") or "")
     link = clip_link(record)
     return (bool(link) and link in body) or "://" in body
@@ -684,7 +714,9 @@ def next_follow_up(record: dict[str, Any], now: datetime | None = None) -> dict[
     "bump_link" or None when all are sent, "number": 1.., "total": steps,
     "due": bool, "due_on": ISO date}."""
     now = now or datetime.now(timezone.utc)
-    steps = follow_up_steps(_link_in_first_email(record))
+    steps = (FOLLOW_UP_STEPS_PARTNER if record.get("kind") == DIRECT_KIND and record.get("partner")
+             else FOLLOW_UP_STEPS_INTRO if record.get("kind") == DIRECT_KIND
+             else follow_up_steps(_link_in_first_email(record)))
     done = len(_follow_ups_sent(record))
     if done >= len(steps):
         return {"step": None, "number": done, "total": len(steps), "due": False, "due_on": ""}
@@ -798,8 +830,11 @@ def get_replies(now: datetime | None = None) -> list[dict[str, Any]]:
         if item["reply"] == "yes":
             body = str(record.get("full_email_body") or "")
             item["yes_reply_subject"] = f"Re: {record.get('subject') or subject_for(body)}"
-            item["yes_reply_body"] = build_yes_reply(
-                _first_name_of(record), clip_link(record), _clip_count_of(record), _content_format_of(record)
+            item["yes_reply_body"] = (
+                build_partner_yes_reply(_first_name_of(record)) if record.get("partner")
+                else build_intro_yes_reply(_first_name_of(record)) if record.get("kind") == DIRECT_KIND
+                else build_yes_reply(_first_name_of(record), clip_link(record), _clip_count_of(record),
+                                     _content_format_of(record))
             )
         replies.append(item)
     replies.sort(key=lambda item: str(item.get("replied_at")), reverse=True)
@@ -880,9 +915,13 @@ def pass_summary(now: datetime | None = None) -> dict[str, int]:
                 "auto_weak" if error.startswith("weak moments")
                 else "auto_screen_share" if error.startswith(SCREEN_SHARE_PIP)
                 else "auto_age" if error.startswith(AGE_RESTRICTED)
+                else "auto_dubbed" if error.startswith(AUTO_DUBBED)
                 else "auto_faceless"
             )
             counts[key] = counts.get(key, 0) + 1
+    for record in low_fit_leads():  # Round 53: found by the worker, not queued (no buyer)
+        if recent(record.get("skipped_at")):
+            counts["auto_low_fit"] = counts.get("auto_low_fit", 0) + 1
     return counts
 
 
@@ -909,10 +948,11 @@ def restore_passed_as_sent(record_id: str) -> bool:
     return True
 
 
-def mark_follow_up(record_id: str, outcome: str) -> bool:
+def mark_follow_up(record_id: str, outcome: str, step: str = "", to: str = "") -> bool:
     """outcome: "followed_up" (the next follow-up was sent), "yes" / "no" / "other"
     (they replied; "replied" is the same as "other"), or "client" (a "yes" became a
-    trial or a paying client)."""
+    trial or a paying client). Round 53: ``step`` names the follow-up that went out
+    (core.follow_up_plan: warm, nudge, new_door, resend, last) and ``to`` who it went to."""
     if outcome not in {"followed_up", "replied", "client", *REPLY_OUTCOMES}:
         raise KeyError(outcome)
     now = datetime.now(timezone.utc).isoformat()
@@ -924,6 +964,11 @@ def mark_follow_up(record_id: str, outcome: str) -> bool:
             if outcome == "followed_up":
                 record["follow_ups"] = _follow_ups_sent(record) + [now]
                 record.setdefault("followed_up_at", now)
+                if step:
+                    record["follow_up_log"] = list(record.get("follow_up_log") or []) + [
+                        {"step": step, "at": now, **({"to": to} if to else {})}]
+                if step == "new_door":
+                    record["marketer_sent_at"] = now
             elif outcome == "client":
                 record["client_at"] = now
             else:
@@ -931,6 +976,31 @@ def mark_follow_up(record_id: str, outcome: str) -> bool:
                 record["reply"] = "other" if outcome == "replied" else outcome
             _write_json_atomic(PENDING_OUTREACH_PATH, records)
             return True
+    return False
+
+
+def get_all_sent() -> list[dict[str, Any]]:
+    """Round 54: every pitch ever marked sent (replied or not), for the reply-rate breakdowns."""
+    with _worker_lock():
+        return [record for record in _pending_records() if record.get("status") == "sent"]
+
+
+RECORD_FIELDS = {"marketing_contact", "marketer_sent_at"}
+
+
+def set_record_fields(record_id: str, **fields: Any) -> bool:
+    """Round 53: save extra facts on a pitch (pending or sent), e.g. the marketing contact
+    found from the Outbox. Only RECORD_FIELDS can be set this way."""
+    unknown = set(fields) - RECORD_FIELDS
+    if unknown:
+        raise KeyError(", ".join(sorted(unknown)))
+    with _worker_lock():
+        records = _pending_records()
+        for record in records:
+            if record.get("record_id") == record_id:
+                record.update(fields)
+                _write_json_atomic(PENDING_OUTREACH_PATH, records)
+                return True
     return False
 
 
@@ -972,7 +1042,7 @@ def mark_outreach_sent(record_id: str, *, subject: str | None = None, body: str 
                 _write_json_atomic(PENDING_OUTREACH_PATH, pending)
                 state = _processed_state()
                 channel_id = record.get("channel_id")
-                if isinstance(channel_id, str):
+                if isinstance(channel_id, str) and channel_id:
                     _update_lead_status(state, channel_id, "sent")
                 remove_pitch_files(record_id, _pitches_dir())  # previews are only for the Outbox
                 return True
@@ -1000,6 +1070,12 @@ def record_clip_trim(record_id: str, index: int, start: float, end: float) -> bo
     return False
 
 
+# Round 49: you can take any clip out of a pitch, down to its last one (a pitch with one strong
+# clip beats one with a weak second). The pipeline still skips a lead with fewer than MIN_CLIPS
+# good clips when it makes the pitch.
+OUTBOX_MIN_CLIPS = 1
+
+
 def remove_pitch_clip(record_id: str, index: int) -> dict[str, Any]:
     """Drop clip ``index`` (from 1) from a pitch in the Outbox: off their clip page, out
     of the Drive backup, this Mac's saved files and the record. Later clips move up one
@@ -1019,8 +1095,8 @@ def remove_pitch_clip(record_id: str, index: int) -> dict[str, Any]:
         if manifest.is_file()
         else len(record.get("clips") or [])
     )
-    if count <= MIN_CLIPS:
-        raise ValueError(f"A pitch keeps at least {MIN_CLIPS} clips. To send fewer, Pass this creator.")
+    if count <= OUTBOX_MIN_CLIPS:
+        raise ValueError("That's the pitch's only clip. To drop the pitch, Pass this creator.")
     if not 1 <= index <= count:
         raise ValueError(f"There's no clip {index} in this pitch.")
 
@@ -1077,6 +1153,14 @@ def remove_pitch_clip(record_id: str, index: int) -> dict[str, Any]:
     }
 
 
+def _lead_theme(lead: dict[str, Any]) -> str:
+    """Round 46: what a B2B prospect is covering this month (core.linkedin_harvester), or ''."""
+    from core.outreach import clean_theme
+
+    angle = lead.get("calendar_angle") if isinstance(lead.get("calendar_angle"), dict) else {}
+    return clean_theme(angle.get("theme"))
+
+
 def _same_moment(first: Any, second: Any) -> bool:
     try:
         return abs(float(first) - float(second)) <= 1.0
@@ -1091,12 +1175,14 @@ def _email_from_facts(record: dict[str, Any], facts: dict[str, Any], count: int)
         str(record.get("channel_title") or ""),
         video_title=str(record.get("video_title") or ""),
         video_topic=str(facts.get("topic") or ""),
+        drive_link=clip_link(record),  # round 44: the first email carries the link
         clip_count=count,
         opening_at=float(at) if isinstance(at, (int, float)) else None,
         key_point=str(facts.get("point") or ""),
         greeting_name=greeting_name_of(str(record.get("full_email_body") or "")),
         content_format=str(facts.get("format") or ""),
         business=bool(facts.get("business")),
+        theme=str(facts.get("theme") or ""),
     )
 
 
@@ -1221,6 +1307,7 @@ def _enqueue_leads(leads: list[dict[str, Any]]) -> int:
     discover_channels marks all returned channels as seen, so leads that are not
     saved here are never found again.
     """
+    leads, low_fit = _fit_leads(leads)
     with _worker_lock():
         queue = _lead_queue()
         queued_ids = {str(lead.get("channel_id")) for lead in queue}
@@ -1232,7 +1319,55 @@ def _enqueue_leads(leads: list[dict[str, Any]]) -> int:
                 queued_ids.add(channel_id)
                 added += 1
         _write_json_atomic(LEAD_QUEUE_PATH, queue)
+        if low_fit:
+            _record_low_fit(low_fit)
     return added
+
+
+LOW_FIT_PATH = STORAGE_DIR / "low_fit_leads.json"
+LOW_FIT_KEEP = 300
+
+
+def _fit_leads(leads: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Round 53 (core.fit): each lead gets its buyer fit, and a better fit moves it up the
+    queue. Channels the worker found by itself that clearly can't buy (sports, schools,
+    consumer money tips...) are not queued at all, so no render time goes to them. Leads you
+    chose (a B2B prospect you queued, a forced creator) always go through. FIT_GATE=0 turns
+    all of this off."""
+    if not fit_gate_on():
+        return leads, []
+    kept, dropped = [], []
+    for lead in leads:
+        fit = buyer_fit(lead)
+        lead = {**lead, "fit": {"points": fit["points"], "grade": fit["grade"]}}
+        chosen = lead.get("source") == "b2b_harvester" or lead.get("forced") or lead.get("do_next")
+        if fit["grade"] == "skip" and not chosen:
+            dropped.append({"channel_id": lead.get("channel_id"), "channel_title": lead.get("channel_title"),
+                            "fit": fit, "skipped_at": datetime.now(timezone.utc).isoformat()})
+            logger.info("Not queued (not a buyer): %s: %s", lead.get("channel_title"), "; ".join(fit["reasons"][-3:]))
+            continue
+        try:
+            lead["priority"] = int(lead.get("priority") or 0) + (fit["points"] - 50) // 10
+        except (TypeError, ValueError):
+            pass
+        kept.append(lead)
+    return kept, dropped
+
+
+def _record_low_fit(dropped: list[dict[str, Any]]) -> None:
+    try:
+        existing = json.loads(LOW_FIT_PATH.read_text(encoding="utf-8")) if LOW_FIT_PATH.exists() else []
+    except (OSError, ValueError):
+        existing = []
+    _write_json_atomic(LOW_FIT_PATH, (list(existing) + dropped)[-LOW_FIT_KEEP:])
+
+
+def low_fit_leads() -> list[dict[str, Any]]:
+    """Channels the worker didn't queue because there's no buyer behind them (newest last)."""
+    try:
+        return json.loads(LOW_FIT_PATH.read_text(encoding="utf-8")) if LOW_FIT_PATH.exists() else []
+    except (OSError, ValueError):
+        return []
 
 
 FIRST_IN_LINE = 1000  # "Do next" (and a forced creator whose turn has come) go before every scored lead
@@ -1609,7 +1744,9 @@ def _content_kind(report: dict[str, Any], subject: str, email: str) -> str:
 
 def _cap_like_make_clips(clips: list[ClipResult], words: list[Word], report: dict[str, Any]) -> list[ClipResult]:
     """Round 32: the worker's clips end on a finished sentence at 59 s at most, like Make
-    clips' "59 s max" (STANDARD_EDIT.max_seconds); the pitch's clip length follows."""
+    clips' "59 s max" (STANDARD_EDIT.max_seconds); the pitch's clip length follows.
+    Round 55 (core.clip_length): max_seconds is None by default, so nothing is cut here and
+    every clip keeps its idea-complete 35-180 s ending (CLIP_LENGTH=legacy brings the cap back)."""
     if not STANDARD_EDIT.max_seconds or not clips:
         return clips
     capped = cap_clip_length(clips, words, STANDARD_EDIT.max_seconds)
@@ -1711,6 +1848,21 @@ def _requeue_interrupted(lead: dict[str, Any]) -> None:
         logger.exception("Could not put %s back in the queue", lead.get("channel_title"))
 
 
+def _auto_dub_check(video_url: str) -> str:
+    """Round 51: why the video is auto-dubbed (core.downloader.auto_dub_reason), or ''. A failed
+    metadata lookup doesn't block the lead: the download's own check runs after it. AUTO_DUB_CHECK=0
+    turns the check off (tests/run_all.py does for the suites before it: they fake the download)."""
+    if os.getenv("AUTO_DUB_CHECK", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return ""
+    try:
+        return str(fetch_video_info(video_url).get("auto_dub") or "")
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, SignInRequired):
+            return ""
+        logger.info("Couldn't check %s for dubbed audio before downloading (%s); checking after.", video_url, exc)
+        return ""
+
+
 def _skip_not_a_fit(lead: dict[str, Any], reason: NotAFit) -> None:
     """Record why, and never queue this creator again."""
     channel_id = str(lead.get("channel_id", ""))
@@ -1748,12 +1900,20 @@ def _process_lead(
     queued = False
     page_name: str | None = None
     try:
+        # Round 51: never an auto-dubbed video (an AI voice over the speaker's lips). Checked from
+        # the video's audio tracks before downloading it, and again from the download itself.
+        dubbed = _auto_dub_check(video_url)
+        if dubbed:
+            raise NotAFit(dubbed)
         try:
             source_video = Path(download_source_video(video_url))
         except SignInRequired as exc:
             if exc.age_restricted:
                 raise NotAFit(f"{AGE_RESTRICTED}: YouTube needs a signed-in 18+ account for this video") from exc
             raise
+        dubbed = str((peek_download_info(video_url) or {}).get("auto_dub") or "")
+        if dubbed and os.getenv("AUTO_DUB_CHECK", "1").strip().lower() not in {"0", "false", "no", "off"}:
+            raise NotAFit(dubbed)
         # Right after the download, before any transcribing, AI, rendering or upload.
         # A creator you forced into the queue skips these checks: you decided.
         camera = camera_check(source_video) if not forced else None
@@ -1801,6 +1961,8 @@ def _process_lead(
                 min_judge_score=FORCED_MIN_CLIP_SCORE if forced else MIN_CLIP_SCORE,
                 report=report,
                 business=bool(lead.get("business_offer")),
+                heatmap=list(video_info.get("heatmap") or []) or None,  # Round 36: replay spikes, as in the app
+                theme=_lead_theme(lead),  # Round 46: the B2B prospect's content-calendar angle
             )
         except WeakMoments as exc:
             raise NotAFit(f"weak moments: {exc}") from exc
@@ -1816,7 +1978,7 @@ def _process_lead(
             layouts,
             rendered_items,
             graphics=VideoInfo(title=str(video_title or ""), channel=str(channel_title or ""),
-                               description=str(video_info.get("description") or "")),
+                               description=str(video_info.get("description") or ""), theme=_lead_theme(lead)),
         )
         if rendered_items:
             try:
@@ -1832,6 +1994,7 @@ def _process_lead(
                     video_title,
                     [{"path": path, "start": clip.start_time, "end": clip.end_time} for path, clip in zip(rendered, clips)],
                     kind=_content_kind(report, subject, outreach_email),
+                    theme=_lead_theme(lead),
                 )
             except Exception:
                 logger.warning(
@@ -1854,6 +2017,9 @@ def _process_lead(
         if not link:
             raise RuntimeError("The clip page couldn't be made and DRIVE_BACKUP is off, so there's no link to send.")
         email_body = fill_drive_link(outreach_email, link)
+        if not greeting_name_of(email_body) and clean_first_name(str(lead.get("contact_name") or "").split(" ")[0]):
+            # Round 46: a B2B prospect's named decision-maker (core.linkedin_harvester)
+            email_body = set_greeting(email_body, clean_first_name(str(lead["contact_name"]).split(" ")[0]))
         channel_url = str(
             lead.get("channel_url")
             or f"https://www.youtube.com/channel/{lead['channel_id']}"
@@ -1892,6 +2058,14 @@ def _process_lead(
             **({"pitch": report["pitch_facts"]} if isinstance(report.get("pitch_facts"), dict) else {}),
             **({"business_offer": lead["business_offer"]} if lead.get("business_offer") else {}),
             **({"linkedin_url": lead["linkedin_url"]} if lead.get("linkedin_url") else {}),
+            # Round 51: the links in their channel description (the Outbox shows them)
+            **({"social_links": list(lead["social_links"])[:12]} if lead.get("social_links") else {}),
+            **({"channel_url": lead["channel_url"]} if lead.get("channel_url") else {}),
+            # Round 47: a B2B prospect's contact, for the Outbox (core.linkedin_harvester)
+            **{key: lead[key] for key in ("contact_name", "contact_role", "contact_confidence", "website", "prospect_id")
+               if lead.get(key)},
+            # Round 53: who else to write to, and what the channel says it does (core.fit reads it)
+            **{key: lead[key] for key in ("marketing_contact", "description", "linkedin_company") if lead.get(key)},
             "subscriber_count": lead.get("subscriber_count"),
             "video_seconds": round(duration),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1903,10 +2077,7 @@ def _process_lead(
         while True:
             with _worker_lock():
                 pending = _pending_records()
-                pending_count = sum(
-                    record.get("status", "pending") == "pending"
-                    for record in pending
-                )
+                pending_count = sum(_takes_a_slot(record) for record in pending)
                 if pending_count < MAX_PENDING_LEADS:
                     pending.append(pending_record)
                     _write_json_atomic(PENDING_OUTREACH_PATH, pending)
@@ -2242,10 +2413,7 @@ def run_continuous_queue(
             logger.info("Stopped from the app.")
             return
         with _worker_lock():
-            pending_count = sum(
-                record.get("status", "pending") == "pending"
-                for record in _pending_records()
-            )
+            pending_count = sum(_takes_a_slot(record) for record in _pending_records())
 
         if pending_count >= buffer_size:
             if logged_full_at != pending_count:  # say it once, not every 5 seconds

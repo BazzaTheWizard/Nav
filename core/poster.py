@@ -99,11 +99,13 @@ def best_poster_time(clip: Path, window: tuple[float, float] = AUTO_WINDOW) -> f
     return round(best[1], 2) if best else DEFAULT_POSTER_AT
 
 
-def poster_jpeg(clip: Path, at: float, width: int = POSTER_WIDTH) -> bytes:
-    """The frame at ``at`` seconds as a JPEG (what the clip page shows)."""
+def poster_jpeg(clip: Path, at: float, width: int = POSTER_WIDTH, quality: int = 3) -> bytes:
+    """The frame at ``at`` seconds as a JPEG (what the clip page shows). ``quality``: FFmpeg's
+    -q:v (2 is near-lossless: the full-size cover image, Round 49)."""
     result = subprocess.run(
         [_ffmpeg(), "-v", "error", "-ss", f"{max(0.0, at):.3f}", "-i", str(clip), "-frames:v", "1",
-         "-vf", f"scale={width}:-2", "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+         "-vf", f"scale={width}:-2:flags=lanczos,format=yuvj420p", "-q:v", str(int(quality)), "-f", "image2pipe",
+         "-vcodec", "mjpeg", "pipe:1"],
         capture_output=True, timeout=60,
     )
     if result.returncode != 0 or not result.stdout:

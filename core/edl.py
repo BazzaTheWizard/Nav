@@ -24,6 +24,7 @@ TEMPLATES = (
     "timeline", "metric_bars", "ranked_bars", "diverging_bar", "share_split", "trend_line",
     "arr_bridge", "sankey_flow", "cac_payback", "drawdown_curve", "candlestick_ema",
     "comparison_card", "step_sequence", "market_line",
+    "geo_map_card", "prediction_gauge_card", "flow_sankey_card", "framework_matrix_card", "headline_card",
 )
 TEMPLATE_LABELS = {
     "kinetic_range": "A · Number or range over the speaker",
@@ -44,9 +45,25 @@ TEMPLATE_LABELS = {
     "comparison_card": "C · Comparison card (two sides of the speaker's contrast, in their words)",
     "step_sequence": "C · Step sequence (2–4 steps of the speaker's framework, in order)",
     "market_line": "C · Market data (a real price, rate or revenue series, with its source)",
+    "geo_map_card": "C · Map (1–3 countries named; trade or capital arcs between them)",
+    "prediction_gauge_card": "C · Odds (a probability from 50%: the speaker's, or a Polymarket market)",
+    "flow_sankey_card": "C · Value chain (2–5 companies or stages in order, optional amounts)",
+    "framework_matrix_card": "C · Framework (a 2x2 matrix, or a 3–4 step flywheel)",
+    "headline_card": "C · Thesis (the speaker's key line as a press pull quote)",
 }
 MODES = {name: ("overlay" if name in {"kinetic_range", "buckets", "stat_pill", "speaker_title"} else "split")
          for name in TEMPLATES}
+# Round 41: the Visual Proof overlays (core.proof_cards, planned by core.visual_proof). The
+# speaker stays full-screen under them. Kept out of TEMPLATES (what the AI director and the
+# manual editor offer); valid on any card.
+PROOF_TEMPLATES = ("brand_proof", "wiki_proof", "stat_proof", "newspaper_tearout")
+MODES.update({name: "overlay" for name in PROOF_TEMPLATES})
+TEMPLATE_LABELS.update({
+    "brand_proof": "Proof · Company logo pill (named on its word)",
+    "wiki_proof": "Proof · Wikipedia card (a person, event or book named)",
+    "stat_proof": "Proof · A figure rolling up as it's said",
+    "newspaper_tearout": "Proof · Newspaper tear-out (the thesis line, highlighted as said)",
+})
 
 
 @dataclass
@@ -96,7 +113,7 @@ class Card:
     entity: str = ""
 
     def __post_init__(self) -> None:
-        if self.template not in TEMPLATES:
+        if self.template not in TEMPLATES and self.template not in PROOF_TEMPLATES:
             raise ValueError(f"Unknown card template: {self.template!r}")
         self.rows = [row if isinstance(row, CardRow) else CardRow(**row) for row in self.rows]
 
@@ -111,6 +128,17 @@ class BrandKit:
     accent: str = "#F4C430"
     logo_path: str = ""
     show_name: str = ""
+    # Round 40 (core.palettes): which editorial palette the graphics wear. "auto" picks one
+    # per clip from its topic and studio lighting; or nyt_archival, bloomberg_obsidian,
+    # economist_slate, studio_adaptive, classic (Round 39's dark palette with ``accent``).
+    palette_mode: str = "auto"
+    # The palette resolved for one clip (core.palettes.Palette.to_dict), set by the pipeline
+    # on the clip's own copy of the kit. Empty: classic (every older edit and test).
+    palette: dict[str, Any] = field(default_factory=dict)
+    # Round 45: the client's executive, for the lower-third ID (core.executive), e.g.
+    # "Omeed Tabiei" / "Founder, Optimist Legal". Shown only when the face check is certain.
+    exec_name: str = ""
+    exec_title: str = ""
 
 
 @dataclass
