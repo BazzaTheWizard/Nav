@@ -49,3 +49,8 @@ storage/jobs/
 storage/clip_mode/
 # Round 64: the streamer leads (contact details, your notes, the cached Twitch token)
 storage/leads/
+
+# Local TwitchDownloaderCLI binary & licenses
+TwitchDownloaderCLI
+COPYRIGHT.txt
+THIRD-PARTY-LICENSES.txt
