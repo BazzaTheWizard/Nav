@@ -79,6 +79,11 @@ class Assembly:
 def plan(script: Script, spans: list[LineSpan], library: Library, avoid_recent: bool = True) -> tuple[list[Piece], list[Cue]]:
     """Which shot plays when. Never the same shot twice in one video while others are left."""
     pool = library.shots()
+    footage = sum(s.duration for s in pool)
+    needed = spans[-1].end if spans else 0.0
+    if pool and footage < needed:
+        logger.warning("The library holds %.0f s of footage for a %.0f s voiceover: shots will repeat. "
+                       "Add footage (python tools/narrate.py ingest <folder>).", footage, needed)
     used: set[int] = set(library.recent_shot_ids()) if avoid_recent else set()
     pieces: list[Piece] = []
     cues: list[Cue] = []

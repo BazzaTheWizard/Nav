@@ -2,6 +2,10 @@
 
 Branch: `gta-narrate`. Read `docs/GTA6_INTEGRATION_PLAN.md` first, then this.
 
+**Done in Round 62.** What was built against each item is noted inline below; the tuning
+numbers are in `docs/CLIP_MODE_TUNING.md`. Still open: tuning the chat signal on a real
+chat replay (it could not be fetched from the build machine), and an `app.py` tab for both modes.
+
 ## What exists (Rounds 59-61)
 - Narrate mode: `core/narrate/*`, `tools/narrate.py` (tests 59, 60).
 - Clip mode, mechanical part: `core/clip_mode/chat.py` (chat replay in), `core/clip_mode/signals.py`
@@ -21,6 +25,10 @@ are different:
 - chat spikes lag the moment by about 2-8 s (people react after seeing it).
 
 ## What to build
+(1-3 built: `core/clip_mode/picker.py`, `signals.py`; 4: `tests/test_round62.py`; the review
+pass fixed `expansion=none` on pop-up text, negative word starts at a section's edge, and a
+warning when the footage library is shorter than the voiceover.)
+
 1. A gaming mode for the picker, switched on by `CLIP_LENGTH=gaming` (or a new `CONTENT_KIND=stream`):
    - a stream-highlight prompt (hype, rage, funny, clutch, fail, wholesome; a reaction you can
      understand without context), returning moments with a payoff time;

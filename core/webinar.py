@@ -40,7 +40,12 @@ GAP_HEIGHT = 24  # "gap": dark space between the two
 SHADOW_STEPS = (0.55, 0.42, 0.3, 0.2, 0.12, 0.06)  # "shadow": 4 px bands, darkest at the top
 # Slide shape: "auto" trims dark borders; "16:9" and "4:3" crop the slide area to exactly
 # that shape (centered), so it's scaled evenly and never stretched.
-SLIDE_SHAPES = {"auto": None, "16:9": 16 / 9, "4:3": 4 / 3}
+SLIDE_SHAPES = {"auto": None, "16:9": 16 / 9, "4:3": 4 / 3, "stream": 4 / 3}
+# Round 62, slides="stream": a streamer's facecam over their gameplay. The content is a 4:3
+# crop of the game placed on the side away from the camera corner (so the camera is not
+# shown twice) and shown taller than slides, since gameplay has no text to keep readable.
+STREAM_CONTENT_MAX_HEIGHT = 840
+FACE_WINDOW_EXTRA = 0.5  # a webcam window usually reaches this much of the face box past it
 TITLE_GAP = 28  # slides -> title card
 CAPTION_GAP = 36  # slides (or the title card) -> captions
 TITLE_CAPTION_GAP = 20
@@ -112,17 +117,31 @@ class WebinarLayout:
         content = self.content
         content_crop = f"crop=w={content.width}:h={content.height}:x={content.x}:y={content.y}"
         band, rest = BAND_HEIGHT, OUTPUT_HEIGHT - BAND_HEIGHT
+        split = ("[0:v]split=4[web_cam][web_blur][web_slides][web_slides2];" if self.slides == "stream"
+                 else "[0:v]split=3[web_cam][web_blur][web_slides];")
         return (
-            "[0:v]split=3[web_cam][web_blur][web_slides];"
-            f"[web_cam]{cam_crop},scale=w={OUTPUT_WIDTH}:h={band}:force_original_aspect_ratio=decrease:"
+            split
+            + f"[web_cam]{cam_crop},scale=w={OUTPUT_WIDTH}:h={band}:force_original_aspect_ratio=decrease:"
             f"force_divisible_by=2:flags=lanczos{sharpen}[web_face];"
             # A quarter-size blur scaled up, as in the blurred-background layouts.
             f"[web_blur]{cam_crop},scale=270:{band // 4}:force_original_aspect_ratio=increase,"
             f"crop=270:{band // 4},boxblur=5:2,eq=brightness=-0.15,scale={OUTPUT_WIDTH}:{band}[web_back];"
             "[web_back][web_face]overlay=x=(W-w)/2:y=(H-h)/2[web_top];"
-            f"[web_slides]{content_crop},scale={self.content_width}:{self.content_height}:flags=lanczos,"
-            f"pad={OUTPUT_WIDTH}:{rest}:(ow-iw)/2:{self.content_top - band}:color=black[web_bottom];"
-            f"[web_top][web_bottom]vstack=inputs=2{self._divider()}[base]"
+            + self._bottom(content_crop, sharpen, rest)
+            + f"[web_top][web_bottom]vstack=inputs=2{self._divider()}[base]"
+        )
+
+    def _bottom(self, content_crop: str, sharpen: str, rest: int) -> str:
+        """The content on black (slides), or, for slides="stream", on a dark blurred copy of
+        itself so the caption area is not a black hole."""
+        content = f"[web_slides]{content_crop},scale={self.content_width}:{self.content_height}:flags=lanczos"
+        if self.slides != "stream":
+            return f"{content},pad={OUTPUT_WIDTH}:{rest}:(ow-iw)/2:{self.content_top - band_height()}:color=black[web_bottom];"
+        return (
+            f"{content}{sharpen}[web_game];"
+            f"[web_slides2]{content_crop},scale=270:{rest // 4}:force_original_aspect_ratio=increase,crop=270:{rest // 4},"
+            f"boxblur=6:2,eq=brightness=-0.35:saturation=0.8,scale={OUTPUT_WIDTH}:{rest}[web_game_back];"
+            f"[web_game_back][web_game]overlay=x=(W-w)/2:y={self.content_top - band_height()}[web_bottom];"
         )
 
     def _divider(self) -> str:
@@ -158,6 +177,10 @@ def layout_from_dict(data: dict[str, object]) -> WebinarLayout:
         box = values[key]
         values[key] = CropBox(**box) if isinstance(box, dict) else box
     return WebinarLayout(**values)  # type: ignore[arg-type]
+
+
+def band_height() -> int:
+    return BAND_HEIGHT
 
 
 def _slide_shape(box: CropBox, shape: str) -> CropBox:
@@ -313,6 +336,33 @@ def _webcam_window(
     )
 
 
+def _stream_box(camera: CropBox, corner: str, width: int, height: int, found: str = "webcam window") -> CropBox:
+    """The gameplay for slides="stream": the tallest 4:3 crop that leaves the camera out,
+    on the side away from it (a camera top-right -> the crop hugs the left edge). The
+    camera's column is left out only when enough width remains; a huge camera is ignored.
+    When only the face was found (not the window around it), the window is assumed to
+    reach FACE_WINDOW_EXTRA of the face box further toward the middle of the frame."""
+    ratio = SLIDE_SHAPES["stream"]
+    full_w = min(width, height * ratio)
+    margin = _even(width * 0.008)  # the window's border line
+    extra = _even(camera.width * FACE_WINDOW_EXTRA) if found == "face" else 0
+    if corner.endswith("right"):
+        free_w = max(0, camera.x - margin - extra)
+        x = 0
+    else:
+        free_w = max(0, width - (camera.x + camera.width) - margin - extra)
+        x = width - free_w
+    if free_w >= 0.75 * full_w:  # the camera can be left out without upscaling the game much
+        crop_w = _even(min(full_w, free_w))
+        crop_h = _even(min(height, crop_w / ratio))
+        x = x if corner.endswith("right") else width - crop_w
+    else:
+        crop_w, crop_h = _even(full_w), _even(min(height, full_w / ratio))
+        x = (width - crop_w) / 2
+    y = (height - crop_h) / 2
+    return CropBox(_even_position(x), _even_position(y), crop_w, crop_h)
+
+
 def _default_box(corner: str, width: int, height: int) -> CropBox:
     """No face found: a 16:9 webcam-sized box tucked into the corner."""
     box_w = _even(width * DEFAULT_WEBCAM_WIDTH)
@@ -367,9 +417,12 @@ def plan_webinar(
         camera, how = _default_box(chosen, width, height), "no face: default corner box"
     if slides == "16:9":
         content = _slide_shape(CropBox(0, 0, _even(width), _even(height)), slides)
+    elif slides == "stream":
+        content = _stream_box(camera, chosen, width, height, how)
     else:
         content = _slide_shape(_content_box(frames, width, height, camera if how == "webcam window" else None), slides)
-    scale = min(OUTPUT_WIDTH / content.width, CONTENT_MAX_HEIGHT / content.height)
+    max_height = STREAM_CONTENT_MAX_HEIGHT if slides == "stream" else CONTENT_MAX_HEIGHT
+    scale = min(OUTPUT_WIDTH / content.width, max_height / content.height)
     layout = WebinarLayout(
         frame_width=width, frame_height=height, corner=chosen, found=how, camera=camera, content=content,
         content_width=_even(content.width * scale), content_height=_even(content.height * scale),

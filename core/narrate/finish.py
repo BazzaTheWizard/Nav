@@ -66,7 +66,7 @@ def popup_filters(cues: list[Cue], to_output: Callable[[float], float], work: Pa
         # fade in over 0.12 s, out over 0.2 s
         alpha = f"if(lt(t,{a:.3f}+0.12),(t-{a:.3f})/0.12,if(gt(t,{b:.3f}-0.2),({b:.3f}-t)/0.2,1))"
         filters.append(
-            f"drawtext=fontfile='{FONT}':textfile='{text_file}':fontsize=92:fontcolor={ink}:"
+            f"drawtext=fontfile='{FONT}':textfile='{text_file}':expansion=none:fontsize=92:fontcolor={ink}:"
             f"box=1:boxcolor={box}:boxborderw=28:x=(w-text_w)/2:y={POPUP_Y}:"
             f"alpha='{alpha}':enable='between(t,{a:.3f},{b:.3f})'")
     return filters
