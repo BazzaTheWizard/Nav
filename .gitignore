@@ -47,3 +47,5 @@ clip_r*/
 storage/narrate/
 storage/jobs/
 storage/clip_mode/
+# Round 64: the streamer leads (contact details, your notes, the cached Twitch token)
+storage/leads/

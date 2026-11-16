@@ -1,7 +1,9 @@
-"""Round 63: the 🎮 GTA tab. Both GTA clipping modes as buttons instead of terminal commands.
+"""Round 63: the 🎮 GTA tab. The GTA modes as buttons instead of terminal commands.
 
 - 🎙️ Narrate (tools/narrate.py): footage library -> script -> voiceover -> finished clips
 - 📺 Stream clips (tools/clip_stream.py): a licensed campaign VOD -> highlight clips
+- 🔎 Find Streamers (tools/find_leads.py, Round 64): who is live on GTA with 30-400 viewers and a
+  public VOD -> a table of leads with your status per lead, and two sample clips to pitch with
 
 Each button starts the tool as a background job (core.tool_jobs), with exactly the flags you
 would type, so the app and the terminal always make the same clips. The tools set their own
@@ -10,7 +12,7 @@ them out of the podcast pipeline that runs in this one. Jobs keep going when you
 reload; their output shows live under the buttons, with a Stop button.
 
 The pure helpers (the argv builders, the folder readers) have no Streamlit in them and are tested
-in tests/test_round63.py; render_tab() is the UI.
+in tests/test_round63.py and tests/test_round64.py; render_tab() is the UI.
 """
 from __future__ import annotations
 
@@ -24,11 +26,13 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from core import leads as LD
 from core import tool_jobs
 
 ROOT = Path(__file__).resolve().parent
 NARRATE_TOOL = ROOT / "tools" / "narrate.py"
 STREAM_TOOL = ROOT / "tools" / "clip_stream.py"
+LEADS_TOOL = ROOT / "tools" / "find_leads.py"
 # The folders the tools use (tools/narrate.py LIBRARY_DB, CAPTION_HISTORY, OUT_DIR;
 # tools/clip_stream.py OUT_ROOT). Not imported from the tools: importing them would set their
 # environment defaults in the app's process. tests/test_round63.py checks they still match.
@@ -53,7 +57,11 @@ CAPTION_LOOKS = {"Rotate per video (default)": "rotate", "Bold (yellow word)": "
 STREAM_LAYOUTS = {"Stream: facecam on top, gameplay below (default)": "stream",
                   "Full frame on blur": "blurred_background", "Face-tracked crop": "smart_crop",
                   "Webinar": "webinar", "Automatic": "auto"}
-NARRATE, STREAM = "narrate", "stream"
+NARRATE, STREAM, LEADS = "narrate", "stream", "leads"
+MODES = ("🎙️ Narrate", "📺 Stream clips", "🔎 Find Streamers")
+SAMPLE_CLIPS = 2  # clips made per lead to pitch with
+LEAD_COLUMNS = ("username", "status", "live_viewers", "avg_viewers", "tier", "game", "stream_title", "vod_duration",
+                "vod_age_days", "vod_note", "contact_hints", "latest_vod_url", "channel_url")
 
 
 # ------------------------------------------------------------------ argv builders (no UI)
@@ -110,6 +118,66 @@ def stream_argv(*, url: str = "", video: str = "", chat: str = "", campaign: str
             argv += [flag, value]
     argv += (["--no-audio-signal"] if not audio_signal else []) + (["--no-judge"] if not judge else [])
     return argv + (["--plan"] if plan else [])
+
+
+def leads_argv(games: str = "", lo: int = LD.MIN_VIEWERS, hi: int = LD.MAX_VIEWERS,
+               default_games: bool = True) -> list[str]:
+    """tools/find_leads.py for the Find Streamers form. ``games``: extra games, one per line or
+    comma-separated."""
+    extra = [g.strip() for g in re.split(r"[,\n]", games) if g.strip()]
+    if int(lo) > int(hi):
+        raise ValueError("The fewest viewers must not be above the most.")
+    if not default_games and not extra:
+        raise ValueError("Type a game, or keep GTA VI and GTA V ticked.")
+    argv = [sys.executable, str(LEADS_TOOL), "--min", str(int(lo)), "--max", str(int(hi))]
+    argv += [] if default_games else ["--no-default-games"]
+    for game in extra:
+        argv += ["--game", game]
+    return argv
+
+
+def sample_campaign(login: str) -> str:
+    return f"Pitch sample: {login}"
+
+
+def sample_name(login: str) -> str:
+    return f"pitch-{slug(login)}"
+
+
+def sample_clips_argv(login: str, vod_url: str, display_name: str = "", game: str = "") -> list[str]:
+    """tools/clip_stream.py on a lead's latest VOD: two clips, saved under the lead's own name."""
+    if not login.strip():
+        raise ValueError("Pick a lead first.")
+    if not vod_url.strip():
+        raise ValueError(f"{login} has no past broadcast saved.")
+    return stream_argv(url=vod_url, campaign=sample_campaign(login.strip()), count=SAMPLE_CLIPS,
+                       name=sample_name(login), streamer=display_name or login, game=game)
+
+
+def saved_leads(db: Path = LD.DB_PATH, last_search: bool = True) -> list[dict]:
+    """Leads from the database: the last search's, or every one saved. [] before the first search."""
+    if not Path(db).is_file():
+        return []
+    con = LD.connect(db)
+    try:
+        return LD.rows(con, run=LD.latest_run(con) if last_search else None)
+    finally:
+        con.close()
+
+
+def status_edits(before: list[dict], after: list[dict]) -> dict[str, str]:
+    """{login: new status} for the rows whose status was changed in the table."""
+    was = {r["username"]: r["status"] for r in before}
+    return {r["username"]: r["status"] for r in after
+            if r.get("username") in was and r.get("status") in LD.STATUSES and r["status"] != was[r["username"]]}
+
+
+def save_statuses(edits: dict[str, str], db: Path = LD.DB_PATH) -> int:
+    con = LD.connect(db)
+    try:
+        return sum(LD.set_status(con, login, status) for login, status in edits.items())
+    finally:
+        con.close()
 
 
 # ------------------------------------------------------------------ folder readers (no UI)
@@ -204,16 +272,19 @@ def new_script_path(name: str, scripts_dir: Path = SCRIPTS_DIR) -> Path:
 def render_tab() -> None:
     import streamlit as st
 
-    st.caption("Both GTA modes, as buttons. Each one runs the same command-line tool in the background "
+    st.caption("The GTA modes, as buttons. Each one runs the same command-line tool in the background "
                "(you can switch tabs while it works) and shows its progress here.")
-    mode = st.radio("GTA mode", ["🎙️ Narrate", "📺 Stream clips"], key="gta_mode", horizontal=True,
+    mode = st.radio("GTA mode", list(MODES), key="gta_mode", horizontal=True,
                     label_visibility="collapsed",
                     help="Narrate: your script and voiceover over bought gameplay. Stream clips: highlights "
-                    "from a streamer's VOD, only for a clipping campaign you've joined.")
+                    "from a streamer's VOD, only for a clipping campaign you've joined. Find Streamers: who is "
+                    "live right now and worth pitching.")
     if mode.endswith("Narrate"):
         _render_narrate(st)
-    else:
+    elif mode.endswith("Stream clips"):
         _render_stream(st)
+    else:
+        _render_leads(st)
 
 
 def _start(st: Any, kind: str, label: str, argv: list[str]) -> None:
@@ -478,3 +549,98 @@ def _render_stream_results(st: Any) -> None:
         with columns[n % 3]:
             st.video(clip["file"])
             st.caption(f"{clip['start']:.0f}-{clip['end']:.0f} s · score {clip.get('score')} · {clip.get('title', '')}")
+
+
+# --- Find Streamers --------------------------------------------------------------------
+def _render_leads(st: Any) -> None:
+    st.caption("Streamers live right now with a public past broadcast, from Twitch's API. Each search saves a "
+               "snapshot, so the average viewers column gets truer the more often you search.")
+    _render_job(st, LEADS)
+    with st.form("find_leads"):
+        games = st.text_input("Games (besides GTA VI and GTA V)", placeholder="Red Dead Redemption 2, Fortnite",
+                              help="Separate several with commas. Names are matched to Twitch categories.")
+        default_games = st.checkbox("Search GTA VI and GTA V", value=True,
+                                    help="GTA RP streams are under GTA V. Before Twitch has a GTA VI category, it is "
+                                    "reported and skipped.")
+        lo, hi = st.slider("Live viewers", 0, 2000, (LD.MIN_VIEWERS, LD.MAX_VIEWERS), step=10,
+                           help=f"Under {LD.TIER_SPLIT}: growing. {LD.TIER_SPLIT} and up: established.")
+        find = st.form_submit_button("🔎 Find streamers", type="primary")
+    if find:
+        try:
+            _start(st, LEADS, f"Find streamers ({lo}-{hi} viewers)", leads_argv(games, lo, hi, default_games))
+        except ValueError as exc:
+            st.error(str(exc))
+    _render_leads_results(st)
+
+
+def _render_leads_results(st: Any) -> None:
+    which = st.radio("Show", ["Last search", "Every saved lead"], key="leads_show", horizontal=True,
+                     label_visibility="collapsed")
+    leads = saved_leads(last_search=which == "Last search")
+    if not leads:
+        st.info("No leads yet. Twitch needs TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET in .env; then press "
+                "Find streamers.")
+        return
+    handled = sum(1 for lead in leads if lead["status"] in LD.HANDLED)
+    expiring = sum(1 for lead in leads if "expiring" in lead["vod_note"])
+    st.subheader(f"{len(leads)} leads")
+    st.caption(f"{len(leads) - handled} new · {handled} already handled (listed last)"
+               + (f" · {expiring} with a past broadcast Twitch deletes soon" if expiring else "")
+               + ". Click a column to sort. Change a lead's status in its Status cell.")
+    shown = [{c: lead[c] for c in LEAD_COLUMNS} for lead in leads]
+    revision = st.session_state.get("leads_revision", 0)  # a new key drops the table's stored edits
+    edited = st.data_editor(
+        shown, key=f"leads_table_{revision}", hide_index=True, disabled=[c for c in LEAD_COLUMNS if c != "status"],
+        column_config={
+            "status": st.column_config.SelectboxColumn("Status", options=list(LD.STATUSES), required=True),
+            "username": "Streamer", "live_viewers": "Live", "avg_viewers": "Avg", "tier": "Tier", "game": "Game",
+            "stream_title": "Stream title", "vod_duration": "VOD length", "vod_age_days": "VOD age (days)",
+            "vod_note": "VOD note", "contact_hints": "Contact hints",
+            "latest_vod_url": st.column_config.LinkColumn("Latest VOD"),
+            "channel_url": st.column_config.LinkColumn("About page")})
+    edits = status_edits(shown, edited if isinstance(edited, list) else [])
+    if edits:
+        save_statuses(edits)
+        st.session_state["leads_revision"] = revision + 1
+        st.rerun()
+    st.download_button("⬇️ Download CSV", LD.csv_text(leads), file_name=time.strftime("leads_%Y-%m-%d.csv"),
+                       mime="text/csv")
+
+    st.subheader("One lead")
+    by_login = {lead["username"]: lead for lead in leads}
+    if st.session_state.get("lead_pick") not in by_login:
+        st.session_state["lead_pick"] = leads[0]["username"]
+    login = st.selectbox("Lead", list(by_login), key="lead_pick", format_func=lambda name: (
+        f"{name} · {by_login[name]['live_viewers']} live · {by_login[name]['status']}"))
+    lead = by_login[login]
+    st.markdown(f"[Latest VOD]({lead['latest_vod_url']}) ({lead['vod_duration']}"
+                + (f", {lead['vod_note']}" if lead["vod_note"] else "") + f") · [About page]({lead['channel_url']})"
+                + (f" · {lead['contact_hints']}" if lead["contact_hints"] else " · no contact in the description"))
+    status_column, notes_column, save_column = st.columns([2, 5, 1], vertical_alignment="bottom")
+    status = status_column.selectbox("Status", list(LD.STATUSES), index=LD.STATUSES.index(lead["status"]),
+                                     key=f"lead_status_{login}")
+    notes = notes_column.text_input("Notes", lead["notes"], key=f"lead_notes_{login}")
+    if save_column.button("Save", key=f"lead_save_{login}") and (status, notes) != (lead["status"], lead["notes"]):
+        con = LD.connect()
+        try:
+            LD.set_status(con, login, status, notes)
+        finally:
+            con.close()
+        st.session_state["leads_revision"] = revision + 1
+        st.rerun()
+    st.caption(f"Sample clips are for sending to {lead['display_name'] or login} with your pitch, not for posting: "
+               f"they are saved with the campaign \"{sample_campaign(login)}\".")
+    if st.button(f"🎬 Make sample clips ({SAMPLE_CLIPS})", key=f"lead_sample_{login}", type="primary"):
+        try:
+            _start(st, STREAM, sample_campaign(login),
+                   sample_clips_argv(login, lead["latest_vod_url"], lead["display_name"], lead["game"]))
+        except ValueError as exc:
+            st.error(str(exc))
+    _render_job(st, STREAM)
+    picks = read_json(STREAMS_OUT / sample_name(login) / "picks.json") or {}
+    clips = [c for c in picks.get("clips") or [] if Path(c.get("file", "")).is_file()]
+    columns = st.columns(3) if clips else []
+    for n, clip in enumerate(clips):
+        with columns[n % 3]:
+            st.video(clip["file"])
+            st.caption(f"{clip['start']:.0f}-{clip['end']:.0f} s · {clip.get('title', '')} · {clip['file']}")
