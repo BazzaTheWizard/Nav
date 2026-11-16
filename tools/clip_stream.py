@@ -208,6 +208,26 @@ def analyse(audio: Path, messages: list, duration: float, out: Path, *, full_tra
     return words, SG.heatmap(fused), wins
 
 
+def chat_replay(url: str, out: Path, progress) -> Path | None:
+    """The VOD's chat replay, downloaded once. A download that fails (a sub-only or deleted VOD,
+    the downloader crashing) is not the end of the run: the clips are then ranked by loudness and
+    words, and the next run tries the chat again."""
+    from core.clip_mode import chat as C
+
+    kept = [p for p in sorted(out.glob("chat*.json")) if p.stat().st_size > 0]
+    if progress.done("chat", url):
+        return kept[0] if kept else None
+    progress.start("chat", url)
+    try:
+        found = C.download(url, out)
+    except Exception as exc:  # noqa: BLE001 - chat is one signal of three
+        logging.warning("The chat replay could not be downloaded (%s). Continuing without chat.",
+                        str(exc).strip().splitlines()[0][:200] if str(exc).strip() else type(exc).__name__)
+        return None
+    progress.finish("chat", url, file=found.name if found else "")
+    return found
+
+
 def _dump_clip(clip) -> dict:
     return {**clip.model_dump(), "peak_retention_score": getattr(clip, "peak_retention_score", None)}
 
@@ -287,17 +307,7 @@ def main() -> None:
     print(f"VOD: {meta['title'] or audio.name}  {duration / 60:.0f} min  {streamer} / {game or '?'}")
 
     stage("Chat replay")
-    if args.chat:
-        chat_file = Path(args.chat)
-    elif not args.url:
-        chat_file = None
-    else:
-        kept = [p for p in sorted(out.glob("chat*.json")) if p.stat().st_size > 0]
-        chat_file = kept[0] if progress.done("chat", args.url) and kept else None
-        if chat_file is None and not progress.done("chat", args.url):
-            progress.start("chat", args.url)
-            chat_file = C.download(args.url, out)
-            progress.finish("chat", args.url, file=chat_file.name if chat_file else "")
+    chat_file = Path(args.chat) if args.chat else chat_replay(args.url, out, progress) if args.url else None
     messages = C.load(chat_file) if chat_file else []
     print(f"  {len(messages)} messages" if messages else "  none (ranking by loudness and the words)")
 

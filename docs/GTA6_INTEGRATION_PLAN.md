@@ -105,6 +105,11 @@ boundaries -> the stream judge), a speech signal from the transcript, loudness r
 2-hour VOD (`docs/CLIP_MODE_TUNING.md`), audio-only + per-clip section downloads
 (`core/clip_mode/vod.py`), and the "stream" layout (facecam on top, gameplay below,
 `core/webinar.py` slides="stream"). Open: the chat signal has only been tuned on synthetic bursts.
+**Round 65 (long VODs):** only the windows around chat and loudness spikes are transcribed
+(`core/clip_mode/windows.py`: 45 minutes of audio or 30 windows at most, dead air cut), runs are
+resumable (`progress.json` in the output folder) and downloads are retried and checked for
+completeness. `--full-transcript` is the old path. The first real chat replay (307 messages in
+2 h 12 min) was too quiet to tune the chat signal on; see `docs/CLIP_MODE_TUNING.md`.
 
 1. **`core/clip_mode/twitch.py`**: TwitchDownloaderCLI or `tcd` pulls the VOD plus chat JSON. Only for campaigns you've joined.
 2. **Chat-velocity peaks**: messages per 10 s against a rolling baseline, plus spikes in emote and "CLIP IT" counts, output as the same `Peak` objects `core/heatmap_scorer.spikes()` already uses for YouTube's replay heatmap. That makes `boost()` and `score_clips()` work on streams unchanged.
@@ -121,6 +126,39 @@ boundaries -> the stream judge), a speech signal from the transcript, loudness r
 1. Run Postiz with Docker, connect TikTok, YouTube, Instagram and X, and call its REST API from a new `core/publish.py`. Write per-platform captions and hashtags, and stagger the posting times.
    - Self-hosted Postiz needs your own developer apps on each platform, and approval (Meta, YouTube, TikTok) can take weeks. Start that now, or use Postiz Cloud at first.
 2. Log every post (shot IDs, format, platform, time) to SQLite, so you can later rank formats by views.
+
+## Phase 5: the gaming pivot (branch `gaming-pivot`, GTA VI launches Thu 19 Nov 2026)
+
+**Status: built in Rounds 64-66.** Not in the plan above; added for launch week.
+
+1. **Round 64, the streamer lead finder** (`tools/find_leads.py`, `core/leads.py`,
+   `tests/test_round64.py`). Twitch Helix with an app access token (`TWITCH_CLIENT_ID`,
+   `TWITCH_CLIENT_SECRET` in `.env`): who is live on GTA VI and GTA V (plus any `--game`) with
+   30-400 viewers and a public past broadcast. Tier (growing under 150, established from 150),
+   the latest VOD with its length and age (flagged when Twitch is about to delete it), channel
+   type, and any email or Discord invite in the channel description. Everything is saved to
+   `storage/leads/leads.sqlite` with a viewer snapshot per run (so `avg_viewers` builds up) and
+   your status per streamer (new, contacted, replied, client, skip); each run also writes
+   `storage/leads/leads_<date>.csv`. In the app: 🎮 GTA -> 🔎 Find Streamers, with a status
+   dropdown per lead and **Make sample clips** (`clip_stream.py --count 2 --campaign
+   "Pitch sample: <login>"` on the lead's latest VOD).
+   - Checked against Twitch on 16 Nov 2026: the GTA VI category exists (id 1867279146) and is empty
+     until launch.
+   - Not built: scheduling. Run it hourly over launch weekend with launchd (the command is
+     `.venv/bin/python tools/find_leads.py`).
+2. **Round 65, long VODs** (see Phase 3 above and `docs/CLIP_MODE_TUNING.md`).
+3. **Round 66, the gaming app** (`app.py`, `tests/test_round66.py`). `NAV_MODE=gaming` (the
+   default on this branch) shows 🎮 GTA, 🎬 Make clips and 🩺 System; the Outbox, Sent and
+   Prospects tabs and the outreach header are hidden, not deleted. `NAV_MODE=b2b` in `.env`
+   restores the app as it was. `docs/PRUNE_CANDIDATES.md` lists what the gaming entry points no
+   longer reach (from `tools/import_graph.py`); nothing was deleted. Twitch chat replays now also
+   work with `TwitchDownloaderCLI` unzipped into the project folder (it no longer has to be on PATH).
+
+Open after Round 66:
+- The chat signal still needs a busy replay to tune on (hundreds of viewers).
+- A lead who is live has a latest VOD that is still recording: sample clips come from what has
+  been recorded so far.
+- Phase 4 (publishing) is not started.
 
 ---
 

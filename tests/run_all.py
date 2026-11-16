@@ -64,6 +64,10 @@ for test in sorted(Path(__file__).parent.glob("test_*.py")):
     # it check the 30-60 s picks and the 59 s cap they were written for.
     if not number or int(number.group(1)) < 55:
         env["CLIP_LENGTH"] = "legacy"
+    # Round 66: the gaming app (GTA, Make clips, System) is the default; the suites before it
+    # check the six-tab LinkedIn app they were written for.
+    if not number or int(number.group(1)) < 66:
+        env["NAV_MODE"] = "b2b"
     try:
         result = subprocess.run([sys.executable, str(test), str(root)], cwd=root, capture_output=True, text=True, env=env)
     finally:

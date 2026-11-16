@@ -162,6 +162,24 @@ def _legacy_ui() -> bool:
     return os.getenv("LEGACY_UI", "").strip() == "1" or executive.overlay_mode() == "full"
 
 
+def nav_mode() -> str:
+    """Round 66: which app this is. NAV_MODE in .env:
+
+    gaming (the default on the gaming-pivot branch): the tabs are 🎮 GTA (Narrate, Stream clips,
+    Find Streamers), 🎬 Make clips and 🩺 System. The LinkedIn B2B tabs (📬 Outbox, 📨 Sent,
+    🔎 Prospects) and the outreach header are hidden. Nothing is deleted: their code, the
+    worker and its saved state are all still there.
+    b2b: the app as it was before Round 66 (all six tabs, the outreach header)."""
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")  # never overrides what is already set
+    return "b2b" if os.getenv("NAV_MODE", "").strip().lower() == "b2b" else "gaming"
+
+
+def _gaming_nav() -> bool:
+    return nav_mode() == "gaming"
+
+
 class OutreachPitch(BaseModel):
     subject: str
     body: str
@@ -950,7 +968,15 @@ def _generate_clips(
         audio_path.unlink(missing_ok=True)
 
 
-TAB_LABELS = ("📬 Outbox", "📨 Sent", "🔎 Prospects", "🎬 Make clips", "🎮 GTA", "🩺 System")
+B2B_TAB_LABELS = ("📬 Outbox", "📨 Sent", "🔎 Prospects", "🎬 Make clips", "🎮 GTA", "🩺 System")
+GAMING_TAB_LABELS = ("🎮 GTA", "🎬 Make clips", "🩺 System")  # Round 66: NAV_MODE=gaming
+
+
+def tab_labels() -> tuple[str, ...]:
+    return GAMING_TAB_LABELS if _gaming_nav() else B2B_TAB_LABELS
+
+
+TAB_LABELS = tab_labels()  # the tabs of the mode the app started in
 # Page styles. Outbox players keep a 9:16 box while a new preview loads, so swapping
 # a clip after a re-render never collapses the column and moves the page. The About
 # page button is the big blue one: it's where the creator's email usually is.
@@ -988,6 +1014,29 @@ def main() -> None:
         # Round 51: mark this Mac's network as yours on the clip pages, once per session, so your
         # own looks at a prospect's page (views, plays, downloads, copies) are never counted.
         st.session_state["own_network_marked"] = clip_pages.register_own_network() or "tried"
+    if _gaming_nav():
+        _main_gaming()
+    else:
+        _main_b2b()
+
+
+def _main_gaming() -> None:
+    """Round 66, NAV_MODE=gaming: the GTA tools first, then Make clips and System. The outreach
+    header (worker status, Outbox numbers) and the Outbox / Sent / Prospects tabs are not drawn."""
+    st.title("Nav Studios")
+    st.caption("Gaming mode: GTA narration, stream highlights and streamer leads. The LinkedIn outreach tabs "
+               "(Outbox, Sent, Prospects) are hidden, not deleted: `NAV_MODE=b2b` in `.env` brings them back.")
+    gta_tab, clips_tab, system_tab = st.tabs(GAMING_TAB_LABELS)
+    with gta_tab:
+        _render_gta_tab()
+    with clips_tab:
+        _render_clip_generator()
+    with system_tab:
+        _render_system()
+
+
+def _main_b2b() -> None:
+    """NAV_MODE=b2b: the app as it was before Round 66."""
     try:
         pending = get_pending_outreach()
     except Exception as exc:
@@ -996,7 +1045,7 @@ def main() -> None:
         pending = []
     _render_header(pending)
 
-    outbox_tab, sent_tab, pipeline_tab, clips_tab, gta_tab, system_tab = st.tabs(TAB_LABELS)
+    outbox_tab, sent_tab, pipeline_tab, clips_tab, gta_tab, system_tab = st.tabs(B2B_TAB_LABELS)
     with outbox_tab:
         _render_outbox(pending)
     with sent_tab:
@@ -3449,8 +3498,7 @@ def _harvester_text() -> str:
             f"B2B_YOUTUBE_SEARCHES={S.youtube_searches_per_run()}")
 
 
-def _render_system() -> None:
-    st.subheader("Worker")
+def _render_worker_controls() -> None:
     st.caption(
         "It keeps the Outbox filled: when it's full it waits, and it makes the next pitch as "
         "soon as you send or pass one. Stopping never loses a creator: one that was half done "
@@ -3463,12 +3511,44 @@ def _render_system() -> None:
     st.caption("Or in Terminal (stop it with **Ctrl+C**):")
     st.code(WORKER_COMMAND, language="bash")
 
+
+def _gaming_settings() -> list[dict[str, str]]:
+    """Round 66: what the GTA tools need, as set / missing (a key's value is never shown)."""
+    def has(*names: str) -> bool:
+        return all(os.getenv(name, "").strip() for name in names)
+
+    chat_tool = shutil.which("TwitchDownloaderCLI") or (Path(__file__).resolve().parent / "TwitchDownloaderCLI").is_file()
+    return [
+        {"Setting": "NAV_MODE", "Now": "gaming: GTA, Make clips and System (NAV_MODE=b2b brings back Outbox, Sent and Prospects)"},
+        {"Setting": "Twitch API (TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET)", "Now": (
+            "set" if has("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET") else "missing: Find Streamers needs both")},
+        {"Setting": "Transcription (GROQ_API_KEY)", "Now": (
+            "Groq" if has("GROQ_API_KEY") else "local Whisper (slow on long VODs)")},
+        {"Setting": "Script and moment picking (GEMINI_API_KEY or OPENAI_API_KEY)", "Now": (
+            "Gemini" if has("GEMINI_API_KEY") else "OpenAI" if has("OPENAI_API_KEY") else
+            "missing: Stream clips keeps the raw spikes, Narrate cannot write scripts")},
+        {"Setting": "Twitch chat replays (TwitchDownloaderCLI)", "Now": (
+            "found" if chat_tool else "not found: Stream clips ranks by loudness and words only")},
+    ]
+
+
+def _render_system() -> None:
+    if _gaming_nav():
+        # Round 66: the outreach worker is not part of the gaming app, but it may still be running
+        running = bool(get_worker_status()["running"])
+        with st.expander("LinkedIn outreach worker (its tabs are hidden in gaming mode)"
+                         + (" · 🟢 running" if running else " · not running"), expanded=running):
+            _render_worker_controls()
+    else:
+        st.subheader("Worker")
+        _render_worker_controls()
+
     st.subheader("Settings in use")
     st.caption("Change these in `.env`, then restart the app and the worker.")
     settings = load_settings()
     loudness = loudness_target()
     st.table(
-        [
+        (_gaming_settings() if _gaming_nav() else []) + [
             {"Setting": "CAPTION_STYLE", "Now": caption_style_name()},
             {"Setting": "VISUAL_OVERLAYS", "Now": _overlay_mode_text()},
             {"Setting": "MIDCLIP_TRIM", "Now": "off" if os.getenv("MIDCLIP_TRIM", "").strip() == "0" else "on (pauses and fillers)"},

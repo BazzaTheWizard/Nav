@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -116,14 +117,23 @@ def load(path: str | Path) -> list[Message]:
     return sorted(messages, key=lambda m: m.t)
 
 
+def twitch_downloader() -> str | None:
+    """TwitchDownloaderCLI: on PATH, or (Round 66) the one unzipped into the project folder."""
+    found = shutil.which("TwitchDownloaderCLI") or shutil.which("TwitchDownloaderCLI.exe")
+    if found:
+        return found
+    local = Path(__file__).resolve().parents[2] / "TwitchDownloaderCLI"
+    return str(local) if local.is_file() and os.access(local, os.X_OK) else None
+
+
 def download(url: str, out_dir: str | Path) -> Path | None:
     """The chat replay for a Twitch or YouTube VOD, or None (with a log line) when it can't be fetched."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if (m := _TWITCH_VOD.search(url)):
-        exe = shutil.which("TwitchDownloaderCLI") or shutil.which("TwitchDownloaderCLI.exe")
+        exe = twitch_downloader()
         if not exe:
-            logger.warning("Twitch chat needs TwitchDownloaderCLI on PATH "
+            logger.warning("Twitch chat needs TwitchDownloaderCLI on PATH or in the project folder "
                            "(https://github.com/lay295/TwitchDownloader/releases). Continuing without chat.")
             return None
         target = out_dir / f"chat_{m.group(1)}.json"
