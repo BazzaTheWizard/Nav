@@ -1,0 +1,19 @@
+{
+  "client": "District Consulting",
+  "cta": "Book your free AI marketing consult",
+  "cta_sub": "",
+  "accent": "#1F3A5F",
+  "logo": "",
+  "min_seconds": 20,
+  "max_seconds": 45,
+  "end_card_seconds": 3,
+  "hook_seconds": 3,
+  "themes": [
+    {"title": "AI is not a replacement for marketing strategy.",
+     "look_for": "using AI thoughtfully vs relying on it blindly; strategy, judgment and goals still come from people"},
+    {"title": "How small businesses can use AI for marketing.",
+     "look_for": "practical use cases: brainstorming, content planning, research, captions, website copy"},
+    {"title": "The biggest mistake businesses make with AI content.",
+     "look_for": "generic content, no brand voice, inaccurate outputs, over-reliance on AI"}
+  ]
+}
