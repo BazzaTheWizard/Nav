@@ -21,3 +21,9 @@ boto3  # clip pages (Cloudflare R2)
 playwright  # graphics: renders each chart frame by frame (then: .venv/bin/playwright install chromium)
 yfinance  # Round 35: real market data for charts (core.market_data)
 numpy
+# Round 59 (Narrate mode, tools/narrate.py). All optional: each step falls back without them.
+# PySceneDetect pulls in a second OpenCV package (opencv-python), which breaks face tracking
+# (see above), so install it without its dependencies:
+#   pip install --no-deps scenedetect && pip install click platformdirs
+# Forced alignment of your voiceover to the script (better caption timing):
+#   pip install stable-ts
