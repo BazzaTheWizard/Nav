@@ -950,7 +950,7 @@ def _generate_clips(
         audio_path.unlink(missing_ok=True)
 
 
-TAB_LABELS = ("📬 Outbox", "📨 Sent", "🔎 Prospects", "🎬 Make clips", "🩺 System")
+TAB_LABELS = ("📬 Outbox", "📨 Sent", "🔎 Prospects", "🎬 Make clips", "🎮 GTA", "🩺 System")
 # Page styles. Outbox players keep a 9:16 box while a new preview loads, so swapping
 # a clip after a re-render never collapses the column and moves the page. The About
 # page button is the big blue one: it's where the creator's email usually is.
@@ -996,7 +996,7 @@ def main() -> None:
         pending = []
     _render_header(pending)
 
-    outbox_tab, sent_tab, pipeline_tab, clips_tab, system_tab = st.tabs(TAB_LABELS)
+    outbox_tab, sent_tab, pipeline_tab, clips_tab, gta_tab, system_tab = st.tabs(TAB_LABELS)
     with outbox_tab:
         _render_outbox(pending)
     with sent_tab:
@@ -1007,8 +1007,22 @@ def main() -> None:
         _render_manual_pages()  # at the very bottom: out of the way of making clips
     with clips_tab:
         _render_clip_generator()
+    with gta_tab:
+        _render_gta_tab()
     with system_tab:
         _render_system()
+
+
+def _render_gta_tab() -> None:
+    """Round 63: Narrate mode and Clip mode (tools/narrate.py, tools/clip_stream.py) as buttons.
+    Imported here, not at the top, so a problem in it never stops the rest of the app."""
+    try:
+        import gta_tab
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Could not load the GTA tab")
+        st.error(f"Could not load the GTA tab: {exc}")
+        return
+    gta_tab.render_tab()
 
 
 # --- Header: worker status and the four numbers that matter -------------------------

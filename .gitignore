@@ -45,3 +45,5 @@ clip_r*/
 
 # Round 59: the Narrate footage library
 storage/narrate/
+storage/jobs/
+storage/clip_mode/

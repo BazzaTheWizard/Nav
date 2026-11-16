@@ -43,6 +43,7 @@ for key, value in {"LINKEDIN_POSTS": "0", "AUTO_GRAPHICS": "0", "VISUAL_OVERLAYS
     os.environ.setdefault(key, value)
 
 LIBRARY_DB = ROOT / "storage" / "narrate" / "library.sqlite"
+CAPTION_HISTORY = LIBRARY_DB.parent / "caption_styles.json"  # Round 63: which caption look each video got
 OUT_DIR = ROOT / "storage" / "output" / "narrate"
 AUDIO_EXTENSIONS = (".wav", ".m4a", ".mp3", ".aac", ".flac", ".ogg")
 MAX_REUSE = 0.4  # refuse a render when more than this share of its shots were in the last 10 videos
@@ -109,6 +110,7 @@ def render_one(script_path: Path, voice: Path, args) -> Path:
     from core.narrate import script as S
     from core.narrate.assemble import assemble
     from core.narrate.finish import finish, style_for
+    from core.narrate import looks
     from core.narrate.library import Library
     from core.pipeline import render_selected_clip
 
@@ -130,11 +132,15 @@ def render_one(script_path: Path, voice: Path, args) -> Path:
                          "--allow-reuse.")
     clip = ClipResult(start_time=0.0, end_time=made.duration, viral_title=script.hook, caption=script.hook,
                       hashtags=["GTA6", "GTAVI"], virality_score=80)
-    rendered = render_selected_clip(made.video, clip, words, settings, OUT_DIR / f"{name}.mp4",
-                                    layout_mode=args.layout, work_dir=work, title_fade_in=False,
-                                    climax_hook_on=False)
+    popup = style_for(name)
+    captions = looks.caption_style_for(name, popup, CAPTION_HISTORY, getattr(args, "captions", looks.ROTATE))
+    print(f"  look: {captions} captions, pop-up style {popup}")
+    with looks.caption_env(captions):
+        rendered = render_selected_clip(made.video, clip, words, settings, OUT_DIR / f"{name}.mp4",
+                                        layout_mode=args.layout, work_dir=work, title_fade_in=False,
+                                        climax_hook_on=False)
     final = finish(rendered.path, made.cues, rendered.output_time, OUT_DIR / f"{name}_final.mp4",
-                   style=style_for(name))
+                   style=popup)
     lib.record_render(name, made.shot_ids)
     return final
 
@@ -181,6 +187,9 @@ def main() -> None:
                         "wide: the whole 16:9 picture as a strip")
     p.add_argument("--layout", default="blurred_background", choices=["blurred_background", "wide_blurred_background",
                                                                        "smart_crop"])
+    p.add_argument("--captions", default="rotate",
+                   choices=["rotate", "bold", "neon", "lime", "boxed"],
+                   help="caption look: rotate (default: a different look per video, kept on re-renders) or a fixed one")
     p.add_argument("--game-db", type=float, default=-20.0, help="game sound under your voice, in dB")
     p.add_argument("--no-game-audio", action="store_true")
     p.add_argument("--allow-reuse", action="store_true")

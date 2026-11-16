@@ -4,7 +4,8 @@ Branch: `gta-narrate`. Read `docs/GTA6_INTEGRATION_PLAN.md` first, then this.
 
 **Done in Round 62.** What was built against each item is noted inline below; the tuning
 numbers are in `docs/CLIP_MODE_TUNING.md`. Still open: tuning the chat signal on a real
-chat replay (it could not be fetched from the build machine), and an `app.py` tab for both modes.
+chat replay (it could not be fetched from the build machine). The `app.py` tab for both modes
+was built in Round 63 (🎮 GTA tab, `gta_tab.py`).
 
 ## What exists (Rounds 59-61)
 - Narrate mode: `core/narrate/*`, `tools/narrate.py` (tests 59, 60).

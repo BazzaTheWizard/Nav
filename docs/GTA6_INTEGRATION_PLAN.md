@@ -69,6 +69,10 @@ the app.py tab is not in yet, so use the command line in `tools/narrate.py`.
    - Writes `assembled.mp4` plus `markers.json` (TEXT, ZOOM and SFX cues on the timeline).
 6. **Finish with the existing pipeline**: call `core.pipeline.render_selected_clip(assembled.mp4, ClipResult(0, dur), words, ...)` with `layout_mode="blurred_background"` for now, `AUTO_GRAPHICS=0`, `linkedin_posts=False`. Captions, title card, loudnorm and the whoosh/tick SFX come for free.
 7. **`app.py`**: new "GTA Narrate" tab. Generate or paste a script → teleprompter → upload voiceover → render → batch of 5.
+   **Status: built in Round 63** as the 🎮 GTA tab (`gta_tab.py`), with Stream clips beside Narrate.
+   Each button runs `tools/narrate.py` / `tools/clip_stream.py` as a background job
+   (`core/tool_jobs.py`, logs in `storage/jobs/`), so the tools keep their own env defaults out of
+   the app, keep running across reloads, and can be stopped.
 
 ## Phase 2: Quality upgrades
 
@@ -79,7 +83,10 @@ camera's own pan removed, the minimap corner ignored, pulled toward the centre, 
 capped). The existing `blurred_background` layout then shows it, so `core/video_renderer.py` is
 untouched. Markers: [TEXT] pop-ups, [ZOOM] punch-ins and [SFX] cues were already done in Round 59
 (core/narrate/finish.py) without the card templates. Variety: the Round 59 reuse guard, plus the
-pop-up colour now rotates per video. Still open: caption-style rotation.
+pop-up colour now rotates per video. **Round 63:** caption-style rotation (`core/narrate/looks.py`):
+four creator looks (bold, neon, lime, boxed in `core.subtitle_engine.CAPTION_STYLES`); each new
+video gets the least recently used one, never the same colour as its pop-ups, and keeps it on
+re-renders (`storage/narrate/caption_styles.json`). `--captions neon` (or the tab) fixes one.
 
 1. **`gameplay` layout** in `core/video_renderer.py` (add it to `LAYOUT_MODES`):
    - Crop path from OpenCV optical flow plus a saliency map, smoothed with the springs `core/camera_crop.py` already has. The crop follows the car or character instead of the frame's center.

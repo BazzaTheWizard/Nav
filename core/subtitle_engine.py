@@ -172,6 +172,17 @@ def number_emphasis() -> bool:
 CAPTION_STYLES = {
     "bold": {"outline": 6, "shadow": 3, "shadow_colour": "&H64000000", "blur": 0.6, "emphasis": "balanced"},
     "classic": {"outline": 3, "shadow": 1, "shadow_colour": "&H80000000", "blur": 0.0, "emphasis": "off"},
+    # Round 63: more creator looks, so Narrate mode can rotate them between videos (core.narrate.looks).
+    # Optional keys (bold / classic leave them out and look exactly as before): "font", "size",
+    # "highlight" (the spoken word, ASS BGR), "outline_colour" and "box" (1: an opaque box behind
+    # the line; the outline colour is the box, so the spoken word never pulses: emphasis off).
+    "neon": {"outline": 7, "shadow": 0, "shadow_colour": "&H00000000", "blur": 1.4, "emphasis": "punchy",
+             "font": "Montserrat ExtraBold", "size": 76, "highlight": "&HFFE500&"},  # cyan #00E5FF
+    "lime": {"outline": 5, "shadow": 5, "shadow_colour": "&H50000000", "blur": 0.4, "emphasis": "balanced",
+             "highlight": "&H4FFF7C&"},  # green #7CFF4F
+    "boxed": {"outline": 16, "shadow": 0, "shadow_colour": "&H00000000", "blur": 0.0, "emphasis": "off",
+              "font": "Montserrat ExtraBold", "size": 68, "highlight": "&H7F3DFF&",  # pink #FF3D7F
+              "outline_colour": "&H28000000", "box": 1},
 }
 
 # Active-word emphasis: the spoken word turns yellow and briefly pulses, then
@@ -262,7 +273,7 @@ def create_ass_subtitles(
     ``caption_top``, under the slides); captions in that time sit just under it.
     caption_top: every caption's top edge at this y instead of the usual height
     (the webinar layout puts them under the slides).
-    style: "bold" or "classic" (default: CAPTION_STYLE in .env, else "bold").
+    style: "bold", "classic", or a Round 63 look ("neon", "lime", "boxed") (default: CAPTION_STYLE in .env).
     emphasis: "off", "subtle", "balanced" or "punchy" (default: EMPHASIS_INTENSITY
     in .env, else the style's own default).
     accent: the brand colour for named companies and countries (Round 36, core.captions:
@@ -297,7 +308,7 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ShortForm,Arial Black,72,&H00FFFFFF,&H0000FFFF,&H00000000,{look["shadow_colour"]},-1,0,0,0,100,100,0,0,1,{look["outline"]},{look["shadow"]},2,{CAPTION_MARGIN_H},{CAPTION_MARGIN_H},{CAPTION_MARGIN_V},1
+Style: ShortForm,{look.get("font", "Arial Black")},{look.get("size", 72)},&H00FFFFFF,&H0000FFFF,{look.get("outline_colour", "&H00000000")},{look["shadow_colour"]},-1,0,0,0,100,100,0,0,{3 if look.get("box") else 1},{look["outline"]},{look["shadow"]},2,{CAPTION_MARGIN_H},{CAPTION_MARGIN_H},{CAPTION_MARGIN_V},1
 Style: Hook,Arial Black,58,&H00FFFFFF,&H00FFFFFF,&H50000000,&H00000000,-1,0,0,0,100,100,0,0,3,18,0,8,120,120,{HOOK_MARGIN_V},1
 
 [Events]
@@ -397,7 +408,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     spoken = (f"{{\\c{palette[kind]}"
                               f"{semantic.keyword_pop(look['outline'], word_ms) if preset is not None else ''}}}")
                 else:
-                    spoken = f"{{\\c{HIGHLIGHT_COLOUR}{_pulse(preset, look['outline'], word_ms)}}}"
+                    spoken = f"{{\\c{look.get('highlight', HIGHLIGHT_COLOUR)}{_pulse(preset, look['outline'], word_ms)}}}"
                 text = " ".join(
                     f"{spoken}{token}{restore}" if i == word_index else shown[i]
                     for i, token in enumerate(tokens)
