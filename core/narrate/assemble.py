@@ -5,7 +5,11 @@ That time is filled with shots from the library that match the line's tags, cut 
 2-3.5 s (faster on the hook) so the picture keeps moving. Game sound from the footage plays
 under your voice at GAME_AUDIO_DB (or not at all with game_audio_db=None).
 
-[ZOOM] lines get a 1.12x punch-in. [TEXT] and [SFX] markers are returned (with their times)
+[ZOOM] lines get a 1.12x punch-in.
+
+Round 60, frame: "wide" keeps the 16:9 picture (the renderer shows it as a strip over blur);
+"tall" (4:5) and "vertical" (9:16) crop each shot around its action (core.narrate.reframe), so
+the gameplay fills far more of the phone screen. [TEXT] and [SFX] markers are returned (with their times)
 for core.narrate.finish, which draws them on the finished vertical clip.
 
 The result goes through core.pipeline.render_selected_clip like any talking-head video.
@@ -19,6 +23,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from core.narrate import reframe
 from core.narrate.align import LineSpan
 from core.narrate.library import Library, Shot
 from core.narrate.script import Script
@@ -42,6 +47,7 @@ class Piece:
     at: float  # where it starts in the assembled video
     line: int
     zoom: bool = False
+    centre: tuple[float, float] = (0.5, 0.5)  # Round 60: the crop's centre at the piece's start and end
 
 
 @dataclass
@@ -104,11 +110,15 @@ def _has_audio(path: str) -> bool:
     return bool(out.stdout.strip())
 
 
-def _render_piece(piece: Piece, out: Path) -> None:
-    scale = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT}"
-    if piece.zoom:
-        zw, zh = int(WIDTH * ZOOM) // 2 * 2, int(HEIGHT * ZOOM) // 2 * 2
-        scale = f"scale={zw}:{zh}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT}"
+def _render_piece(piece: Piece, out: Path, frame: str = "wide") -> None:
+    if frame == "wide":
+        scale = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT}"
+        if piece.zoom:
+            zw, zh = int(WIDTH * ZOOM) // 2 * 2, int(HEIGHT * ZOOM) // 2 * 2
+            scale = f"scale={zw}:{zh}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT}"
+    else:
+        scale = reframe.crop_filter(piece.path, reframe.Track(*piece.centre), frame, piece.duration,
+                                    ZOOM if piece.zoom else 1.0)
     vf = f"{scale},fps={FPS},setsar=1,format=yuv420p"
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{piece.src_start:.3f}",
            "-t", f"{piece.duration:.3f}", "-i", piece.path]
@@ -123,16 +133,23 @@ def _render_piece(piece: Piece, out: Path) -> None:
 
 
 def assemble(script: Script, spans: list[LineSpan], library: Library, voiceover: str | Path, out_path: str | Path,
-             work_dir: str | Path, game_audio_db: float | None = GAME_AUDIO_DB) -> Assembly:
+             work_dir: str | Path, game_audio_db: float | None = GAME_AUDIO_DB, frame: str = "wide") -> Assembly:
+    if frame not in reframe.FRAMES:
+        raise ValueError(f"frame must be one of {', '.join(reframe.FRAMES)}")
     out_path, work_dir = Path(out_path), Path(work_dir)
     pieces_dir = work_dir / f"{out_path.stem}_pieces"
     shutil.rmtree(pieces_dir, ignore_errors=True)
     pieces_dir.mkdir(parents=True)
     pieces, cues = plan(script, spans, library)
     files: list[Path] = []
+    if frame != "wide":
+        out_w, out_h = reframe.FRAMES[frame]
+        for piece in pieces:
+            tr = reframe.track(piece.path, piece.src_start, piece.duration, out_w / out_h)
+            piece.centre = (round(tr.start, 4), round(tr.end, 4))
     for n, piece in enumerate(pieces):
         f = pieces_dir / f"{n:03d}.mp4"
-        _render_piece(piece, f)
+        _render_piece(piece, f, frame)
         files.append(f)
     listing = pieces_dir / "list.txt"
     listing.write_text("".join(f"file '{f.resolve()}'\n" for f in files))

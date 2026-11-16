@@ -15,6 +15,8 @@ Steps (each is one command):
 
   4. Render:
        python tools/narrate.py render scripts/garage.txt --voice takes/garage.m4a
+     --frame tall (default) crops each shot to 4:5 around the action; --frame vertical fills the
+     phone screen; --frame wide keeps the whole 16:9 picture.
      Several at once:  python tools/narrate.py render scripts/*.txt --voice-dir takes/
      (each script's voiceover is the file in takes/ with the same name).
 
@@ -106,7 +108,7 @@ def render_one(script_path: Path, voice: Path, args) -> Path:
     from core.narrate import align as A
     from core.narrate import script as S
     from core.narrate.assemble import assemble
-    from core.narrate.finish import finish
+    from core.narrate.finish import finish, style_for
     from core.narrate.library import Library
     from core.pipeline import render_selected_clip
 
@@ -121,7 +123,7 @@ def render_one(script_path: Path, voice: Path, args) -> Path:
     spans = A.line_spans(script, words)
     lib = Library(LIBRARY_DB)
     made = assemble(script, spans, lib, voice, work / f"{name}_assembled.mp4", work,
-                    game_audio_db=None if args.no_game_audio else args.game_db)
+                    game_audio_db=None if args.no_game_audio else args.game_db, frame=args.frame)
     share = lib.reuse_share(made.shot_ids)
     if share > MAX_REUSE and not args.allow_reuse:
         raise SystemExit(f"{name}: {share:.0%} of its shots were in the last 10 videos. Add footage, or pass "
@@ -131,7 +133,8 @@ def render_one(script_path: Path, voice: Path, args) -> Path:
     rendered = render_selected_clip(made.video, clip, words, settings, OUT_DIR / f"{name}.mp4",
                                     layout_mode=args.layout, work_dir=work, title_fade_in=False,
                                     climax_hook_on=False)
-    final = finish(rendered.path, made.cues, rendered.output_time, OUT_DIR / f"{name}_final.mp4")
+    final = finish(rendered.path, made.cues, rendered.output_time, OUT_DIR / f"{name}_final.mp4",
+                   style=style_for(name))
     lib.record_render(name, made.shot_ids)
     return final
 
@@ -173,6 +176,9 @@ def main() -> None:
     p.add_argument("scripts", nargs="+")
     p.add_argument("--voice", default="", help="the voiceover (one script only)")
     p.add_argument("--voice-dir", default="", help="folder of voiceovers named like the scripts")
+    p.add_argument("--frame", default="tall", choices=["tall", "vertical", "wide"],
+                   help="tall: 4:5 action crop over blur (default); vertical: full-screen 9:16 action crop; "
+                        "wide: the whole 16:9 picture as a strip")
     p.add_argument("--layout", default="blurred_background", choices=["blurred_background", "wide_blurred_background",
                                                                        "smart_crop"])
     p.add_argument("--game-db", type=float, default=-20.0, help="game sound under your voice, in dB")

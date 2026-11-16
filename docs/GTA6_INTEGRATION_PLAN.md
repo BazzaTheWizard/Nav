@@ -72,6 +72,15 @@ the app.py tab is not in yet, so use the command line in `tools/narrate.py`.
 
 ## Phase 2: Quality upgrades
 
+**Status: built in Round 60** (`core/narrate/reframe.py`, `tests/test_round60.py`). Instead of a
+new renderer layout, the crop happens while assembling: `--frame tall` (default, 4:5 over
+blur) or `--frame vertical` (full 9:16) crops each shot around its action (optical flow with the
+camera's own pan removed, the minimap corner ignored, pulled toward the centre, pan speed
+capped). The existing `blurred_background` layout then shows it, so `core/video_renderer.py` is
+untouched. Markers: [TEXT] pop-ups, [ZOOM] punch-ins and [SFX] cues were already done in Round 59
+(core/narrate/finish.py) without the card templates. Variety: the Round 59 reuse guard, plus the
+pop-up colour now rotates per video. Still open: caption-style rotation.
+
 1. **`gameplay` layout** in `core/video_renderer.py` (add it to `LAYOUT_MODES`):
    - Crop path from OpenCV optical flow plus a saliency map, smoothed with the springs `core/camera_crop.py` already has. The crop follows the car or character instead of the frame's center.
    - Keep the minimap (bottom-left in GTA) out of the caption area, or blur it.

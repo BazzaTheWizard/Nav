@@ -24,6 +24,17 @@ FONT = ROOT / "assets" / "fonts" / "Montserrat-ExtraBold.ttf"
 POPUP_SECONDS = 1.8
 POPUP_Y = 420  # px from the top of the 1080x1920 frame: clear of the title card and the captions
 SFX_DB = -8.0
+# Round 60: the pop-up box colour rotates between videos (a channel of identical-looking
+# videos reads as templated). (box colour, text colour)
+POPUP_STYLES = (("0xFFD400", "black"), ("0x00E5FF", "black"), ("0xFF3D7F", "white"), ("0x7CFF4F", "black"),
+                ("0xFFFFFF", "black"))
+
+
+def style_for(name: str) -> int:
+    """A stable style number for a video name (the same script always looks the same)."""
+    import zlib
+
+    return zlib.crc32(name.encode()) % len(POPUP_STYLES)
 
 
 def _probe_duration(path: Path) -> float:
@@ -44,7 +55,8 @@ def sound_cues(cues: list[Cue], to_output: Callable[[float], float]) -> list[tup
     return sorted(found)
 
 
-def popup_filters(cues: list[Cue], to_output: Callable[[float], float], work: Path) -> list[str]:
+def popup_filters(cues: list[Cue], to_output: Callable[[float], float], work: Path, style: int = 0) -> list[str]:
+    box, ink = POPUP_STYLES[style % len(POPUP_STYLES)]
     filters: list[str] = []
     for n, cue in enumerate(c for c in cues if c.kind == "TEXT" and c.value.strip()):
         a = to_output(cue.at)
@@ -54,21 +66,21 @@ def popup_filters(cues: list[Cue], to_output: Callable[[float], float], work: Pa
         # fade in over 0.12 s, out over 0.2 s
         alpha = f"if(lt(t,{a:.3f}+0.12),(t-{a:.3f})/0.12,if(gt(t,{b:.3f}-0.2),({b:.3f}-t)/0.2,1))"
         filters.append(
-            f"drawtext=fontfile='{FONT}':textfile='{text_file}':fontsize=92:fontcolor=black:"
-            f"box=1:boxcolor=0xFFD400:boxborderw=28:x=(w-text_w)/2:y={POPUP_Y}:"
+            f"drawtext=fontfile='{FONT}':textfile='{text_file}':fontsize=92:fontcolor={ink}:"
+            f"box=1:boxcolor={box}:boxborderw=28:x=(w-text_w)/2:y={POPUP_Y}:"
             f"alpha='{alpha}':enable='between(t,{a:.3f},{b:.3f})'")
     return filters
 
 
 def finish(clip_path: str | Path, cues: list[Cue], to_output: Callable[[float], float],
-           out_path: str | Path | None = None) -> Path:
+           out_path: str | Path | None = None, style: int = 0) -> Path:
     """Draw the pop-ups and mix the sound cues into the clip. Returns the finished file."""
     clip_path = Path(clip_path)
     out_path = Path(out_path) if out_path else clip_path.with_name(clip_path.stem + "_final.mp4")
     work = clip_path.parent / f"{clip_path.stem}_finish"
     work.mkdir(parents=True, exist_ok=True)
     duration = _probe_duration(clip_path)
-    filters = popup_filters(cues, to_output, work)
+    filters = popup_filters(cues, to_output, work, style)
     track = audio_polish.cue_track(sound_cues(cues, to_output), duration, work / "cues.wav")
     if not filters and track is None:
         shutil.copyfile(clip_path, out_path)
