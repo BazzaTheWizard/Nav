@@ -9,6 +9,9 @@ and Instagram Reels limit; LinkedIn takes much longer videos, so 180 s never blo
 CLIP_LENGTH=legacy (in .env, or set by tests/run_all.py for the suites before Round 55)
 restores Round 54's rules exactly: 30-60 s picks, the 59 s cap, a 59 s teaser limit.
 
+CLIP_LENGTH=gaming (Round 61, Clip mode for stream highlights): 15-60 s, aiming at 15-45 s,
+capped at 59 s like the old rules.
+
 Every module reads its limits from here, so the AI prompt, the sentence snapping, the
 fallback picker, the judge, the teaser, the worker and the re-cut checks always agree.
 """
@@ -24,31 +27,39 @@ def legacy() -> bool:
 
 LEGACY = legacy()
 
+
+def gaming() -> bool:
+    """Round 61: CLIP_LENGTH=gaming, short stream highlights (15-60 s), for Clip mode."""
+    return os.getenv("CLIP_LENGTH", "idea").strip().lower() in {"gaming", "stream", "short"}
+
+
+GAMING = gaming() and not LEGACY
+
 # Hard limits a final clip must fall inside (sentence snapping, fallback picks).
-MIN_SECONDS = 30.0 if LEGACY else 35.0
-MAX_SECONDS = 60.0 if LEGACY else 180.0
+MIN_SECONDS = 30.0 if LEGACY else 15.0 if GAMING else 35.0
+MAX_SECONDS = 60.0 if LEGACY else 60.0 if GAMING else 180.0
 # What the AI is told to aim for. The real length is wherever the thought ends.
-TARGET_TEXT = "30-60 seconds" if LEGACY else "35 seconds to 3 minutes"
+TARGET_TEXT = "30-60 seconds" if LEGACY else "15-45 seconds" if GAMING else "35 seconds to 3 minutes"
 # A thought that needs less than this is usually a fragment; the fallback picker and the
 # boundary scorer lean toward complete arcs of at least this length.
-COMFORT_SECONDS = 30.0 if LEGACY else 40.0
+COMFORT_SECONDS = 30.0 if LEGACY else 20.0 if GAMING else 40.0
 
 # AI proposals outside this range are thrown away before snapping (a model a little off
 # still gets snapped into MIN..MAX).
-MIN_PROPOSED_SECONDS = 10.0 if LEGACY else 20.0
-MAX_PROPOSED_SECONDS = 120.0 if LEGACY else 240.0
+MIN_PROPOSED_SECONDS = 10.0 if LEGACY else 8.0 if GAMING else 20.0
+MAX_PROPOSED_SECONDS = 120.0 if LEGACY else 90.0 if GAMING else 240.0
 
 # The automatic length cap (EditProfile.max_seconds). None: no cap, the idea decides.
 # Make clips' "59 s max" box still offers the old cap by hand.
-CAP_SECONDS: float | None = 59.0 if LEGACY else None
+CAP_SECONDS: float | None = 59.0 if (LEGACY or GAMING) else None
 MANUAL_CAP_SECONDS = 59.0
 
 # Teaser + clip must stay within the platform limit (core.climax_hook / core.opening).
 PLATFORM_LIMIT_SECONDS = 180.0
-TEASER_MAX_TOTAL_SECONDS = 59.0 if LEGACY else PLATFORM_LIMIT_SECONDS
+TEASER_MAX_TOTAL_SECONDS = 59.0 if (LEGACY or GAMING) else PLATFORM_LIMIT_SECONDS
 
 # Words of each clip the judge reads: 3 min at a fast 200 words a minute, plus room.
-JUDGE_MAX_WORDS = 300 if LEGACY else 650
+JUDGE_MAX_WORDS = 300 if (LEGACY or GAMING) else 650
 
 # Manual re-cuts (Make clips trims, pitch trims): any length a delivered clip can have.
 RECUT_MIN_SECONDS = 15.0
@@ -57,7 +68,7 @@ RECUT_MAX_SECONDS = 90.0 if LEGACY else PLATFORM_LIMIT_SECONDS
 
 def label() -> str:
     """For the app and logs, e.g. "35 s to 3 min"."""
-    return "30-60 s" if LEGACY else "35 s to 3 min"
+    return "30-60 s" if LEGACY else "15-60 s" if GAMING else "35 s to 3 min"
 
 
 def scaled_timeout(clip_seconds: float, base: float, per_clip_second: float) -> float:

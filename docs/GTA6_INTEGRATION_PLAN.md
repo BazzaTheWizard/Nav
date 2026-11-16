@@ -89,6 +89,12 @@ pop-up colour now rotates per video. Still open: caption-style rotation.
 
 ## Phase 3: Clip mode (licensed streamer campaigns)
 
+**Status: mechanical part built in Round 61** (`core/clip_mode/`, `tools/clip_stream.py`,
+`CLIP_LENGTH=gaming` in `core/clip_length.py`, `tests/test_round61.py`). Chat (TwitchDownloader JSON,
+yt-dlp live_chat, CSV) and loudness spikes are fused into a yt-dlp-style heatmap and passed to the
+existing `pick_clips_with_agent(heatmap=...)`. **Still open (the Fable step, see
+docs/FABLE_HANDOFF.md):** a gaming-tuned picker prompt and judge, and tuning the signal weights.
+
 1. **`core/clip_mode/twitch.py`**: TwitchDownloaderCLI or `tcd` pulls the VOD plus chat JSON. Only for campaigns you've joined.
 2. **Chat-velocity peaks**: messages per 10 s against a rolling baseline, plus spikes in emote and "CLIP IT" counts, output as the same `Peak` objects `core/heatmap_scorer.spikes()` already uses for YouTube's replay heatmap. That makes `boost()` and `score_clips()` work on streams unchanged.
 3. **Audio-energy peaks**: Nav already computes loudness (`camera_energy`, `video_renderer._measure_loudness`), so use it as a second peak source. A peak where chat and audio overlap counts double.
