@@ -149,8 +149,12 @@ def audio_values(lufs: np.ndarray) -> np.ndarray:
     return out
 
 
-def speech_values(words: list[Word], duration: float) -> np.ndarray:
-    """0-1 per bucket: reaction words and repeats in what the streamer says."""
+def speech_values(words: list[Word], duration: float, covered: np.ndarray | None = None) -> np.ndarray:
+    """0-1 per bucket: reaction words and repeats in what the streamer says.
+
+    ``covered`` (Round 65, long VODs): True for the buckets that were transcribed at all. The
+    baseline is then drawn from the last two minutes of *transcribed* buckets, so the silence
+    of the parts nobody transcribed is not mistaken for a quiet streamer. None: every bucket."""
     n = max(1, int(np.ceil(duration / BUCKET)))
     points = np.zeros(n)
     repeats = np.zeros(n)
@@ -178,6 +182,15 @@ def speech_values(words: list[Word], duration: float) -> np.ndarray:
     for i, parts in joined.items():
         points[i] += 0.8 * max(0, len(REACTION.findall(" ".join(parts))) - sum(1 for p in parts if REACTION.search(p)))
     points = np.convolve(points, np.array([0.25, 1.0, 0.25]), mode="same")
+    if covered is not None:
+        keep = np.flatnonzero(np.asarray(covered, dtype=bool)[:n])
+        out = np.zeros(n)
+        if len(keep):
+            some = points[keep]
+            values = np.clip((some - _rolling_median(some, int(BASELINE / BUCKET))) / SPEECH_SPIKE, 0.0, 1.0)
+            values[:WARMUP_BUCKETS] = 0.0
+            out[keep] = values
+        return out
     base = _rolling_median(points, int(BASELINE / BUCKET))
     out = np.clip((points - base) / SPEECH_SPIKE, 0.0, 1.0)
     out[:WARMUP_BUCKETS] = 0.0

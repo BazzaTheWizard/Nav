@@ -96,7 +96,8 @@ def narrate_render_argv(scripts: list[Path], frame: str = "tall", layout: str = 
 
 def stream_argv(*, url: str = "", video: str = "", chat: str = "", campaign: str = "", count: int = 6,
                 name: str = "", streamer: str = "", game: str = "", layout: str = "stream",
-                audio_signal: bool = True, judge: bool = True, plan: bool = False) -> list[str]:
+                audio_signal: bool = True, judge: bool = True, plan: bool = False,
+                full_transcript: bool = False) -> list[str]:
     url, video, campaign = url.strip(), video.strip(), campaign.strip()
     if not campaign:
         raise ValueError("Name the clipping campaign that licenses this VOD (e.g. \"Whop: <campaign>\").")
@@ -117,6 +118,7 @@ def stream_argv(*, url: str = "", video: str = "", chat: str = "", campaign: str
         if value:
             argv += [flag, value]
     argv += (["--no-audio-signal"] if not audio_signal else []) + (["--no-judge"] if not judge else [])
+    argv += ["--full-transcript"] if full_transcript else []
     return argv + (["--plan"] if plan else [])
 
 
@@ -485,7 +487,8 @@ def _render_narrate_clips(st: Any, found: list[Path]) -> None:
 # --- Stream clips ----------------------------------------------------------------------
 def _render_stream(st: Any) -> None:
     st.caption("Only clip streamers who run a clipping campaign you've joined: the campaign is saved with the "
-               "clips, so you always know which licence a clip was made under.")
+               "clips, so you always know which licence a clip was made under. Long VODs are fine: only the parts "
+               "around chat and loudness spikes are transcribed, and a stopped run carries on when you start it again.")
     _render_job(st, STREAM)
     with st.form("stream_clip"):
         url = st.text_input("Twitch / YouTube VOD link", placeholder="https://www.twitch.tv/videos/123456789")
@@ -507,6 +510,11 @@ def _render_stream(st: Any) -> None:
             game = game_column.text_input("Game", placeholder="From the link")
             audio_signal = st.checkbox("Use loudness spikes", value=True, help="Off: rank by chat only.")
             judge = st.checkbox("Judge each clip cold (one more model call per clip)", value=True)
+            full_transcript = st.checkbox(
+                "Transcribe the whole stream", value=False,
+                help="Normally only the windows around chat and loudness spikes are transcribed (45 minutes of "
+                "audio at most), which is what makes a 7-hour VOD workable. On: every word, as before. Slow, and "
+                "a long VOD can use up Groq's hourly limit.")
         plan_column, make_column = st.columns(2)
         plan = plan_column.form_submit_button("🔍 Find moments (dry run)",
                                               help="No model calls, no rendering: shows the moments it would use.")
@@ -519,7 +527,7 @@ def _render_stream(st: Any) -> None:
                                        time.strftime("%Y%m%d-%H%M%S-") + Path(chat_upload.name).name))
             argv = stream_argv(url=url, video=video, chat=chat, campaign=campaign, count=count, name=name,
                                streamer=streamer, game=game, layout=STREAM_LAYOUTS[layout],
-                               audio_signal=audio_signal, judge=judge, plan=plan)
+                               audio_signal=audio_signal, judge=judge, plan=plan, full_transcript=full_transcript)
             what = url.strip().rsplit("/", 1)[-1] if url.strip() else Path(video).name
             _start(st, STREAM, f"{'Find moments' if plan else 'Make clips'}: {what}", argv)
         except ValueError as exc:
